@@ -25,9 +25,21 @@ constexpr int HEAD_DIM=128;
 constexpr int KV_DIM=N_KV_HEADS*HEAD_DIM;
 constexpr int INTERMEDIATE=18944;
 constexpr int VOCAB_SIZE=152064;
-constexpr float ROPE_THETA=1000000.0f;
+constexpr float DEFAULT_RMS_NORM_EPS=1e-6f;
+constexpr float DEFAULT_ROPE_THETA=1000000.0f;
 
 static thread_local std::string g_err;
+
+struct ModelConfig {
+    int n_layers=N_LAYERS;
+    int hidden=HIDDEN;
+    int n_heads=N_HEADS;
+    int n_kv_heads=N_KV_HEADS;
+    int intermediate=INTERMEDIATE;
+    int vocab_size=VOCAB_SIZE;
+    float rms_norm_eps=DEFAULT_RMS_NORM_EPS;
+    float rope_theta=DEFAULT_ROPE_THETA;
+};
 
 struct TensorMeta {
     std::string file;
@@ -41,6 +53,54 @@ static bool ends_with(const std::string& s,const std::string& suf){
 }
 static std::string path_join(const std::string& a,const std::string& b){
     return (!a.empty() && a.back()=='/') ? a+b : a+"/"+b;
+}
+static std::string read_text_file(const std::string& path){
+    std::ifstream f(path);
+    if(!f) return "";
+    std::stringstream ss; ss<<f.rdbuf(); return ss.str();
+}
+static int json_int_or(const std::string& json,const std::string& key,int fallback){
+    std::regex re("\""+key+"\"\\s*:\\s*(-?\\d+)");
+    std::smatch m;
+    return std::regex_search(json,m,re) ? std::stoi(m[1].str()) : fallback;
+}
+static float json_float_or(const std::string& json,const std::string& key,float fallback){
+    std::regex re("\""+key+"\"\\s*:\\s*([-+0-9.eE]+)");
+    std::smatch m;
+    return std::regex_search(json,m,re) ? std::stof(m[1].str()) : fallback;
+}
+static void require_config_value(const std::string& name,int actual,int expected){
+    if(actual!=expected){
+        throw std::runtime_error("unsupported config "+name+"="+std::to_string(actual)+
+            ", this binary was compiled for "+std::to_string(expected));
+    }
+}
+static ModelConfig load_config(const std::string& dir){
+    ModelConfig c;
+    std::string path=path_join(dir,"config.json");
+    std::string json=read_text_file(path);
+    if(json.empty()){
+        std::cout<<"[C++] config.json not found, using compiled defaults\n";
+        return c;
+    }
+    c.n_layers=json_int_or(json,"num_hidden_layers",c.n_layers);
+    c.hidden=json_int_or(json,"hidden_size",c.hidden);
+    c.n_heads=json_int_or(json,"num_attention_heads",c.n_heads);
+    c.n_kv_heads=json_int_or(json,"num_key_value_heads",c.n_kv_heads);
+    c.intermediate=json_int_or(json,"intermediate_size",c.intermediate);
+    c.vocab_size=json_int_or(json,"vocab_size",c.vocab_size);
+    c.rms_norm_eps=json_float_or(json,"rms_norm_eps",c.rms_norm_eps);
+    c.rope_theta=json_float_or(json,"rope_theta",c.rope_theta);
+
+    require_config_value("num_hidden_layers",c.n_layers,N_LAYERS);
+    require_config_value("hidden_size",c.hidden,HIDDEN);
+    require_config_value("num_attention_heads",c.n_heads,N_HEADS);
+    require_config_value("num_key_value_heads",c.n_kv_heads,N_KV_HEADS);
+    require_config_value("intermediate_size",c.intermediate,INTERMEDIATE);
+    require_config_value("vocab_size",c.vocab_size,VOCAB_SIZE);
+    std::cout<<"[C++] config loaded: rms_norm_eps="<<c.rms_norm_eps
+             <<", rope_theta="<<c.rope_theta<<"\n";
+    return c;
 }
 static uint64_t read_u64_le(std::ifstream& f){
     unsigned char b[8]; f.read((char*)b,8);
@@ -168,12 +228,12 @@ __global__ void silu_mul_kernel(const float* g,const float* u,float* o,int n){
     int i=blockIdx.x*blockDim.x+threadIdx.x;
     if(i<n){float x=g[i]; o[i]=(x/(1.f+expf(-x)))*u[i];}
 }
-__global__ void rope_kernel(float* x,int heads,int pos){
+__global__ void rope_kernel(float* x,int heads,int pos,float rope_theta){
     int pair=blockIdx.x*blockDim.x+threadIdx.x;
     int total=heads*(HEAD_DIM/2); if(pair>=total) return;
     int h=pair/(HEAD_DIM/2), p=pair%(HEAD_DIM/2);
     int d0=p*2,d1=d0+1,base=h*HEAD_DIM;
-    float inv=powf(ROPE_THETA,-(float)d0/HEAD_DIM);
+    float inv=powf(rope_theta,-(float)d0/HEAD_DIM);
     float a=pos*inv,c=cosf(a),s=sinf(a);
     float v0=x[base+d0],v1=x[base+d1];
     x[base+d0]=v0*c-v1*s; x[base+d1]=v0*s+v1*c;
@@ -207,7 +267,7 @@ struct Layer{
     float *bq=nullptr,*bk=nullptr,*bv=nullptr,*wgate=nullptr,*wup=nullptr,*wdown=nullptr;
     float *kc=nullptr,*vc=nullptr;
 };
-struct Model{float *emb=nullptr,*norm=nullptr,*lm=nullptr; Layer layers[N_LAYERS];};
+struct Model{float *emb=nullptr,*norm=nullptr,*lm=nullptr; float rms_norm_eps=DEFAULT_RMS_NORM_EPS,rope_theta=DEFAULT_ROPE_THETA; Layer layers[N_LAYERS];};
 struct Work{
     float *x=nullptr,*n=nullptr,*q=nullptr,*k=nullptr,*v=nullptr,*ctx=nullptr,*ao=nullptr;
     float *gate=nullptr,*up=nullptr,*mid=nullptr,*mo=nullptr,*logits=nullptr;
@@ -232,8 +292,11 @@ static void free_work(Work& w){
     freep(w.gate);freep(w.up);freep(w.mid);freep(w.mo);freep(w.logits);
 }
 static Model load_model(const std::string& dir,int max_seq){
+    ModelConfig cfg=load_config(dir);
     auto metas=scan_safetensors(dir);
     Model m;
+    m.rms_norm_eps=cfg.rms_norm_eps;
+    m.rope_theta=cfg.rope_theta;
     m.emb=load_tensor(metas,"model.embed_tokens.weight");
     m.norm=load_tensor(metas,"model.norm.weight");
     m.lm=load_tensor(metas,"lm_head.weight");
@@ -274,25 +337,25 @@ static void forward_token(const Model& m,Work& w,int token,int pos){
     embedding_kernel<<<(HIDDEN+B-1)/B,B>>>(token,m.emb,w.x);
     for(int i=0;i<N_LAYERS;i++){
         const Layer& l=m.layers[i];
-        rmsnorm_kernel<<<1,B,B*sizeof(float)>>>(w.x,l.ln1,w.n,HIDDEN,1e-6f);
+        rmsnorm_kernel<<<1,B,B*sizeof(float)>>>(w.x,l.ln1,w.n,HIDDEN,m.rms_norm_eps);
         linear_kernel<<<(HIDDEN+B-1)/B,B>>>(w.n,l.wq,l.bq,w.q,HIDDEN,HIDDEN);
         linear_kernel<<<(KV_DIM+B-1)/B,B>>>(w.n,l.wk,l.bk,w.k,HIDDEN,KV_DIM);
         linear_kernel<<<(KV_DIM+B-1)/B,B>>>(w.n,l.wv,l.bv,w.v,HIDDEN,KV_DIM);
-        rope_kernel<<<(N_HEADS*(HEAD_DIM/2)+B-1)/B,B>>>(w.q,N_HEADS,pos);
-        rope_kernel<<<(N_KV_HEADS*(HEAD_DIM/2)+B-1)/B,B>>>(w.k,N_KV_HEADS,pos);
+        rope_kernel<<<(N_HEADS*(HEAD_DIM/2)+B-1)/B,B>>>(w.q,N_HEADS,pos,m.rope_theta);
+        rope_kernel<<<(N_KV_HEADS*(HEAD_DIM/2)+B-1)/B,B>>>(w.k,N_KV_HEADS,pos,m.rope_theta);
         store_kv_kernel<<<(KV_DIM+B-1)/B,B>>>(l.kc,w.k,pos,KV_DIM);
         store_kv_kernel<<<(KV_DIM+B-1)/B,B>>>(l.vc,w.v,pos,KV_DIM);
         attn_kernel<<<(HIDDEN+B-1)/B,B>>>(w.q,l.kc,l.vc,w.ctx,pos);
         linear_kernel<<<(HIDDEN+B-1)/B,B>>>(w.ctx,l.wo,nullptr,w.ao,HIDDEN,HIDDEN);
         add_kernel<<<(HIDDEN+B-1)/B,B>>>(w.x,w.ao,HIDDEN);
-        rmsnorm_kernel<<<1,B,B*sizeof(float)>>>(w.x,l.ln2,w.n,HIDDEN,1e-6f);
+        rmsnorm_kernel<<<1,B,B*sizeof(float)>>>(w.x,l.ln2,w.n,HIDDEN,m.rms_norm_eps);
         linear_kernel<<<(INTERMEDIATE+B-1)/B,B>>>(w.n,l.wgate,nullptr,w.gate,HIDDEN,INTERMEDIATE);
         linear_kernel<<<(INTERMEDIATE+B-1)/B,B>>>(w.n,l.wup,nullptr,w.up,HIDDEN,INTERMEDIATE);
         silu_mul_kernel<<<(INTERMEDIATE+B-1)/B,B>>>(w.gate,w.up,w.mid,INTERMEDIATE);
         linear_kernel<<<(HIDDEN+B-1)/B,B>>>(w.mid,l.wdown,nullptr,w.mo,INTERMEDIATE,HIDDEN);
         add_kernel<<<(HIDDEN+B-1)/B,B>>>(w.x,w.mo,HIDDEN);
     }
-    rmsnorm_kernel<<<1,B,B*sizeof(float)>>>(w.x,m.norm,w.n,HIDDEN,1e-6f);
+    rmsnorm_kernel<<<1,B,B*sizeof(float)>>>(w.x,m.norm,w.n,HIDDEN,m.rms_norm_eps);
     linear_kernel<<<(VOCAB_SIZE+B-1)/B,B>>>(w.n,m.lm,nullptr,w.logits,HIDDEN,VOCAB_SIZE);
     CK(cudaDeviceSynchronize());
 }

@@ -35,6 +35,19 @@ constexpr int HEAD_DIM = 128;
 constexpr int KV_DIM = N_KV_HEADS * HEAD_DIM;
 constexpr int INTERMEDIATE = 18944;
 constexpr int VOCAB_SIZE = 152064;
+constexpr float DEFAULT_RMS_NORM_EPS = 1e-6f;
+constexpr float DEFAULT_ROPE_THETA = 1000000.0f;
+
+struct ModelConfig {
+    int n_layers = N_LAYERS;
+    int hidden = HIDDEN;
+    int n_heads = N_HEADS;
+    int n_kv_heads = N_KV_HEADS;
+    int intermediate = INTERMEDIATE;
+    int vocab_size = VOCAB_SIZE;
+    float rms_norm_eps = DEFAULT_RMS_NORM_EPS;
+    float rope_theta = DEFAULT_ROPE_THETA;
+};
 
 // Qwen2 长上下文模型常见 rope_theta 是 1000000。
 // 如果你的 config.json 里不是这个值，需要改这里。
@@ -58,6 +71,63 @@ static std::string join_path(const std::string& a, const std::string& b) {
     if (a.empty()) return b;
     if (a.back() == '/') return a + b;
     return a + "/" + b;
+}
+
+static std::string read_text_file(const std::string& path) {
+    std::ifstream f(path);
+    if (!f) return "";
+    std::stringstream ss;
+    ss << f.rdbuf();
+    return ss.str();
+}
+
+static int json_int_or(const std::string& json, const std::string& key, int fallback) {
+    std::regex re("\"" + key + "\"\\s*:\\s*(-?\\d+)");
+    std::smatch m;
+    return std::regex_search(json, m, re) ? std::stoi(m[1].str()) : fallback;
+}
+
+static float json_float_or(const std::string& json, const std::string& key, float fallback) {
+    std::regex re("\"" + key + "\"\\s*:\\s*([-+0-9.eE]+)");
+    std::smatch m;
+    return std::regex_search(json, m, re) ? std::stof(m[1].str()) : fallback;
+}
+
+static void require_config_value(const std::string& name, int actual, int expected) {
+    if (actual != expected) {
+        std::cerr << "unsupported config " << name << "=" << actual
+                  << ", this binary was compiled for " << expected << "\n";
+        std::exit(1);
+    }
+}
+
+static ModelConfig load_config(const std::string& model_dir) {
+    ModelConfig c;
+    std::string json = read_text_file(join_path(model_dir, "config.json"));
+    if (json.empty()) {
+        std::cout << "config.json not found, using compiled defaults\n";
+        return c;
+    }
+
+    c.n_layers = json_int_or(json, "num_hidden_layers", c.n_layers);
+    c.hidden = json_int_or(json, "hidden_size", c.hidden);
+    c.n_heads = json_int_or(json, "num_attention_heads", c.n_heads);
+    c.n_kv_heads = json_int_or(json, "num_key_value_heads", c.n_kv_heads);
+    c.intermediate = json_int_or(json, "intermediate_size", c.intermediate);
+    c.vocab_size = json_int_or(json, "vocab_size", c.vocab_size);
+    c.rms_norm_eps = json_float_or(json, "rms_norm_eps", c.rms_norm_eps);
+    c.rope_theta = json_float_or(json, "rope_theta", c.rope_theta);
+
+    require_config_value("num_hidden_layers", c.n_layers, N_LAYERS);
+    require_config_value("hidden_size", c.hidden, HIDDEN);
+    require_config_value("num_attention_heads", c.n_heads, N_HEADS);
+    require_config_value("num_key_value_heads", c.n_kv_heads, N_KV_HEADS);
+    require_config_value("intermediate_size", c.intermediate, INTERMEDIATE);
+    require_config_value("vocab_size", c.vocab_size, VOCAB_SIZE);
+
+    std::cout << "config loaded: rms_norm_eps=" << c.rms_norm_eps
+              << ", rope_theta=" << c.rope_theta << "\n";
+    return c;
 }
 
 static std::vector<std::string> list_safetensors(const std::string& dir) {
@@ -359,7 +429,7 @@ __global__ void silu_mul_kernel(const float* gate, const float* up, float* out, 
     }
 }
 
-__global__ void rope_kernel(float* x, int n_heads, int pos) {
+__global__ void rope_kernel(float* x, int n_heads, int pos, float rope_theta) {
     int pair = blockIdx.x * blockDim.x + threadIdx.x;
     int total_pairs = n_heads * (HEAD_DIM / 2);
     if (pair >= total_pairs) return;
@@ -370,7 +440,7 @@ __global__ void rope_kernel(float* x, int n_heads, int pos) {
     int d0 = p * 2;
     int d1 = d0 + 1;
 
-    float inv_freq = powf(ROPE_THETA, -static_cast<float>(d0) / HEAD_DIM);
+    float inv_freq = powf(rope_theta, -static_cast<float>(d0) / HEAD_DIM);
     float angle = pos * inv_freq;
     float c = cosf(angle);
     float s = sinf(angle);
@@ -474,6 +544,8 @@ struct Model {
     float* embed = nullptr;
     float* final_norm = nullptr;
     float* lm_head = nullptr;
+    float rms_norm_eps = DEFAULT_RMS_NORM_EPS;
+    float rope_theta = DEFAULT_ROPE_THETA;
     LayerWeights layers[N_LAYERS];
 };
 
@@ -497,9 +569,12 @@ static std::string layer_name(int l, const std::string& suffix) {
 }
 
 static Model load_model(const std::string& model_dir, int max_seq) {
+    ModelConfig cfg = load_config(model_dir);
     auto metas = scan_safetensors(model_dir);
 
     Model m{};
+    m.rms_norm_eps = cfg.rms_norm_eps;
+    m.rope_theta = cfg.rope_theta;
 
     m.embed = load_tensor_gpu(metas, "model.embed_tokens.weight");
     m.final_norm = load_tensor_gpu(metas, "model.norm.weight");
@@ -568,14 +643,14 @@ static void forward_token(const Model& m, Work& w, int token, int pos) {
     for (int l = 0; l < N_LAYERS; ++l) {
         const auto& layer = m.layers[l];
 
-        rmsnorm_kernel<<<1, block, block * sizeof(float)>>>(w.x, layer.ln1, w.norm, HIDDEN, 1e-6f);
+        rmsnorm_kernel<<<1, block, block * sizeof(float)>>>(w.x, layer.ln1, w.norm, HIDDEN, m.rms_norm_eps);
 
         linear_kernel<<<(HIDDEN + block - 1) / block, block>>>(w.norm, layer.wq, layer.bq, w.q, HIDDEN, HIDDEN);
         linear_kernel<<<(KV_DIM + block - 1) / block, block>>>(w.norm, layer.wk, layer.bk, w.k, HIDDEN, KV_DIM);
         linear_kernel<<<(KV_DIM + block - 1) / block, block>>>(w.norm, layer.wv, layer.bv, w.v, HIDDEN, KV_DIM);
 
-        rope_kernel<<<(N_HEADS * (HEAD_DIM / 2) + block - 1) / block, block>>>(w.q, N_HEADS, pos);
-        rope_kernel<<<(N_KV_HEADS * (HEAD_DIM / 2) + block - 1) / block, block>>>(w.k, N_KV_HEADS, pos);
+        rope_kernel<<<(N_HEADS * (HEAD_DIM / 2) + block - 1) / block, block>>>(w.q, N_HEADS, pos, m.rope_theta);
+        rope_kernel<<<(N_KV_HEADS * (HEAD_DIM / 2) + block - 1) / block, block>>>(w.k, N_KV_HEADS, pos, m.rope_theta);
 
         store_kv_kernel<<<(KV_DIM + block - 1) / block, block>>>(layer.k_cache, w.k, pos, KV_DIM);
         store_kv_kernel<<<(KV_DIM + block - 1) / block, block>>>(layer.v_cache, w.v, pos, KV_DIM);
@@ -585,7 +660,7 @@ static void forward_token(const Model& m, Work& w, int token, int pos) {
         linear_kernel<<<(HIDDEN + block - 1) / block, block>>>(w.ctx, layer.wo, nullptr, w.attn_out, HIDDEN, HIDDEN);
         add_kernel<<<(HIDDEN + block - 1) / block, block>>>(w.x, w.attn_out, HIDDEN);
 
-        rmsnorm_kernel<<<1, block, block * sizeof(float)>>>(w.x, layer.ln2, w.norm, HIDDEN, 1e-6f);
+        rmsnorm_kernel<<<1, block, block * sizeof(float)>>>(w.x, layer.ln2, w.norm, HIDDEN, m.rms_norm_eps);
 
         linear_kernel<<<(INTERMEDIATE + block - 1) / block, block>>>(w.norm, layer.wgate, nullptr, w.gate, HIDDEN, INTERMEDIATE);
         linear_kernel<<<(INTERMEDIATE + block - 1) / block, block>>>(w.norm, layer.wup, nullptr, w.up, HIDDEN, INTERMEDIATE);
@@ -596,7 +671,7 @@ static void forward_token(const Model& m, Work& w, int token, int pos) {
         add_kernel<<<(HIDDEN + block - 1) / block, block>>>(w.x, w.mlp_out, HIDDEN);
     }
 
-    rmsnorm_kernel<<<1, block, block * sizeof(float)>>>(w.x, m.final_norm, w.norm, HIDDEN, 1e-6f);
+    rmsnorm_kernel<<<1, block, block * sizeof(float)>>>(w.x, m.final_norm, w.norm, HIDDEN, m.rms_norm_eps);
 
     linear_kernel<<<(VOCAB_SIZE + block - 1) / block, block>>>(w.norm, m.lm_head, nullptr, w.logits, HIDDEN, VOCAB_SIZE);
 
