@@ -1,0 +1,14 @@
+
+# build outputs
+build/
+*.o
+*.so
+*.a
+*.out
+
+# compiled binaries
+toy_cuda_infer
+deepseek7b_token_cuda_infer
+
+# local backup
+*.bak
