@@ -88,10 +88,8 @@ lm_head.weight
 所以它的输入不是中文文本，而是 token id：
 
 ```bash
-./deepseek7b_token_cuda_infer \
-  --model /home/lg/推理/推理引擎/deepseek-r1-7b \
-  --tokens 1,2,3 \
-  --steps 8
+./deepseek7b_token_cuda_infer --model  ../DeepSeek-R1-Distill-Qwen-7B --tokens 1,2,3 --steps 5 --max-seq 128
+
 ```
 
 输出也是 token id。
