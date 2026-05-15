@@ -232,8 +232,8 @@ __global__ void rope_kernel(float* x,int heads,int pos,float rope_theta){
     int pair=blockIdx.x*blockDim.x+threadIdx.x;
     int total=heads*(HEAD_DIM/2); if(pair>=total) return;
     int h=pair/(HEAD_DIM/2), p=pair%(HEAD_DIM/2);
-    int d0=p*2,d1=d0+1,base=h*HEAD_DIM;
-    float inv=powf(rope_theta,-(float)d0/HEAD_DIM);
+    int d0=p,d1=p+(HEAD_DIM/2),base=h*HEAD_DIM;
+    float inv=powf(rope_theta,-(float)(2*p)/HEAD_DIM);
     float a=pos*inv,c=cosf(a),s=sinf(a);
     float v0=x[base+d0],v1=x[base+d1];
     x[base+d0]=v0*c-v1*s; x[base+d1]=v0*s+v1*c;
@@ -272,7 +272,7 @@ struct Work{
     float *x=nullptr,*n=nullptr,*q=nullptr,*k=nullptr,*v=nullptr,*ctx=nullptr,*ao=nullptr;
     float *gate=nullptr,*up=nullptr,*mid=nullptr,*mo=nullptr,*logits=nullptr;
 };
-struct Engine{Model m; Work w; int max_seq=0,pos=0;};
+struct Engine{Model m; Work w; std::vector<int> history; int max_seq=0,pos=0; float repetition_penalty=1.0f;};
 
 static void freep(float*& p){if(p){cudaFree(p);p=nullptr;}}
 static std::string lname(int i,const std::string& s){return "model.layers."+std::to_string(i)+"."+s;}
@@ -359,9 +359,19 @@ static void forward_token(const Model& m,Work& w,int token,int pos){
     linear_kernel<<<(VOCAB_SIZE+B-1)/B,B>>>(w.n,m.lm,nullptr,w.logits,HIDDEN,VOCAB_SIZE);
     CK(cudaDeviceSynchronize());
 }
-static int argmax_gpu_to_cpu(float* d){
+static int argmax_gpu_to_cpu(float* d,const std::vector<int>& history,float repetition_penalty){
     std::vector<float> h(VOCAB_SIZE);
     CK(cudaMemcpy(h.data(),d,VOCAB_SIZE*sizeof(float),cudaMemcpyDeviceToHost));
+    if(repetition_penalty>1.0f){
+        std::vector<unsigned char> seen(VOCAB_SIZE,0);
+        for(int t:history){
+            if(t>=0&&t<VOCAB_SIZE) seen[t]=1;
+        }
+        for(int i=0;i<VOCAB_SIZE;i++){
+            if(!seen[i]) continue;
+            h[i]=h[i]>0 ? h[i]/repetition_penalty : h[i]*repetition_penalty;
+        }
+    }
     int best=0; for(int i=1;i<VOCAB_SIZE;i++) if(h[i]>h[best]) best=i; return best;
 }
 
@@ -379,15 +389,25 @@ void* llm_create(const char* model_dir,int max_seq){
 void llm_destroy(void* h){
     if(!h) return; Engine* e=(Engine*)h; free_work(e->w); free_model(e->m); delete e;
 }
+int llm_set_repetition_penalty(void* h,float penalty){
+    try{
+        if(!h) throw std::runtime_error("handle null");
+        if(penalty<1.0f) throw std::runtime_error("repetition penalty must be >= 1.0");
+        ((Engine*)h)->repetition_penalty=penalty;
+        return 0;
+    }catch(const std::exception& ex){g_err=ex.what(); return -1;}
+}
 int llm_prefill(void* h,const int* tokens,int n){
     try{
         if(!h) throw std::runtime_error("handle null");
         if(!tokens) throw std::runtime_error("tokens null");
         Engine* e=(Engine*)h; if(n<=0||n>e->max_seq) throw std::runtime_error("bad prefill length");
         e->pos=0;
+        e->history.clear();
         for(int i=0;i<n;i++){
             std::cout<<"[C++] prefill pos="<<e->pos<<", token="<<tokens[i]<<"\n";
             forward_token(e->m,e->w,tokens[i],e->pos);
+            e->history.push_back(tokens[i]);
             e->pos++;
         }
         return 0;
@@ -398,9 +418,10 @@ int llm_decode_one(void* h,int* next){
         if(!h) throw std::runtime_error("handle null");
         if(!next) throw std::runtime_error("next null");
         Engine* e=(Engine*)h; if(e->pos>=e->max_seq) throw std::runtime_error("pos >= max_seq");
-        int t=argmax_gpu_to_cpu(e->w.logits);
+        int t=argmax_gpu_to_cpu(e->w.logits,e->history,e->repetition_penalty);
         *next=t;
         std::cout<<"[C++] decode pos="<<e->pos<<", token="<<t<<"\n";
+        e->history.push_back(t);
         forward_token(e->m,e->w,t,e->pos);
         e->pos++;
         return 0;

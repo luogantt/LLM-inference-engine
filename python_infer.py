@@ -13,6 +13,7 @@ def parse_args():
     p.add_argument("--prompt", default="你好 deepseek")
     p.add_argument("--max-new-tokens", type=int, default=16)
     p.add_argument("--max-seq", type=int, default=256)
+    p.add_argument("--repetition-penalty", type=float, default=1.1)
     p.add_argument("--no-chat-template", action="store_true")
     return p.parse_args()
 
@@ -43,6 +44,12 @@ class CudaLLM:
         ]
         self.lib.llm_decode_one.restype = ctypes.c_int
 
+        self.lib.llm_set_repetition_penalty.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_float,
+        ]
+        self.lib.llm_set_repetition_penalty.restype = ctypes.c_int
+
         self.lib.llm_last_error.argtypes = []
         self.lib.llm_last_error.restype = ctypes.c_char_p
 
@@ -70,6 +77,9 @@ class CudaLLM:
         out = ctypes.c_int(-1)
         self.check(self.lib.llm_decode_one(self.handle, ctypes.byref(out)))
         return int(out.value)
+
+    def set_repetition_penalty(self, penalty: float):
+        self.check(self.lib.llm_set_repetition_penalty(self.handle, ctypes.c_float(penalty)))
 
     def __del__(self):
         if getattr(self, "handle", None):
@@ -122,7 +132,21 @@ def main():
     print(input_ids)
     print("input length:", len(input_ids))
 
+    if len(input_ids) >= args.max_seq:
+        raise ValueError(
+            f"input length {len(input_ids)} must be smaller than --max-seq {args.max_seq}"
+        )
+
+    max_decode_tokens = min(args.max_new_tokens, args.max_seq - len(input_ids))
+    if max_decode_tokens < args.max_new_tokens:
+        print(
+            "[Python] max-new-tokens clipped from "
+            f"{args.max_new_tokens} to {max_decode_tokens} because max_seq={args.max_seq}"
+        )
+
     engine = CudaLLM(args.lib, args.model, args.max_seq)
+    engine.set_repetition_penalty(args.repetition_penalty)
+    print(f"[Python] repetition penalty: {args.repetition_penalty}")
 
     print("\n========== CUDA prefill ==========")
     engine.prefill(input_ids)
@@ -131,7 +155,7 @@ def main():
     gen_ids: List[int] = []
 
     print("\n========== CUDA decode ==========")
-    for i in range(args.max_new_tokens):
+    for i in range(max_decode_tokens):
         tid = engine.decode_one()
         gen_ids.append(tid)
 

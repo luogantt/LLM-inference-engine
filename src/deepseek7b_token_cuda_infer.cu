@@ -437,10 +437,10 @@ __global__ void rope_kernel(float* x, int n_heads, int pos, float rope_theta) {
     int h = pair / (HEAD_DIM / 2);
     int p = pair % (HEAD_DIM / 2);
 
-    int d0 = p * 2;
-    int d1 = d0 + 1;
+    int d0 = p;
+    int d1 = p + (HEAD_DIM / 2);
 
-    float inv_freq = powf(rope_theta, -static_cast<float>(d0) / HEAD_DIM);
+    float inv_freq = powf(rope_theta, -static_cast<float>(2 * p) / HEAD_DIM);
     float angle = pos * inv_freq;
     float c = cosf(angle);
     float s = sinf(angle);
