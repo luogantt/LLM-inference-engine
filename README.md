@@ -165,3 +165,7 @@ CPU argmax        -> GPU reduce argmax
 ```
 
 这个项目是“从零写推理器”的第 0 版。
+
+```
+CUDA_VISIBLE_DEVICES=4 python python_infer.py --model /data3/ledi/models/DeepSeek-R1-Distill-Qwen-7B --lib ./build/libllm_cuda.so --prompt "你好 deepseek" --max-new-tokens 3 --max-seq 128
+```
