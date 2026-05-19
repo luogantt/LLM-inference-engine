@@ -281,6 +281,24 @@ __global__ void rmsnorm_kernel(const float* x,const float* w,float* y,int D,floa
     float inv=rsqrtf(sh[0]/D+eps);
     for(int i=tid;i<D;i+=blockDim.x) y[i]=x[i]*inv*w[i];
 }
+__global__ void add_rmsnorm_kernel(float* x,const float* res,const float* w,float* y,int D,float eps){
+    extern __shared__ float sh[];
+    int tid=threadIdx.x;
+    float s=0.0f;
+    for(int i=tid;i<D;i+=blockDim.x){
+        float v=x[i]+res[i];
+        x[i]=v;
+        s+=v*v;
+    }
+    sh[tid]=s;
+    __syncthreads();
+    for(int stride=blockDim.x/2;stride>0;stride>>=1){
+        if(tid<stride) sh[tid]+=sh[tid+stride];
+        __syncthreads();
+    }
+    float inv=rsqrtf(sh[0]/D+eps);
+    for(int i=tid;i<D;i+=blockDim.x) y[i]=x[i]*inv*w[i];
+}
 __global__ void linear_kernel(const float* x,const WeightT* W,const float* b,float* y,int IN,int OUT){
     __shared__ float sh[256];
     int o=blockIdx.x;
@@ -469,6 +487,56 @@ __global__ void attention_apply_kernel(const float* probs,const float* vc,float*
         out+=p*vc[(size_t)t*KV_DIM+kh*HEAD_DIM+d];
     }
     ctx[idx]=out;
+}
+__global__ void attention_fused_kernel(const float* q,const float* kc,const float* vc,float* scores,float* ctx,int pos,int max_seq){
+    __shared__ float sh[256];
+    __shared__ float qsh[HEAD_DIM];
+    int h=blockIdx.x;
+    int tid=threadIdx.x;
+    int group=N_HEADS/N_KV_HEADS;
+    int kh=h/group;
+    const float* qh=q+h*HEAD_DIM;
+    if(tid<HEAD_DIM) qsh[tid]=qh[tid];
+    __syncthreads();
+    const float scale=rsqrtf((float)HEAD_DIM);
+    float mx=-INFINITY;
+    for(int t=tid;t<=pos;t+=blockDim.x){
+        const float* row=kc+(size_t)t*KV_DIM+kh*HEAD_DIM;
+        float dot=0.0f;
+#pragma unroll
+        for(int r=0;r<HEAD_DIM;r++) dot=fmaf(qsh[r],row[r],dot);
+        float s=dot*scale;
+        scores[(size_t)h*max_seq+t]=s;
+        mx=fmaxf(mx,s);
+    }
+    sh[tid]=mx;
+    __syncthreads();
+    for(int stride=blockDim.x/2;stride>0;stride>>=1){
+        if(tid<stride) sh[tid]=fmaxf(sh[tid],sh[tid+stride]);
+        __syncthreads();
+    }
+    mx=sh[0];
+    float den=0.0f;
+    for(int t=tid;t<=pos;t+=blockDim.x){
+        float e=expf(scores[(size_t)h*max_seq+t]-mx);
+        scores[(size_t)h*max_seq+t]=e;
+        den+=e;
+    }
+    sh[tid]=den;
+    __syncthreads();
+    for(int stride=blockDim.x/2;stride>0;stride>>=1){
+        if(tid<stride) sh[tid]+=sh[tid+stride];
+        __syncthreads();
+    }
+    float inv_den=1.0f/sh[0];
+    for(int d=tid;d<HEAD_DIM;d+=blockDim.x){
+        float out=0.0f;
+        for(int t=0;t<=pos;t++){
+            float p=scores[(size_t)h*max_seq+t]*inv_den;
+            out=fmaf(p,vc[(size_t)t*KV_DIM+kh*HEAD_DIM+d],out);
+        }
+        ctx[h*HEAD_DIM+d]=out;
+    }
 }
 __global__ void mark_token_seen_kernel(unsigned char* seen,int token){
     if(token>=0 && token<VOCAB_SIZE) seen[token]=1;
@@ -712,24 +780,25 @@ static void forward_token(const Model& m,Work& w,int token,int pos,int max_seq){
     if(token<0||token>=VOCAB_SIZE) throw std::runtime_error("bad token id "+std::to_string(token));
     int B=256;
     embedding_kernel<<<(HIDDEN+B-1)/B,B>>>(token,m.emb,w.x);
+    rmsnorm_kernel<<<1,B,B*sizeof(float)>>>(w.x,m.layers[0].ln1,w.n,HIDDEN,m.rms_norm_eps);
     for(int i=0;i<N_LAYERS;i++){
         const Layer& l=m.layers[i];
-        rmsnorm_kernel<<<1,B,B*sizeof(float)>>>(w.x,l.ln1,w.n,HIDDEN,m.rms_norm_eps);
         launch_qkv_from_float(w.n,w.wmma_x,l.wq,l.wk,l.wv,l.bq,l.bk,l.bv,w.q,w.k,w.v,HIDDEN);
         rope_kernel<<<(N_HEADS*(HEAD_DIM/2)+B-1)/B,B>>>(w.q,N_HEADS,pos,m.rope_theta);
         rope_kernel<<<(N_KV_HEADS*(HEAD_DIM/2)+B-1)/B,B>>>(w.k,N_KV_HEADS,pos,m.rope_theta);
         store_kv_kernel<<<(KV_DIM+B-1)/B,B>>>(l.kc,w.k,pos,KV_DIM);
         store_kv_kernel<<<(KV_DIM+B-1)/B,B>>>(l.vc,w.v,pos,KV_DIM);
-        attention_scores_kernel<<<N_HEADS,B>>>(w.q,l.kc,w.attn_scores,pos,max_seq);
-        attention_softmax_kernel<<<N_HEADS,B>>>(w.attn_scores,pos,max_seq);
-        attention_apply_kernel<<<(HIDDEN+B-1)/B,B>>>(w.attn_scores,l.vc,w.ctx,pos,max_seq);
+        attention_fused_kernel<<<N_HEADS,B>>>(w.q,l.kc,l.vc,w.attn_scores,w.ctx,pos,max_seq);
         launch_linear_from_float(w.ctx,w.wmma_x,l.wo,nullptr,w.ao,HIDDEN,HIDDEN);
-        add_kernel<<<(HIDDEN+B-1)/B,B>>>(w.x,w.ao,HIDDEN);
-        rmsnorm_kernel<<<1,B,B*sizeof(float)>>>(w.x,l.ln2,w.n,HIDDEN,m.rms_norm_eps);
+        add_rmsnorm_kernel<<<1,B,B*sizeof(float)>>>(w.x,w.ao,l.ln2,w.n,HIDDEN,m.rms_norm_eps);
         launch_gate_up_from_float(w.n,w.wmma_x,l.wgate,l.wup,w.gate,w.up,HIDDEN);
         silu_mul_kernel<<<(INTERMEDIATE+B-1)/B,B>>>(w.gate,w.up,w.mid,INTERMEDIATE);
         launch_linear_from_float(w.mid,w.wmma_x,l.wdown,nullptr,w.mo,INTERMEDIATE,HIDDEN);
-        add_kernel<<<(HIDDEN+B-1)/B,B>>>(w.x,w.mo,HIDDEN);
+        if(i+1<N_LAYERS){
+            add_rmsnorm_kernel<<<1,B,B*sizeof(float)>>>(w.x,w.mo,m.layers[i+1].ln1,w.n,HIDDEN,m.rms_norm_eps);
+        }else{
+            add_kernel<<<(HIDDEN+B-1)/B,B>>>(w.x,w.mo,HIDDEN);
+        }
     }
     rmsnorm_kernel<<<1,B,B*sizeof(float)>>>(w.x,m.norm,w.n,HIDDEN,m.rms_norm_eps);
     launch_linear_from_float(w.n,w.wmma_x,m.lm,nullptr,w.logits,HIDDEN,VOCAB_SIZE);
