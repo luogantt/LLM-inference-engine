@@ -496,59 +496,89 @@ __global__ void store_kv_kernel(float* cache, const float* x, int pos, int dim) 
 // 单 token decode attention。
 // 这是最朴素版本：每个输出元素重复计算 softmax。
 // 慢，但代码最清楚。
-__global__ void attention_kernel(
+__global__ void attention_scores_kernel(
     const float* q,
     const float* k_cache,
+    float* scores,
+    int pos,
+    int max_seq
+) {
+    int h = blockIdx.x;
+    int tid = threadIdx.x;
+    int group_size = N_HEADS / N_KV_HEADS;
+    int kv_h = h / group_size;
+    const float scale = rsqrtf(static_cast<float>(HEAD_DIM));
+
+    for (int t = tid; t <= pos; t += blockDim.x) {
+        float dot = 0.0f;
+        const float* qh = q + h * HEAD_DIM;
+        const float* kh = k_cache + static_cast<size_t>(t) * KV_DIM + kv_h * HEAD_DIM;
+        for (int r = 0; r < HEAD_DIM; ++r) {
+            dot += qh[r] * kh[r];
+        }
+        scores[static_cast<size_t>(h) * max_seq + t] = dot * scale;
+    }
+}
+
+__global__ void attention_softmax_kernel(float* scores, int pos, int max_seq) {
+    __shared__ float sh[256];
+    int h = blockIdx.x;
+    int tid = threadIdx.x;
+
+    float max_score = -INFINITY;
+    for (int t = tid; t <= pos; t += blockDim.x) {
+        max_score = fmaxf(max_score, scores[static_cast<size_t>(h) * max_seq + t]);
+    }
+    sh[tid] = max_score;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) sh[tid] = fmaxf(sh[tid], sh[tid + stride]);
+        __syncthreads();
+    }
+
+    max_score = sh[0];
+    float denom = 0.0f;
+    for (int t = tid; t <= pos; t += blockDim.x) {
+        float e = expf(scores[static_cast<size_t>(h) * max_seq + t] - max_score);
+        scores[static_cast<size_t>(h) * max_seq + t] = e;
+        denom += e;
+    }
+    sh[tid] = denom;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) sh[tid] += sh[tid + stride];
+        __syncthreads();
+    }
+
+    denom = sh[0];
+    for (int t = tid; t <= pos; t += blockDim.x) {
+        scores[static_cast<size_t>(h) * max_seq + t] /= denom;
+    }
+}
+
+__global__ void attention_apply_kernel(
+    const float* probs,
     const float* v_cache,
     float* ctx,
-    int pos
+    int pos,
+    int max_seq
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= HIDDEN) return;
 
     int d = idx % HEAD_DIM;
     int h = idx / HEAD_DIM;
-
     int group_size = N_HEADS / N_KV_HEADS;
     int kv_h = h / group_size;
 
-    float max_score = -1e30f;
-
-    for (int t = 0; t <= pos; ++t) {
-        float dot = 0.0f;
-
-        for (int r = 0; r < HEAD_DIM; ++r) {
-            float qv = q[h * HEAD_DIM + r];
-            float kv = k_cache[static_cast<size_t>(t) * KV_DIM + kv_h * HEAD_DIM + r];
-            dot += qv * kv;
-        }
-
-        float score = dot / sqrtf(static_cast<float>(HEAD_DIM));
-        max_score = fmaxf(max_score, score);
-    }
-
-    float denom = 0.0f;
     float out = 0.0f;
-
     for (int t = 0; t <= pos; ++t) {
-        float dot = 0.0f;
-
-        for (int r = 0; r < HEAD_DIM; ++r) {
-            float qv = q[h * HEAD_DIM + r];
-            float kv = k_cache[static_cast<size_t>(t) * KV_DIM + kv_h * HEAD_DIM + r];
-            dot += qv * kv;
-        }
-
-        float score = dot / sqrtf(static_cast<float>(HEAD_DIM));
-        float e = expf(score - max_score);
-
-        denom += e;
-
-        float vv = v_cache[static_cast<size_t>(t) * KV_DIM + kv_h * HEAD_DIM + d];
-        out += e * vv;
+        float p = probs[static_cast<size_t>(h) * max_seq + t];
+        out += p * v_cache[static_cast<size_t>(t) * KV_DIM + kv_h * HEAD_DIM + d];
     }
-
-    ctx[idx] = out / denom;
+    ctx[idx] = out;
 }
 
 struct LayerWeights {
@@ -594,6 +624,7 @@ struct Work {
     float* mid = nullptr;
     float* mlp_out = nullptr;
     float* logits = nullptr;
+    float* attn_scores = nullptr;
 };
 
 static std::string layer_name(int l, const std::string& suffix) {
@@ -643,7 +674,7 @@ static Model load_model(const std::string& model_dir, int max_seq) {
     return m;
 }
 
-static Work make_work() {
+static Work make_work(int max_seq) {
     Work w{};
 
     CK(cudaMalloc(&w.x, HIDDEN * sizeof(float)));
@@ -658,11 +689,12 @@ static Work make_work() {
     CK(cudaMalloc(&w.mid, INTERMEDIATE * sizeof(float)));
     CK(cudaMalloc(&w.mlp_out, HIDDEN * sizeof(float)));
     CK(cudaMalloc(&w.logits, VOCAB_SIZE * sizeof(float)));
+    CK(cudaMalloc(&w.attn_scores, static_cast<size_t>(N_HEADS) * max_seq * sizeof(float)));
 
     return w;
 }
 
-static void forward_token(const Model& m, Work& w, int token, int pos) {
+static void forward_token(const Model& m, Work& w, int token, int pos, int max_seq) {
     if (token < 0 || token >= VOCAB_SIZE) {
         std::cerr << "bad token id: " << token << "\n";
         std::exit(1);
@@ -687,7 +719,9 @@ static void forward_token(const Model& m, Work& w, int token, int pos) {
         store_kv_kernel<<<(KV_DIM + block - 1) / block, block>>>(layer.k_cache, w.k, pos, KV_DIM);
         store_kv_kernel<<<(KV_DIM + block - 1) / block, block>>>(layer.v_cache, w.v, pos, KV_DIM);
 
-        attention_kernel<<<(HIDDEN + block - 1) / block, block>>>(w.q, layer.k_cache, layer.v_cache, w.ctx, pos);
+        attention_scores_kernel<<<N_HEADS, block>>>(w.q, layer.k_cache, w.attn_scores, pos, max_seq);
+        attention_softmax_kernel<<<N_HEADS, block>>>(w.attn_scores, pos, max_seq);
+        attention_apply_kernel<<<(HIDDEN + block - 1) / block, block>>>(w.attn_scores, layer.v_cache, w.ctx, pos, max_seq);
 
         linear_kernel<<<HIDDEN, block>>>(w.ctx, layer.wo, nullptr, w.attn_out, HIDDEN, HIDDEN);
         add_kernel<<<(HIDDEN + block - 1) / block, block>>>(w.x, w.attn_out, HIDDEN);
@@ -808,7 +842,7 @@ int main(int argc, char** argv) {
     std::cout << "max_seq = " << args.max_seq << "\n";
 
     Model model = load_model(args.model_dir, args.max_seq);
-    Work work = make_work();
+    Work work = make_work(args.max_seq);
 
     std::vector<float> logits(VOCAB_SIZE);
 
@@ -819,7 +853,7 @@ int main(int argc, char** argv) {
     for (int pos = 0; pos < static_cast<int>(tokens.size()); ++pos) {
         std::cout << "prefill pos " << pos << ", token " << tokens[pos] << "\n";
         auto forward_start = Clock::now();
-        forward_token(model, work, tokens[pos], pos);
+        forward_token(model, work, tokens[pos], pos, args.max_seq);
         double forward_ms = elapsed_ms(forward_start, Clock::now());
         prefill_forward_ms += forward_ms;
         {
@@ -862,7 +896,7 @@ int main(int argc, char** argv) {
 
         if (i + 1 < args.steps) {
             auto forward_start = Clock::now();
-            forward_token(model, work, next, pos);
+            forward_token(model, work, next, pos, args.max_seq);
             double forward_ms = elapsed_ms(forward_start, Clock::now());
             decode_forward_ms_total += forward_ms;
             {

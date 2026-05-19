@@ -268,24 +268,61 @@ __global__ void store_kv_kernel(float* cache,const float* x,int pos,int dim){
     int i=blockIdx.x*blockDim.x+threadIdx.x;
     if(i<dim) cache[(size_t)pos*dim+i]=x[i];
 }
-__global__ void attn_kernel(const float* q,const float* kc,const float* vc,float* ctx,int pos){
+__global__ void attention_scores_kernel(const float* q,const float* kc,float* scores,int pos,int max_seq){
+    int h=blockIdx.x;
+    int tid=threadIdx.x;
+    int group=N_HEADS/N_KV_HEADS, kh=h/group;
+    const float scale=rsqrtf((float)HEAD_DIM);
+    for(int t=tid;t<=pos;t+=blockDim.x){
+        float dot=0.0f;
+        const float* qh=q+h*HEAD_DIM;
+        const float* row=kc+(size_t)t*KV_DIM+kh*HEAD_DIM;
+        for(int r=0;r<HEAD_DIM;r++) dot+=qh[r]*row[r];
+        scores[(size_t)h*max_seq+t]=dot*scale;
+    }
+}
+__global__ void attention_softmax_kernel(float* scores,int pos,int max_seq){
+    __shared__ float sh[256];
+    int h=blockIdx.x;
+    int tid=threadIdx.x;
+    float mx=-INFINITY;
+    for(int t=tid;t<=pos;t+=blockDim.x){
+        mx=fmaxf(mx,scores[(size_t)h*max_seq+t]);
+    }
+    sh[tid]=mx;
+    __syncthreads();
+    for(int stride=blockDim.x/2;stride>0;stride>>=1){
+        if(tid<stride) sh[tid]=fmaxf(sh[tid],sh[tid+stride]);
+        __syncthreads();
+    }
+    mx=sh[0];
+    float den=0.0f;
+    for(int t=tid;t<=pos;t+=blockDim.x){
+        float e=expf(scores[(size_t)h*max_seq+t]-mx);
+        scores[(size_t)h*max_seq+t]=e;
+        den+=e;
+    }
+    sh[tid]=den;
+    __syncthreads();
+    for(int stride=blockDim.x/2;stride>0;stride>>=1){
+        if(tid<stride) sh[tid]+=sh[tid+stride];
+        __syncthreads();
+    }
+    den=sh[0];
+    for(int t=tid;t<=pos;t+=blockDim.x){
+        scores[(size_t)h*max_seq+t]/=den;
+    }
+}
+__global__ void attention_apply_kernel(const float* probs,const float* vc,float* ctx,int pos,int max_seq){
     int idx=blockIdx.x*blockDim.x+threadIdx.x; if(idx>=HIDDEN) return;
     int d=idx%HEAD_DIM, h=idx/HEAD_DIM;
     int group=N_HEADS/N_KV_HEADS, kh=h/group;
-    float mx=-1e30f;
+    float out=0.0f;
     for(int t=0;t<=pos;t++){
-        float dot=0;
-        for(int r=0;r<HEAD_DIM;r++) dot+=q[h*HEAD_DIM+r]*kc[(size_t)t*KV_DIM+kh*HEAD_DIM+r];
-        mx=fmaxf(mx,dot/sqrtf((float)HEAD_DIM));
+        float p=probs[(size_t)h*max_seq+t];
+        out+=p*vc[(size_t)t*KV_DIM+kh*HEAD_DIM+d];
     }
-    float den=0,out=0;
-    for(int t=0;t<=pos;t++){
-        float dot=0;
-        for(int r=0;r<HEAD_DIM;r++) dot+=q[h*HEAD_DIM+r]*kc[(size_t)t*KV_DIM+kh*HEAD_DIM+r];
-        float e=expf(dot/sqrtf((float)HEAD_DIM)-mx);
-        den+=e; out+=e*vc[(size_t)t*KV_DIM+kh*HEAD_DIM+d];
-    }
-    ctx[idx]=out/den;
+    ctx[idx]=out;
 }
 __global__ void mark_token_seen_kernel(unsigned char* seen,int token){
     if(token>=0 && token<VOCAB_SIZE) seen[token]=1;
@@ -332,6 +369,7 @@ struct Model{float *emb=nullptr,*norm=nullptr,*lm=nullptr; float rms_norm_eps=DE
 struct Work{
     float *x=nullptr,*n=nullptr,*q=nullptr,*k=nullptr,*v=nullptr,*ctx=nullptr,*ao=nullptr;
     float *gate=nullptr,*up=nullptr,*mid=nullptr,*mo=nullptr,*logits=nullptr;
+    float *attn_scores=nullptr;
 };
 struct Engine{
     Model m;
@@ -352,7 +390,7 @@ template <typename T>
 static void freep(T*& p){if(p){cudaFree(p);p=nullptr;}}
 static std::string lname(int i,const std::string& s){return "model.layers."+std::to_string(i)+"."+s;}
 
-static Work make_work(){
+static Work make_work(int max_seq){
     Work w;
     CK(cudaMalloc(&w.x,HIDDEN*sizeof(float))); CK(cudaMalloc(&w.n,HIDDEN*sizeof(float)));
     CK(cudaMalloc(&w.q,HIDDEN*sizeof(float))); CK(cudaMalloc(&w.k,KV_DIM*sizeof(float))); CK(cudaMalloc(&w.v,KV_DIM*sizeof(float)));
@@ -360,11 +398,12 @@ static Work make_work(){
     CK(cudaMalloc(&w.gate,INTERMEDIATE*sizeof(float))); CK(cudaMalloc(&w.up,INTERMEDIATE*sizeof(float)));
     CK(cudaMalloc(&w.mid,INTERMEDIATE*sizeof(float))); CK(cudaMalloc(&w.mo,HIDDEN*sizeof(float)));
     CK(cudaMalloc(&w.logits,VOCAB_SIZE*sizeof(float)));
+    CK(cudaMalloc(&w.attn_scores,(size_t)N_HEADS*max_seq*sizeof(float)));
     return w;
 }
 static void free_work(Work& w){
     freep(w.x);freep(w.n);freep(w.q);freep(w.k);freep(w.v);freep(w.ctx);freep(w.ao);
-    freep(w.gate);freep(w.up);freep(w.mid);freep(w.mo);freep(w.logits);
+    freep(w.gate);freep(w.up);freep(w.mid);freep(w.mo);freep(w.logits);freep(w.attn_scores);
 }
 static Model load_model(const std::string& dir,int max_seq){
     ModelConfig cfg=load_config(dir);
@@ -409,7 +448,7 @@ static void free_model(Model& m){
 static void mark_seen(unsigned char* seen,int token){
     mark_token_seen_kernel<<<1,1>>>(seen,token);
 }
-static void forward_token(const Model& m,Work& w,int token,int pos){
+static void forward_token(const Model& m,Work& w,int token,int pos,int max_seq){
     if(token<0||token>=VOCAB_SIZE) throw std::runtime_error("bad token id "+std::to_string(token));
     int B=256;
     embedding_kernel<<<(HIDDEN+B-1)/B,B>>>(token,m.emb,w.x);
@@ -423,7 +462,9 @@ static void forward_token(const Model& m,Work& w,int token,int pos){
         rope_kernel<<<(N_KV_HEADS*(HEAD_DIM/2)+B-1)/B,B>>>(w.k,N_KV_HEADS,pos,m.rope_theta);
         store_kv_kernel<<<(KV_DIM+B-1)/B,B>>>(l.kc,w.k,pos,KV_DIM);
         store_kv_kernel<<<(KV_DIM+B-1)/B,B>>>(l.vc,w.v,pos,KV_DIM);
-        attn_kernel<<<(HIDDEN+B-1)/B,B>>>(w.q,l.kc,l.vc,w.ctx,pos);
+        attention_scores_kernel<<<N_HEADS,B>>>(w.q,l.kc,w.attn_scores,pos,max_seq);
+        attention_softmax_kernel<<<N_HEADS,B>>>(w.attn_scores,pos,max_seq);
+        attention_apply_kernel<<<(HIDDEN+B-1)/B,B>>>(w.attn_scores,l.vc,w.ctx,pos,max_seq);
         linear_kernel<<<HIDDEN,B>>>(w.ctx,l.wo,nullptr,w.ao,HIDDEN,HIDDEN);
         add_kernel<<<(HIDDEN+B-1)/B,B>>>(w.x,w.ao,HIDDEN);
         rmsnorm_kernel<<<1,B,B*sizeof(float)>>>(w.x,l.ln2,w.n,HIDDEN,m.rms_norm_eps);
@@ -457,7 +498,7 @@ void* llm_create(const char* model_dir,int max_seq){
             os<<"[C++][time] create engine, model="<<model_dir<<", max_seq="<<max_seq;
             time_log(os.str());
         }
-        e->m=load_model(model_dir,max_seq); e->w=make_work();
+        e->m=load_model(model_dir,max_seq); e->w=make_work(max_seq);
         CK(cudaMalloc(&e->seen,VOCAB_SIZE*sizeof(unsigned char)));
         CK(cudaMalloc(&e->next_token,sizeof(int)));
         CK(cudaMemset(e->seen,0,VOCAB_SIZE*sizeof(unsigned char)));
@@ -492,7 +533,7 @@ int llm_prefill(void* h,const int* tokens,int n){
         for(int i=0;i<n;i++){
             std::cout<<"[C++] prefill pos="<<e->pos<<", token="<<tokens[i]<<"\n";
             auto forward_start=Clock::now();
-            forward_token(e->m,e->w,tokens[i],e->pos);
+            forward_token(e->m,e->w,tokens[i],e->pos,e->max_seq);
             double forward_ms=elapsed_ms(forward_start,Clock::now());
             e->forward_ms+=forward_ms;
             mark_seen(e->seen,tokens[i]);
@@ -530,7 +571,7 @@ int llm_decode_one(void* h,int* next){
         std::cout<<"[C++] decode pos="<<e->pos<<", token="<<t<<"\n";
         mark_seen(e->seen,t);
         auto forward_start=Clock::now();
-        forward_token(e->m,e->w,t,e->pos);
+        forward_token(e->m,e->w,t,e->pos,e->max_seq);
         double forward_ms=elapsed_ms(forward_start,Clock::now());
         e->forward_ms+=forward_ms;
         e->pos++;
