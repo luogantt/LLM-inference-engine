@@ -67,18 +67,32 @@ __global__ void rmsnorm_kernel(const float* x, const float* weight, float* y, in
 
 // y[out] = W[out, in] @ x[in] + bias[out]
 __global__ void linear_kernel(const float* x, const float* W, const float* bias, float* y, int IN, int OUT) {
-    int o = blockIdx.x * blockDim.x + threadIdx.x;
+    __shared__ float sh[256];
+    int o = blockIdx.x;
+    int tid = threadIdx.x;
     if (o >= OUT) return;
 
     float sum = 0.0f;
     const float* row = W + o * IN;
 
-    for (int i = 0; i < IN; ++i) {
+    for (int i = tid; i < IN; i += blockDim.x) {
         sum += row[i] * x[i];
     }
 
-    if (bias) sum += bias[o];
-    y[o] = sum;
+    sh[tid] = sum;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            sh[tid] += sh[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        if (bias) sh[0] += bias[o];
+        y[o] = sh[0];
+    }
 }
 
 __global__ void add_kernel(float* x, const float* y, int N) {
@@ -304,9 +318,9 @@ void forward_token(const Model& m, Work& w, int token, int pos) {
 
         rmsnorm_kernel<<<1, block, block * sizeof(float)>>>(w.x, layer.ln1, w.n, HIDDEN, 1e-6f);
 
-        linear_kernel<<<(HIDDEN + block - 1) / block, block>>>(w.n, layer.wq, layer.bq, w.q, HIDDEN, HIDDEN);
-        linear_kernel<<<(KV_DIM + block - 1) / block, block>>>(w.n, layer.wk, layer.bk, w.k, HIDDEN, KV_DIM);
-        linear_kernel<<<(KV_DIM + block - 1) / block, block>>>(w.n, layer.wv, layer.bv, w.v, HIDDEN, KV_DIM);
+        linear_kernel<<<HIDDEN, block>>>(w.n, layer.wq, layer.bq, w.q, HIDDEN, HIDDEN);
+        linear_kernel<<<KV_DIM, block>>>(w.n, layer.wk, layer.bk, w.k, HIDDEN, KV_DIM);
+        linear_kernel<<<KV_DIM, block>>>(w.n, layer.wv, layer.bv, w.v, HIDDEN, KV_DIM);
 
         rope_kernel<<<(N_HEADS * (HEAD_DIM / 2) + block - 1) / block, block>>>(w.q, N_HEADS, pos);
         rope_kernel<<<(N_KV_HEADS * (HEAD_DIM / 2) + block - 1) / block, block>>>(w.k, N_KV_HEADS, pos);
@@ -316,23 +330,23 @@ void forward_token(const Model& m, Work& w, int token, int pos) {
 
         attention_kernel<<<(HIDDEN + block - 1) / block, block>>>(w.q, layer.k_cache, layer.v_cache, w.ctx, pos);
 
-        linear_kernel<<<(HIDDEN + block - 1) / block, block>>>(w.ctx, layer.wo, nullptr, w.attn_out, HIDDEN, HIDDEN);
+        linear_kernel<<<HIDDEN, block>>>(w.ctx, layer.wo, nullptr, w.attn_out, HIDDEN, HIDDEN);
         add_kernel<<<(HIDDEN + block - 1) / block, block>>>(w.x, w.attn_out, HIDDEN);
 
         rmsnorm_kernel<<<1, block, block * sizeof(float)>>>(w.x, layer.ln2, w.n, HIDDEN, 1e-6f);
 
-        linear_kernel<<<(INTERMEDIATE + block - 1) / block, block>>>(w.n, layer.wgate, nullptr, w.gate, HIDDEN, INTERMEDIATE);
-        linear_kernel<<<(INTERMEDIATE + block - 1) / block, block>>>(w.n, layer.wup, nullptr, w.up, HIDDEN, INTERMEDIATE);
+        linear_kernel<<<INTERMEDIATE, block>>>(w.n, layer.wgate, nullptr, w.gate, HIDDEN, INTERMEDIATE);
+        linear_kernel<<<INTERMEDIATE, block>>>(w.n, layer.wup, nullptr, w.up, HIDDEN, INTERMEDIATE);
 
         silu_mul_kernel<<<(INTERMEDIATE + block - 1) / block, block>>>(w.gate, w.up, w.mid, INTERMEDIATE);
 
-        linear_kernel<<<(HIDDEN + block - 1) / block, block>>>(w.mid, layer.wdown, nullptr, w.mlp_out, INTERMEDIATE, HIDDEN);
+        linear_kernel<<<HIDDEN, block>>>(w.mid, layer.wdown, nullptr, w.mlp_out, INTERMEDIATE, HIDDEN);
         add_kernel<<<(HIDDEN + block - 1) / block, block>>>(w.x, w.mlp_out, HIDDEN);
     }
 
     rmsnorm_kernel<<<1, block, block * sizeof(float)>>>(w.x, m.norm, w.n, HIDDEN, 1e-6f);
 
-    linear_kernel<<<(VOCAB_SIZE + block - 1) / block, block>>>(w.n, m.lm_head, nullptr, w.logits, HIDDEN, VOCAB_SIZE);
+    linear_kernel<<<VOCAB_SIZE, block>>>(w.n, m.lm_head, nullptr, w.logits, HIDDEN, VOCAB_SIZE);
 
     CK(cudaDeviceSynchronize());
 }

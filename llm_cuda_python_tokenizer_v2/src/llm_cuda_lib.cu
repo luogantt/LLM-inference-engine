@@ -155,11 +155,20 @@ __global__ void rmsnorm_kernel(const float* x,const float* w,float* y,int D,floa
     for(int i=tid;i<D;i+=blockDim.x) y[i]=x[i]*inv*w[i];
 }
 __global__ void linear_kernel(const float* x,const float* W,const float* b,float* y,int IN,int OUT){
-    int o=blockIdx.x*blockDim.x+threadIdx.x;
+    __shared__ float sh[256];
+    int o=blockIdx.x;
+    int tid=threadIdx.x;
     if(o>=OUT) return;
-    const float* row=W+(size_t)o*IN; float s=0;
-    for(int i=0;i<IN;i++) s+=row[i]*x[i];
-    y[o]=b ? s+b[o] : s;
+    const float* row=W+(size_t)o*IN;
+    float s=0;
+    for(int i=tid;i<IN;i+=blockDim.x) s+=row[i]*x[i];
+    sh[tid]=s;
+    __syncthreads();
+    for(int stride=blockDim.x/2;stride>0;stride>>=1){
+        if(tid<stride) sh[tid]+=sh[tid+stride];
+        __syncthreads();
+    }
+    if(tid==0) y[o]=b ? sh[0]+b[o] : sh[0];
 }
 __global__ void add_kernel(float* x,const float* y,int n){
     int i=blockIdx.x*blockDim.x+threadIdx.x; if(i<n) x[i]+=y[i];
@@ -305,25 +314,25 @@ static void forward_token(const Model& m,Work& w,int token,int pos){
     for(int i=0;i<N_LAYERS;i++){
         const Layer& l=m.layers[i];
         rmsnorm_kernel<<<1,B,B*sizeof(float)>>>(w.x,l.ln1,w.n,HIDDEN,1e-6f);
-        linear_kernel<<<(HIDDEN+B-1)/B,B>>>(w.n,l.wq,l.bq,w.q,HIDDEN,HIDDEN);
-        linear_kernel<<<(KV_DIM+B-1)/B,B>>>(w.n,l.wk,l.bk,w.k,HIDDEN,KV_DIM);
-        linear_kernel<<<(KV_DIM+B-1)/B,B>>>(w.n,l.wv,l.bv,w.v,HIDDEN,KV_DIM);
+        linear_kernel<<<HIDDEN,B>>>(w.n,l.wq,l.bq,w.q,HIDDEN,HIDDEN);
+        linear_kernel<<<KV_DIM,B>>>(w.n,l.wk,l.bk,w.k,HIDDEN,KV_DIM);
+        linear_kernel<<<KV_DIM,B>>>(w.n,l.wv,l.bv,w.v,HIDDEN,KV_DIM);
         rope_kernel<<<(N_HEADS*(HEAD_DIM/2)+B-1)/B,B>>>(w.q,N_HEADS,pos);
         rope_kernel<<<(N_KV_HEADS*(HEAD_DIM/2)+B-1)/B,B>>>(w.k,N_KV_HEADS,pos);
         store_kv_kernel<<<(KV_DIM+B-1)/B,B>>>(l.kc,w.k,pos,KV_DIM);
         store_kv_kernel<<<(KV_DIM+B-1)/B,B>>>(l.vc,w.v,pos,KV_DIM);
         attn_kernel<<<(HIDDEN+B-1)/B,B>>>(w.q,l.kc,l.vc,w.ctx,pos);
-        linear_kernel<<<(HIDDEN+B-1)/B,B>>>(w.ctx,l.wo,nullptr,w.ao,HIDDEN,HIDDEN);
+        linear_kernel<<<HIDDEN,B>>>(w.ctx,l.wo,nullptr,w.ao,HIDDEN,HIDDEN);
         add_kernel<<<(HIDDEN+B-1)/B,B>>>(w.x,w.ao,HIDDEN);
         rmsnorm_kernel<<<1,B,B*sizeof(float)>>>(w.x,l.ln2,w.n,HIDDEN,1e-6f);
-        linear_kernel<<<(INTERMEDIATE+B-1)/B,B>>>(w.n,l.wgate,nullptr,w.gate,HIDDEN,INTERMEDIATE);
-        linear_kernel<<<(INTERMEDIATE+B-1)/B,B>>>(w.n,l.wup,nullptr,w.up,HIDDEN,INTERMEDIATE);
+        linear_kernel<<<INTERMEDIATE,B>>>(w.n,l.wgate,nullptr,w.gate,HIDDEN,INTERMEDIATE);
+        linear_kernel<<<INTERMEDIATE,B>>>(w.n,l.wup,nullptr,w.up,HIDDEN,INTERMEDIATE);
         silu_mul_kernel<<<(INTERMEDIATE+B-1)/B,B>>>(w.gate,w.up,w.mid,INTERMEDIATE);
-        linear_kernel<<<(HIDDEN+B-1)/B,B>>>(w.mid,l.wdown,nullptr,w.mo,INTERMEDIATE,HIDDEN);
+        linear_kernel<<<HIDDEN,B>>>(w.mid,l.wdown,nullptr,w.mo,INTERMEDIATE,HIDDEN);
         add_kernel<<<(HIDDEN+B-1)/B,B>>>(w.x,w.mo,HIDDEN);
     }
     rmsnorm_kernel<<<1,B,B*sizeof(float)>>>(w.x,m.norm,w.n,HIDDEN,1e-6f);
-    linear_kernel<<<(VOCAB_SIZE+B-1)/B,B>>>(w.n,m.lm,nullptr,w.logits,HIDDEN,VOCAB_SIZE);
+    linear_kernel<<<VOCAB_SIZE,B>>>(w.n,m.lm,nullptr,w.logits,HIDDEN,VOCAB_SIZE);
     CK(cudaDeviceSynchronize());
 }
 static int argmax_gpu_to_cpu(float* d,int* next_token){
