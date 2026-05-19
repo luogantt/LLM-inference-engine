@@ -31,6 +31,9 @@ constexpr int INTERMEDIATE=18944;
 constexpr int VOCAB_SIZE=152064;
 using WeightT = half;
 constexpr int WMMA_TILE=16;
+#ifndef USE_WMMA_LINEAR
+#define USE_WMMA_LINEAR 0
+#endif
 constexpr float ROPE_THETA=1000000.0f;
 
 static thread_local std::string g_err;
@@ -512,6 +515,47 @@ static void prepare_wmma_x(const float* x,half* xh,int n){
 static void launch_wmma_linear(const half* xh,const WeightT* W,const float* b,float* y,int IN,int OUT){
     wmma_linear_kernel<<<(OUT+WMMA_TILE-1)/WMMA_TILE,32>>>(xh,W,b,y,IN,OUT);
 }
+static void launch_linear_from_float(const float* x,half* xh,const WeightT* W,const float* b,float* y,int IN,int OUT){
+#if USE_WMMA_LINEAR
+    prepare_wmma_x(x,xh,IN);
+    launch_wmma_linear(xh,W,b,y,IN,OUT);
+#else
+    int B=256;
+    linear_kernel<<<OUT,B>>>(x,W,b,y,IN,OUT);
+#endif
+}
+static void launch_qkv_from_float(
+    const float* x,half* xh,
+    const WeightT* Wq,const WeightT* Wk,const WeightT* Wv,
+    const float* bq,const float* bk,const float* bv,
+    float* q,float* k,float* v,
+    int IN
+){
+#if USE_WMMA_LINEAR
+    prepare_wmma_x(x,xh,IN);
+    launch_wmma_linear(xh,Wq,bq,q,IN,HIDDEN);
+    launch_wmma_linear(xh,Wk,bk,k,IN,KV_DIM);
+    launch_wmma_linear(xh,Wv,bv,v,IN,KV_DIM);
+#else
+    int B=256;
+    qkv_linear_kernel<<<HIDDEN+2*KV_DIM,B>>>(x,Wq,Wk,Wv,bq,bk,bv,q,k,v,IN);
+#endif
+}
+static void launch_gate_up_from_float(
+    const float* x,half* xh,
+    const WeightT* Wgate,const WeightT* Wup,
+    float* gate,float* up,
+    int IN
+){
+#if USE_WMMA_LINEAR
+    prepare_wmma_x(x,xh,IN);
+    launch_wmma_linear(xh,Wgate,nullptr,gate,IN,INTERMEDIATE);
+    launch_wmma_linear(xh,Wup,nullptr,up,IN,INTERMEDIATE);
+#else
+    int B=256;
+    gate_up_linear_kernel<<<2*INTERMEDIATE,B>>>(x,Wgate,Wup,gate,up,IN);
+#endif
+}
 static void forward_token(const Model& m,Work& w,int token,int pos,int max_seq){
     if(token<0||token>=VOCAB_SIZE) throw std::runtime_error("bad token id "+std::to_string(token));
     int B=256;
@@ -519,10 +563,7 @@ static void forward_token(const Model& m,Work& w,int token,int pos,int max_seq){
     for(int i=0;i<N_LAYERS;i++){
         const Layer& l=m.layers[i];
         rmsnorm_kernel<<<1,B,B*sizeof(float)>>>(w.x,l.ln1,w.n,HIDDEN,1e-6f);
-        prepare_wmma_x(w.n,w.wmma_x,HIDDEN);
-        launch_wmma_linear(w.wmma_x,l.wq,l.bq,w.q,HIDDEN,HIDDEN);
-        launch_wmma_linear(w.wmma_x,l.wk,l.bk,w.k,HIDDEN,KV_DIM);
-        launch_wmma_linear(w.wmma_x,l.wv,l.bv,w.v,HIDDEN,KV_DIM);
+        launch_qkv_from_float(w.n,w.wmma_x,l.wq,l.wk,l.wv,l.bq,l.bk,l.bv,w.q,w.k,w.v,HIDDEN);
         rope_kernel<<<(N_HEADS*(HEAD_DIM/2)+B-1)/B,B>>>(w.q,N_HEADS,pos);
         rope_kernel<<<(N_KV_HEADS*(HEAD_DIM/2)+B-1)/B,B>>>(w.k,N_KV_HEADS,pos);
         store_kv_kernel<<<(KV_DIM+B-1)/B,B>>>(l.kc,w.k,pos,KV_DIM);
@@ -530,21 +571,16 @@ static void forward_token(const Model& m,Work& w,int token,int pos,int max_seq){
         attention_scores_kernel<<<N_HEADS,B>>>(w.q,l.kc,w.attn_scores,pos,max_seq);
         attention_softmax_kernel<<<N_HEADS,B>>>(w.attn_scores,pos,max_seq);
         attention_apply_kernel<<<(HIDDEN+B-1)/B,B>>>(w.attn_scores,l.vc,w.ctx,pos,max_seq);
-        prepare_wmma_x(w.ctx,w.wmma_x,HIDDEN);
-        launch_wmma_linear(w.wmma_x,l.wo,nullptr,w.ao,HIDDEN,HIDDEN);
+        launch_linear_from_float(w.ctx,w.wmma_x,l.wo,nullptr,w.ao,HIDDEN,HIDDEN);
         add_kernel<<<(HIDDEN+B-1)/B,B>>>(w.x,w.ao,HIDDEN);
         rmsnorm_kernel<<<1,B,B*sizeof(float)>>>(w.x,l.ln2,w.n,HIDDEN,1e-6f);
-        prepare_wmma_x(w.n,w.wmma_x,HIDDEN);
-        launch_wmma_linear(w.wmma_x,l.wgate,nullptr,w.gate,HIDDEN,INTERMEDIATE);
-        launch_wmma_linear(w.wmma_x,l.wup,nullptr,w.up,HIDDEN,INTERMEDIATE);
+        launch_gate_up_from_float(w.n,w.wmma_x,l.wgate,l.wup,w.gate,w.up,HIDDEN);
         silu_mul_kernel<<<(INTERMEDIATE+B-1)/B,B>>>(w.gate,w.up,w.mid,INTERMEDIATE);
-        prepare_wmma_x(w.mid,w.wmma_x,INTERMEDIATE);
-        launch_wmma_linear(w.wmma_x,l.wdown,nullptr,w.mo,INTERMEDIATE,HIDDEN);
+        launch_linear_from_float(w.mid,w.wmma_x,l.wdown,nullptr,w.mo,INTERMEDIATE,HIDDEN);
         add_kernel<<<(HIDDEN+B-1)/B,B>>>(w.x,w.mo,HIDDEN);
     }
     rmsnorm_kernel<<<1,B,B*sizeof(float)>>>(w.x,m.norm,w.n,HIDDEN,1e-6f);
-    prepare_wmma_x(w.n,w.wmma_x,HIDDEN);
-    launch_wmma_linear(w.wmma_x,m.lm,nullptr,w.logits,HIDDEN,VOCAB_SIZE);
+    launch_linear_from_float(w.n,w.wmma_x,m.lm,nullptr,w.logits,HIDDEN,VOCAB_SIZE);
     CK(cudaDeviceSynchronize());
 }
 static int argmax_gpu_to_cpu(float* d,int* next_token){
