@@ -15,7 +15,7 @@
 #include <unordered_map>
 #include <vector>
 
-#define CK(x) do { cudaError_t e=(x); if(e!=cudaSuccess) throw std::runtime_error(std::string("CUDA: ")+cudaGetErrorString(e)); } while(0)
+#define CK(x) do { cudaError_t _cuda_err=(x); if(_cuda_err!=cudaSuccess) throw std::runtime_error(std::string("CUDA: ")+cudaGetErrorString(_cuda_err)); } while(0)
 
 constexpr int N_LAYERS=28;
 constexpr int HIDDEN=3584;
