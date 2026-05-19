@@ -175,3 +175,4 @@ CUDA_VISIBLE_DEVICES=4 python python_infer.py \
   --max-seq 800
 
 ```
+#### 这个版本是 不用 mma 和 cublas的 极限了
