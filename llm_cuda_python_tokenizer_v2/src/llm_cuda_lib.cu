@@ -201,6 +201,35 @@ __global__ void attn_kernel(const float* q,const float* kc,const float* vc,float
     }
     ctx[idx]=out/den;
 }
+__global__ void argmax_kernel(const float* logits,int* out){
+    __shared__ float best_vals[256];
+    __shared__ int best_ids[256];
+    int tid=threadIdx.x;
+    float best=-INFINITY;
+    int best_id=0;
+    for(int i=tid;i<VOCAB_SIZE;i+=blockDim.x){
+        float v=logits[i];
+        if(v>best || (v==best && i<best_id)){
+            best=v;
+            best_id=i;
+        }
+    }
+    best_vals[tid]=best;
+    best_ids[tid]=best_id;
+    __syncthreads();
+    for(int stride=blockDim.x/2;stride>0;stride>>=1){
+        if(tid<stride){
+            float other=best_vals[tid+stride];
+            int other_id=best_ids[tid+stride];
+            if(other>best_vals[tid] || (other==best_vals[tid] && other_id<best_ids[tid])){
+                best_vals[tid]=other;
+                best_ids[tid]=other_id;
+            }
+        }
+        __syncthreads();
+    }
+    if(tid==0) *out=best_ids[0];
+}
 
 struct Layer{
     float *ln1=nullptr,*ln2=nullptr,*wq=nullptr,*wk=nullptr,*wv=nullptr,*wo=nullptr;
@@ -212,9 +241,10 @@ struct Work{
     float *x=nullptr,*n=nullptr,*q=nullptr,*k=nullptr,*v=nullptr,*ctx=nullptr,*ao=nullptr;
     float *gate=nullptr,*up=nullptr,*mid=nullptr,*mo=nullptr,*logits=nullptr;
 };
-struct Engine{Model m; Work w; int max_seq=0,pos=0;};
+struct Engine{Model m; Work w; int max_seq=0,pos=0; int* next_token=nullptr;};
 
-static void freep(float*& p){if(p){cudaFree(p);p=nullptr;}}
+template <typename T>
+static void freep(T*& p){if(p){cudaFree(p);p=nullptr;}}
 static std::string lname(int i,const std::string& s){return "model.layers."+std::to_string(i)+"."+s;}
 
 static Work make_work(){
@@ -296,10 +326,11 @@ static void forward_token(const Model& m,Work& w,int token,int pos){
     linear_kernel<<<(VOCAB_SIZE+B-1)/B,B>>>(w.n,m.lm,nullptr,w.logits,HIDDEN,VOCAB_SIZE);
     CK(cudaDeviceSynchronize());
 }
-static int argmax_gpu_to_cpu(float* d){
-    std::vector<float> h(VOCAB_SIZE);
-    CK(cudaMemcpy(h.data(),d,VOCAB_SIZE*sizeof(float),cudaMemcpyDeviceToHost));
-    int best=0; for(int i=1;i<VOCAB_SIZE;i++) if(h[i]>h[best]) best=i; return best;
+static int argmax_gpu_to_cpu(float* d,int* next_token){
+    argmax_kernel<<<1,256>>>(d,next_token);
+    int h=0;
+    CK(cudaMemcpy(&h,next_token,sizeof(int),cudaMemcpyDeviceToHost));
+    return h;
 }
 
 extern "C" {
@@ -310,11 +341,12 @@ void* llm_create(const char* model_dir,int max_seq){
         Engine* e=new Engine(); e->max_seq=max_seq; e->pos=0;
         std::cout<<"[C++] create engine, model="<<model_dir<<", max_seq="<<max_seq<<"\n";
         e->m=load_model(model_dir,max_seq); e->w=make_work();
+        CK(cudaMalloc(&e->next_token,sizeof(int)));
         return e;
     }catch(const std::exception& ex){g_err=ex.what(); return nullptr;}
 }
 void llm_destroy(void* h){
-    if(!h) return; Engine* e=(Engine*)h; free_work(e->w); free_model(e->m); delete e;
+    if(!h) return; Engine* e=(Engine*)h; freep(e->next_token); free_work(e->w); free_model(e->m); delete e;
 }
 int llm_prefill(void* h,const int* tokens,int n){
     try{
@@ -335,7 +367,7 @@ int llm_decode_one(void* h,int* next){
         if(!h) throw std::runtime_error("handle null");
         if(!next) throw std::runtime_error("next null");
         Engine* e=(Engine*)h; if(e->pos>=e->max_seq) throw std::runtime_error("pos >= max_seq");
-        int t=argmax_gpu_to_cpu(e->w.logits);
+        int t=argmax_gpu_to_cpu(e->w.logits,e->next_token);
         *next=t;
         std::cout<<"[C++] decode pos="<<e->pos<<", token="<<t<<"\n";
         forward_token(e->m,e->w,t,e->pos);

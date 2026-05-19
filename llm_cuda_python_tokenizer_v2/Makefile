@@ -1,6 +1,6 @@
 NVCC ?= nvcc
 A ?= sm_80
-COMMON_FLAGS = -O2 -std=c++17 -lineinfo
+COMMON_FLAGS = -O3 -std=c++17 -lineinfo
 
 .PHONY: lib clean
 

@@ -261,6 +261,41 @@ __global__ void attn_kernel(const float* q,const float* kc,const float* vc,float
     }
     ctx[idx]=out/den;
 }
+__global__ void mark_token_seen_kernel(unsigned char* seen,int token){
+    if(token>=0 && token<VOCAB_SIZE) seen[token]=1;
+}
+__global__ void argmax_with_penalty_kernel(const float* logits,const unsigned char* seen,float repetition_penalty,int* out){
+    __shared__ float best_vals[256];
+    __shared__ int best_ids[256];
+    int tid=threadIdx.x;
+    float best=-INFINITY;
+    int best_id=0;
+    for(int i=tid;i<VOCAB_SIZE;i+=blockDim.x){
+        float v=logits[i];
+        if(repetition_penalty>1.0f && seen[i]){
+            v = v>0 ? v/repetition_penalty : v*repetition_penalty;
+        }
+        if(v>best || (v==best && i<best_id)){
+            best=v;
+            best_id=i;
+        }
+    }
+    best_vals[tid]=best;
+    best_ids[tid]=best_id;
+    __syncthreads();
+    for(int stride=blockDim.x/2;stride>0;stride>>=1){
+        if(tid<stride){
+            float other=best_vals[tid+stride];
+            int other_id=best_ids[tid+stride];
+            if(other>best_vals[tid] || (other==best_vals[tid] && other_id<best_ids[tid])){
+                best_vals[tid]=other;
+                best_ids[tid]=other_id;
+            }
+        }
+        __syncthreads();
+    }
+    if(tid==0) *out=best_ids[0];
+}
 
 struct Layer{
     float *ln1=nullptr,*ln2=nullptr,*wq=nullptr,*wk=nullptr,*wv=nullptr,*wo=nullptr;
@@ -272,9 +307,17 @@ struct Work{
     float *x=nullptr,*n=nullptr,*q=nullptr,*k=nullptr,*v=nullptr,*ctx=nullptr,*ao=nullptr;
     float *gate=nullptr,*up=nullptr,*mid=nullptr,*mo=nullptr,*logits=nullptr;
 };
-struct Engine{Model m; Work w; std::vector<int> history; int max_seq=0,pos=0; float repetition_penalty=1.0f;};
+struct Engine{
+    Model m;
+    Work w;
+    int max_seq=0,pos=0;
+    float repetition_penalty=1.0f;
+    unsigned char* seen=nullptr;
+    int* next_token=nullptr;
+};
 
-static void freep(float*& p){if(p){cudaFree(p);p=nullptr;}}
+template <typename T>
+static void freep(T*& p){if(p){cudaFree(p);p=nullptr;}}
 static std::string lname(int i,const std::string& s){return "model.layers."+std::to_string(i)+"."+s;}
 
 static Work make_work(){
@@ -331,6 +374,9 @@ static void free_model(Model& m){
         freep(l.kc);freep(l.vc);
     }
 }
+static void mark_seen(unsigned char* seen,int token){
+    mark_token_seen_kernel<<<1,1>>>(seen,token);
+}
 static void forward_token(const Model& m,Work& w,int token,int pos){
     if(token<0||token>=VOCAB_SIZE) throw std::runtime_error("bad token id "+std::to_string(token));
     int B=256;
@@ -359,20 +405,11 @@ static void forward_token(const Model& m,Work& w,int token,int pos){
     linear_kernel<<<(VOCAB_SIZE+B-1)/B,B>>>(w.n,m.lm,nullptr,w.logits,HIDDEN,VOCAB_SIZE);
     CK(cudaDeviceSynchronize());
 }
-static int argmax_gpu_to_cpu(float* d,const std::vector<int>& history,float repetition_penalty){
-    std::vector<float> h(VOCAB_SIZE);
-    CK(cudaMemcpy(h.data(),d,VOCAB_SIZE*sizeof(float),cudaMemcpyDeviceToHost));
-    if(repetition_penalty>1.0f){
-        std::vector<unsigned char> seen(VOCAB_SIZE,0);
-        for(int t:history){
-            if(t>=0&&t<VOCAB_SIZE) seen[t]=1;
-        }
-        for(int i=0;i<VOCAB_SIZE;i++){
-            if(!seen[i]) continue;
-            h[i]=h[i]>0 ? h[i]/repetition_penalty : h[i]*repetition_penalty;
-        }
-    }
-    int best=0; for(int i=1;i<VOCAB_SIZE;i++) if(h[i]>h[best]) best=i; return best;
+static int argmax_gpu_to_cpu(float* logits,const unsigned char* seen,float repetition_penalty,int* next_token){
+    argmax_with_penalty_kernel<<<1,256>>>(logits,seen,repetition_penalty,next_token);
+    int h=0;
+    CK(cudaMemcpy(&h,next_token,sizeof(int),cudaMemcpyDeviceToHost));
+    return h;
 }
 
 extern "C" {
@@ -383,11 +420,14 @@ void* llm_create(const char* model_dir,int max_seq){
         Engine* e=new Engine(); e->max_seq=max_seq; e->pos=0;
         std::cout<<"[C++] create engine, model="<<model_dir<<", max_seq="<<max_seq<<"\n";
         e->m=load_model(model_dir,max_seq); e->w=make_work();
+        CK(cudaMalloc(&e->seen,VOCAB_SIZE*sizeof(unsigned char)));
+        CK(cudaMalloc(&e->next_token,sizeof(int)));
+        CK(cudaMemset(e->seen,0,VOCAB_SIZE*sizeof(unsigned char)));
         return e;
     }catch(const std::exception& ex){g_err=ex.what(); return nullptr;}
 }
 void llm_destroy(void* h){
-    if(!h) return; Engine* e=(Engine*)h; free_work(e->w); free_model(e->m); delete e;
+    if(!h) return; Engine* e=(Engine*)h; freep(e->next_token); freep(e->seen); free_work(e->w); free_model(e->m); delete e;
 }
 int llm_set_repetition_penalty(void* h,float penalty){
     try{
@@ -403,11 +443,11 @@ int llm_prefill(void* h,const int* tokens,int n){
         if(!tokens) throw std::runtime_error("tokens null");
         Engine* e=(Engine*)h; if(n<=0||n>e->max_seq) throw std::runtime_error("bad prefill length");
         e->pos=0;
-        e->history.clear();
+        CK(cudaMemset(e->seen,0,VOCAB_SIZE*sizeof(unsigned char)));
         for(int i=0;i<n;i++){
             std::cout<<"[C++] prefill pos="<<e->pos<<", token="<<tokens[i]<<"\n";
             forward_token(e->m,e->w,tokens[i],e->pos);
-            e->history.push_back(tokens[i]);
+            mark_seen(e->seen,tokens[i]);
             e->pos++;
         }
         return 0;
@@ -418,10 +458,10 @@ int llm_decode_one(void* h,int* next){
         if(!h) throw std::runtime_error("handle null");
         if(!next) throw std::runtime_error("next null");
         Engine* e=(Engine*)h; if(e->pos>=e->max_seq) throw std::runtime_error("pos >= max_seq");
-        int t=argmax_gpu_to_cpu(e->w.logits,e->history,e->repetition_penalty);
+        int t=argmax_gpu_to_cpu(e->w.logits,e->seen,e->repetition_penalty,e->next_token);
         *next=t;
         std::cout<<"[C++] decode pos="<<e->pos<<", token="<<t<<"\n";
-        e->history.push_back(t);
+        mark_seen(e->seen,t);
         forward_token(e->m,e->w,t,e->pos);
         e->pos++;
         return 0;
