@@ -211,25 +211,6 @@ __global__ void embedding_kernel(int token,const WeightT* emb,float* x){
     int i=blockIdx.x*blockDim.x+threadIdx.x;
     if(i<HIDDEN) x[i]=weight_to_float(emb[(size_t)token*HIDDEN+i]);
 }
-__global__ void embedding_rmsnorm_kernel(int token,const WeightT* emb,const float* w,float* x,float* y,int D,float eps){
-    extern __shared__ float sh[];
-    int tid=threadIdx.x;
-    float s=0.0f;
-    const WeightT* row=emb+(size_t)token*D;
-    for(int i=tid;i<D;i+=blockDim.x){
-        float v=weight_to_float(row[i]);
-        x[i]=v;
-        s+=v*v;
-    }
-    sh[tid]=s;
-    __syncthreads();
-    for(int stride=blockDim.x/2;stride>0;stride>>=1){
-        if(tid<stride) sh[tid]+=sh[tid+stride];
-        __syncthreads();
-    }
-    float inv=rsqrtf(sh[0]/D+eps);
-    for(int i=tid;i<D;i+=blockDim.x) y[i]=x[i]*inv*w[i];
-}
 __global__ void rmsnorm_kernel(const float* x,const float* w,float* y,int D,float eps){
     extern __shared__ float sh[];
     int tid=threadIdx.x; float s=0;
@@ -754,7 +735,8 @@ static void launch_gate_up_from_float(
 static void forward_token(const Model& m,Work& w,int token,int pos,int max_seq){
     if(token<0||token>=VOCAB_SIZE) throw std::runtime_error("bad token id "+std::to_string(token));
     int B=256;
-    embedding_rmsnorm_kernel<<<1,B,B*sizeof(float)>>>(token,m.emb,m.layers[0].ln1,w.x,w.n,HIDDEN,1e-6f);
+    embedding_kernel<<<(HIDDEN+B-1)/B,B>>>(token,m.emb,w.x);
+    rmsnorm_kernel<<<1,B,B*sizeof(float)>>>(w.x,m.layers[0].ln1,w.n,HIDDEN,1e-6f);
     for(int i=0;i<N_LAYERS;i++){
         const Layer& l=m.layers[i];
         launch_qkv_from_float(w.n,w.wmma_x,l.wq,l.wk,l.wv,l.bq,l.bk,l.bv,w.q,w.k,w.v,HIDDEN);
@@ -768,9 +750,10 @@ static void forward_token(const Model& m,Work& w,int token,int pos,int max_seq){
         if(i+1<N_LAYERS){
             add_rmsnorm_kernel<<<1,B,B*sizeof(float)>>>(w.x,w.mo,m.layers[i+1].ln1,w.n,HIDDEN,1e-6f);
         }else{
-            add_rmsnorm_kernel<<<1,B,B*sizeof(float)>>>(w.x,w.mo,m.norm,w.n,HIDDEN,1e-6f);
+            add_kernel<<<(HIDDEN+B-1)/B,B>>>(w.x,w.mo,HIDDEN);
         }
     }
+    rmsnorm_kernel<<<1,B,B*sizeof(float)>>>(w.x,m.norm,w.n,HIDDEN,1e-6f);
     launch_linear_from_float(w.n,w.wmma_x,m.lm,nullptr,w.logits,HIDDEN,VOCAB_SIZE);
     CK(cudaDeviceSynchronize());
 }
