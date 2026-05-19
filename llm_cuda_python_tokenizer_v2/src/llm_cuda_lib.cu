@@ -1,5 +1,7 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <mma.h>
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -27,7 +29,8 @@ constexpr int HEAD_DIM=128;
 constexpr int KV_DIM=N_KV_HEADS*HEAD_DIM;
 constexpr int INTERMEDIATE=18944;
 constexpr int VOCAB_SIZE=152064;
-using WeightT = __nv_bfloat16;
+using WeightT = half;
+constexpr int WMMA_TILE=16;
 constexpr float ROPE_THETA=1000000.0f;
 
 static thread_local std::string g_err;
@@ -166,23 +169,28 @@ static WeightT* load_tensor_bf16(const std::unordered_map<std::string,TensorMeta
     auto raw=read_bytes(t);
     std::vector<WeightT> h(n);
     if(t.dtype=="BF16"){
-        if(raw.size()!=n*sizeof(WeightT)) throw std::runtime_error("bad BF16 size "+name);
-        std::memcpy(h.data(),raw.data(),raw.size());
+        if(raw.size()!=n*2) throw std::runtime_error("bad BF16 size "+name);
+        auto* p=(const uint16_t*)raw.data();
+        for(size_t i=0;i<n;i++) h[i]=__float2half_rn(bf16_to_float(p[i]));
     }else if(t.dtype=="F16"){
         if(raw.size()!=n*2) throw std::runtime_error("bad F16 size "+name);
-        auto* p=(const uint16_t*)raw.data(); for(size_t i=0;i<n;i++) h[i]=__float2bfloat16(f16_to_float(p[i]));
+        std::memcpy(h.data(),raw.data(),raw.size());
     }else if(t.dtype=="F32"){
         if(raw.size()!=n*4) throw std::runtime_error("bad F32 size "+name);
-        auto* p=(const float*)raw.data(); for(size_t i=0;i<n;i++) h[i]=__float2bfloat16(p[i]);
+        auto* p=(const float*)raw.data(); for(size_t i=0;i<n;i++) h[i]=__float2half_rn(p[i]);
     }else throw std::runtime_error("unsupported dtype "+t.dtype+" for "+name);
     WeightT* d=nullptr; CK(cudaMalloc(&d,n*sizeof(WeightT))); CK(cudaMemcpy(d,h.data(),n*sizeof(WeightT),cudaMemcpyHostToDevice));
-    std::cout<<"[C++] loaded "<<name<<", dtype="<<t.dtype<<", stored=BF16, numel="<<n<<"\n";
+    std::cout<<"[C++] loaded "<<name<<", dtype="<<t.dtype<<", stored=FP16, numel="<<n<<"\n";
     return d;
+}
+
+__device__ __forceinline__ float weight_to_float(WeightT w){
+    return __half2float(w);
 }
 
 __global__ void embedding_kernel(int token,const WeightT* emb,float* x){
     int i=blockIdx.x*blockDim.x+threadIdx.x;
-    if(i<HIDDEN) x[i]=__bfloat162float(emb[(size_t)token*HIDDEN+i]);
+    if(i<HIDDEN) x[i]=weight_to_float(emb[(size_t)token*HIDDEN+i]);
 }
 __global__ void rmsnorm_kernel(const float* x,const float* w,float* y,int D,float eps){
     extern __shared__ float sh[];
@@ -200,7 +208,7 @@ __global__ void linear_kernel(const float* x,const WeightT* W,const float* b,flo
     if(o>=OUT) return;
     const WeightT* row=W+(size_t)o*IN;
     float s=0;
-    for(int i=tid;i<IN;i+=blockDim.x) s+=__bfloat162float(row[i])*x[i];
+    for(int i=tid;i<IN;i+=blockDim.x) s+=weight_to_float(row[i])*x[i];
     sh[tid]=s;
     __syncthreads();
     for(int stride=blockDim.x/2;stride>0;stride>>=1){
@@ -232,7 +240,7 @@ __global__ void qkv_linear_kernel(
     }
     const WeightT* row=W+(size_t)local_o*IN;
     float s=0.0f;
-    for(int i=tid;i<IN;i+=blockDim.x) s+=__bfloat162float(row[i])*x[i];
+    for(int i=tid;i<IN;i+=blockDim.x) s+=weight_to_float(row[i])*x[i];
     sh[tid]=s;
     __syncthreads();
     for(int stride=blockDim.x/2;stride>0;stride>>=1){
@@ -256,7 +264,7 @@ __global__ void gate_up_linear_kernel(
     float* y=is_gate ? gate : up;
     const WeightT* row=W+(size_t)local_o*IN;
     float s=0.0f;
-    for(int i=tid;i<IN;i+=blockDim.x) s+=__bfloat162float(row[i])*x[i];
+    for(int i=tid;i<IN;i+=blockDim.x) s+=weight_to_float(row[i])*x[i];
     sh[tid]=s;
     __syncthreads();
     for(int stride=blockDim.x/2;stride>0;stride>>=1){
@@ -264,6 +272,49 @@ __global__ void gate_up_linear_kernel(
         __syncthreads();
     }
     if(tid==0) y[local_o]=sh[0];
+}
+__global__ void float_to_half_kernel(const float* x,half* xh,int n){
+    int i=blockIdx.x*blockDim.x+threadIdx.x;
+    if(i<n) xh[i]=__float2half_rn(x[i]);
+}
+__global__ void wmma_linear_kernel(const half* xh,const WeightT* W,const float* b,float* y,int IN,int OUT){
+#if __CUDA_ARCH__ >= 700
+    using namespace nvcuda;
+    __shared__ half a_tile[WMMA_TILE*WMMA_TILE];
+    __shared__ half b_tile[WMMA_TILE*WMMA_TILE];
+    __shared__ float c_tile[WMMA_TILE*WMMA_TILE];
+    const int out0=blockIdx.x*WMMA_TILE;
+    const int tid=threadIdx.x;
+    wmma::fragment<wmma::matrix_a,WMMA_TILE,WMMA_TILE,WMMA_TILE,half,wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b,WMMA_TILE,WMMA_TILE,WMMA_TILE,half,wmma::row_major> b_frag;
+    wmma::fragment<wmma::accumulator,WMMA_TILE,WMMA_TILE,WMMA_TILE,float> acc_frag;
+    wmma::fill_fragment(acc_frag,0.0f);
+    for(int k0=0;k0<IN;k0+=WMMA_TILE){
+        for(int idx=tid;idx<WMMA_TILE*WMMA_TILE;idx+=blockDim.x){
+            int r=idx/WMMA_TILE;
+            int c=idx%WMMA_TILE;
+            int o=out0+r;
+            int k=k0+c;
+            a_tile[idx]=(o<OUT && k<IN) ? W[(size_t)o*IN+k] : __float2half_rn(0.0f);
+        }
+        for(int idx=tid;idx<WMMA_TILE*WMMA_TILE;idx+=blockDim.x){
+            int k=idx/WMMA_TILE;
+            int kk=k0+k;
+            b_tile[idx]=(kk<IN) ? xh[kk] : __float2half_rn(0.0f);
+        }
+        __syncthreads();
+        wmma::load_matrix_sync(a_frag,a_tile,WMMA_TILE);
+        wmma::load_matrix_sync(b_frag,b_tile,WMMA_TILE);
+        wmma::mma_sync(acc_frag,a_frag,b_frag,acc_frag);
+        __syncthreads();
+    }
+    wmma::store_matrix_sync(c_tile,acc_frag,WMMA_TILE,wmma::mem_row_major);
+    __syncthreads();
+    for(int r=tid;r<WMMA_TILE;r+=blockDim.x){
+        int o=out0+r;
+        if(o<OUT) y[o]=c_tile[r*WMMA_TILE]+(b ? b[o] : 0.0f);
+    }
+#endif
 }
 __global__ void add_kernel(float* x,const float* y,int n){
     int i=blockIdx.x*blockDim.x+threadIdx.x; if(i<n) x[i]+=y[i];
@@ -382,6 +433,7 @@ struct Work{
     float *x=nullptr,*n=nullptr,*q=nullptr,*k=nullptr,*v=nullptr,*ctx=nullptr,*ao=nullptr;
     float *gate=nullptr,*up=nullptr,*mid=nullptr,*mo=nullptr,*logits=nullptr;
     float *attn_scores=nullptr;
+    half *wmma_x=nullptr;
 };
 struct Engine{
     Model m;
@@ -409,11 +461,12 @@ static Work make_work(int max_seq){
     CK(cudaMalloc(&w.mid,INTERMEDIATE*sizeof(float))); CK(cudaMalloc(&w.mo,HIDDEN*sizeof(float)));
     CK(cudaMalloc(&w.logits,VOCAB_SIZE*sizeof(float)));
     CK(cudaMalloc(&w.attn_scores,(size_t)N_HEADS*max_seq*sizeof(float)));
+    CK(cudaMalloc(&w.wmma_x,INTERMEDIATE*sizeof(half)));
     return w;
 }
 static void free_work(Work& w){
     freep(w.x);freep(w.n);freep(w.q);freep(w.k);freep(w.v);freep(w.ctx);freep(w.ao);
-    freep(w.gate);freep(w.up);freep(w.mid);freep(w.mo);freep(w.logits);freep(w.attn_scores);
+    freep(w.gate);freep(w.up);freep(w.mid);freep(w.mo);freep(w.logits);freep(w.attn_scores);freep(w.wmma_x);
 }
 static Model load_model(const std::string& dir,int max_seq){
     auto metas=scan_safetensors(dir);
@@ -452,6 +505,13 @@ static void free_model(Model& m){
         freep(l.kc);freep(l.vc);
     }
 }
+static void prepare_wmma_x(const float* x,half* xh,int n){
+    int B=256;
+    float_to_half_kernel<<<(n+B-1)/B,B>>>(x,xh,n);
+}
+static void launch_wmma_linear(const half* xh,const WeightT* W,const float* b,float* y,int IN,int OUT){
+    wmma_linear_kernel<<<(OUT+WMMA_TILE-1)/WMMA_TILE,32>>>(xh,W,b,y,IN,OUT);
+}
 static void forward_token(const Model& m,Work& w,int token,int pos,int max_seq){
     if(token<0||token>=VOCAB_SIZE) throw std::runtime_error("bad token id "+std::to_string(token));
     int B=256;
@@ -459,7 +519,10 @@ static void forward_token(const Model& m,Work& w,int token,int pos,int max_seq){
     for(int i=0;i<N_LAYERS;i++){
         const Layer& l=m.layers[i];
         rmsnorm_kernel<<<1,B,B*sizeof(float)>>>(w.x,l.ln1,w.n,HIDDEN,1e-6f);
-        qkv_linear_kernel<<<HIDDEN+2*KV_DIM,B>>>(w.n,l.wq,l.wk,l.wv,l.bq,l.bk,l.bv,w.q,w.k,w.v,HIDDEN);
+        prepare_wmma_x(w.n,w.wmma_x,HIDDEN);
+        launch_wmma_linear(w.wmma_x,l.wq,l.bq,w.q,HIDDEN,HIDDEN);
+        launch_wmma_linear(w.wmma_x,l.wk,l.bk,w.k,HIDDEN,KV_DIM);
+        launch_wmma_linear(w.wmma_x,l.wv,l.bv,w.v,HIDDEN,KV_DIM);
         rope_kernel<<<(N_HEADS*(HEAD_DIM/2)+B-1)/B,B>>>(w.q,N_HEADS,pos);
         rope_kernel<<<(N_KV_HEADS*(HEAD_DIM/2)+B-1)/B,B>>>(w.k,N_KV_HEADS,pos);
         store_kv_kernel<<<(KV_DIM+B-1)/B,B>>>(l.kc,w.k,pos,KV_DIM);
@@ -467,16 +530,21 @@ static void forward_token(const Model& m,Work& w,int token,int pos,int max_seq){
         attention_scores_kernel<<<N_HEADS,B>>>(w.q,l.kc,w.attn_scores,pos,max_seq);
         attention_softmax_kernel<<<N_HEADS,B>>>(w.attn_scores,pos,max_seq);
         attention_apply_kernel<<<(HIDDEN+B-1)/B,B>>>(w.attn_scores,l.vc,w.ctx,pos,max_seq);
-        linear_kernel<<<HIDDEN,B>>>(w.ctx,l.wo,nullptr,w.ao,HIDDEN,HIDDEN);
+        prepare_wmma_x(w.ctx,w.wmma_x,HIDDEN);
+        launch_wmma_linear(w.wmma_x,l.wo,nullptr,w.ao,HIDDEN,HIDDEN);
         add_kernel<<<(HIDDEN+B-1)/B,B>>>(w.x,w.ao,HIDDEN);
         rmsnorm_kernel<<<1,B,B*sizeof(float)>>>(w.x,l.ln2,w.n,HIDDEN,1e-6f);
-        gate_up_linear_kernel<<<2*INTERMEDIATE,B>>>(w.n,l.wgate,l.wup,w.gate,w.up,HIDDEN);
+        prepare_wmma_x(w.n,w.wmma_x,HIDDEN);
+        launch_wmma_linear(w.wmma_x,l.wgate,nullptr,w.gate,HIDDEN,INTERMEDIATE);
+        launch_wmma_linear(w.wmma_x,l.wup,nullptr,w.up,HIDDEN,INTERMEDIATE);
         silu_mul_kernel<<<(INTERMEDIATE+B-1)/B,B>>>(w.gate,w.up,w.mid,INTERMEDIATE);
-        linear_kernel<<<HIDDEN,B>>>(w.mid,l.wdown,nullptr,w.mo,INTERMEDIATE,HIDDEN);
+        prepare_wmma_x(w.mid,w.wmma_x,INTERMEDIATE);
+        launch_wmma_linear(w.wmma_x,l.wdown,nullptr,w.mo,INTERMEDIATE,HIDDEN);
         add_kernel<<<(HIDDEN+B-1)/B,B>>>(w.x,w.mo,HIDDEN);
     }
     rmsnorm_kernel<<<1,B,B*sizeof(float)>>>(w.x,m.norm,w.n,HIDDEN,1e-6f);
-    linear_kernel<<<VOCAB_SIZE,B>>>(w.n,m.lm,nullptr,w.logits,HIDDEN,VOCAB_SIZE);
+    prepare_wmma_x(w.n,w.wmma_x,HIDDEN);
+    launch_wmma_linear(w.wmma_x,m.lm,nullptr,w.logits,HIDDEN,VOCAB_SIZE);
     CK(cudaDeviceSynchronize());
 }
 static int argmax_gpu_to_cpu(float* d,int* next_token){
