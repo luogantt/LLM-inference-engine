@@ -448,6 +448,94 @@ __global__ void linear_kernel(const float* x, const float* W, const float* bias,
     }
 }
 
+__global__ void qkv_linear_kernel(
+    const float* x,
+    const float* Wq,
+    const float* Wk,
+    const float* Wv,
+    const float* bq,
+    const float* bk,
+    const float* bv,
+    float* q,
+    float* k,
+    float* v,
+    int IN
+) {
+    __shared__ float sh[256];
+    int o = blockIdx.x;
+    int tid = threadIdx.x;
+
+    const float* W = nullptr;
+    const float* bias = nullptr;
+    float* y = nullptr;
+    int local_o = o;
+
+    if (o < HIDDEN) {
+        W = Wq;
+        bias = bq;
+        y = q;
+    } else if (o < HIDDEN + KV_DIM) {
+        local_o = o - HIDDEN;
+        W = Wk;
+        bias = bk;
+        y = k;
+    } else {
+        local_o = o - HIDDEN - KV_DIM;
+        W = Wv;
+        bias = bv;
+        y = v;
+    }
+
+    float sum = 0.0f;
+    const float* row = W + static_cast<size_t>(local_o) * IN;
+    for (int i = tid; i < IN; i += blockDim.x) {
+        sum += row[i] * x[i];
+    }
+
+    sh[tid] = sum;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) sh[tid] += sh[tid + stride];
+        __syncthreads();
+    }
+
+    if (tid == 0) y[local_o] = bias ? sh[0] + bias[local_o] : sh[0];
+}
+
+__global__ void gate_up_linear_kernel(
+    const float* x,
+    const float* Wgate,
+    const float* Wup,
+    float* gate,
+    float* up,
+    int IN
+) {
+    __shared__ float sh[256];
+    int o = blockIdx.x;
+    int tid = threadIdx.x;
+    bool is_gate = o < INTERMEDIATE;
+    int local_o = is_gate ? o : o - INTERMEDIATE;
+    const float* W = is_gate ? Wgate : Wup;
+    float* y = is_gate ? gate : up;
+
+    float sum = 0.0f;
+    const float* row = W + static_cast<size_t>(local_o) * IN;
+    for (int i = tid; i < IN; i += blockDim.x) {
+        sum += row[i] * x[i];
+    }
+
+    sh[tid] = sum;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) sh[tid] += sh[tid + stride];
+        __syncthreads();
+    }
+
+    if (tid == 0) y[local_o] = sh[0];
+}
+
 __global__ void add_kernel(float* x, const float* y, int N) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < N) x[i] += y[i];
@@ -709,9 +797,19 @@ static void forward_token(const Model& m, Work& w, int token, int pos, int max_s
 
         rmsnorm_kernel<<<1, block, block * sizeof(float)>>>(w.x, layer.ln1, w.norm, HIDDEN, m.rms_norm_eps);
 
-        linear_kernel<<<HIDDEN, block>>>(w.norm, layer.wq, layer.bq, w.q, HIDDEN, HIDDEN);
-        linear_kernel<<<KV_DIM, block>>>(w.norm, layer.wk, layer.bk, w.k, HIDDEN, KV_DIM);
-        linear_kernel<<<KV_DIM, block>>>(w.norm, layer.wv, layer.bv, w.v, HIDDEN, KV_DIM);
+        qkv_linear_kernel<<<HIDDEN + 2 * KV_DIM, block>>>(
+            w.norm,
+            layer.wq,
+            layer.wk,
+            layer.wv,
+            layer.bq,
+            layer.bk,
+            layer.bv,
+            w.q,
+            w.k,
+            w.v,
+            HIDDEN
+        );
 
         rope_kernel<<<(N_HEADS * (HEAD_DIM / 2) + block - 1) / block, block>>>(w.q, N_HEADS, pos, m.rope_theta);
         rope_kernel<<<(N_KV_HEADS * (HEAD_DIM / 2) + block - 1) / block, block>>>(w.k, N_KV_HEADS, pos, m.rope_theta);
@@ -728,8 +826,7 @@ static void forward_token(const Model& m, Work& w, int token, int pos, int max_s
 
         rmsnorm_kernel<<<1, block, block * sizeof(float)>>>(w.x, layer.ln2, w.norm, HIDDEN, m.rms_norm_eps);
 
-        linear_kernel<<<INTERMEDIATE, block>>>(w.norm, layer.wgate, nullptr, w.gate, HIDDEN, INTERMEDIATE);
-        linear_kernel<<<INTERMEDIATE, block>>>(w.norm, layer.wup, nullptr, w.up, HIDDEN, INTERMEDIATE);
+        gate_up_linear_kernel<<<2 * INTERMEDIATE, block>>>(w.norm, layer.wgate, layer.wup, w.gate, w.up, HIDDEN);
 
         silu_mul_kernel<<<(INTERMEDIATE + block - 1) / block, block>>>(w.gate, w.up, w.mid, INTERMEDIATE);
 

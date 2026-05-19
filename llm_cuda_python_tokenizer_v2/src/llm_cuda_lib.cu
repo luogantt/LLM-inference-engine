@@ -187,6 +187,62 @@ __global__ void linear_kernel(const float* x,const float* W,const float* b,float
     }
     if(tid==0) y[o]=b ? sh[0]+b[o] : sh[0];
 }
+__global__ void qkv_linear_kernel(
+    const float* x,
+    const float* Wq,const float* Wk,const float* Wv,
+    const float* bq,const float* bk,const float* bv,
+    float* q,float* k,float* v,
+    int IN
+){
+    __shared__ float sh[256];
+    int o=blockIdx.x;
+    int tid=threadIdx.x;
+    const float* W=nullptr;
+    const float* b=nullptr;
+    float* y=nullptr;
+    int local_o=o;
+    if(o<HIDDEN){
+        W=Wq; b=bq; y=q;
+    }else if(o<HIDDEN+KV_DIM){
+        local_o=o-HIDDEN; W=Wk; b=bk; y=k;
+    }else{
+        local_o=o-HIDDEN-KV_DIM; W=Wv; b=bv; y=v;
+    }
+    const float* row=W+(size_t)local_o*IN;
+    float s=0.0f;
+    for(int i=tid;i<IN;i+=blockDim.x) s+=row[i]*x[i];
+    sh[tid]=s;
+    __syncthreads();
+    for(int stride=blockDim.x/2;stride>0;stride>>=1){
+        if(tid<stride) sh[tid]+=sh[tid+stride];
+        __syncthreads();
+    }
+    if(tid==0) y[local_o]=b ? sh[0]+b[local_o] : sh[0];
+}
+__global__ void gate_up_linear_kernel(
+    const float* x,
+    const float* Wgate,const float* Wup,
+    float* gate,float* up,
+    int IN
+){
+    __shared__ float sh[256];
+    int o=blockIdx.x;
+    int tid=threadIdx.x;
+    bool is_gate=o<INTERMEDIATE;
+    int local_o=is_gate ? o : o-INTERMEDIATE;
+    const float* W=is_gate ? Wgate : Wup;
+    float* y=is_gate ? gate : up;
+    const float* row=W+(size_t)local_o*IN;
+    float s=0.0f;
+    for(int i=tid;i<IN;i+=blockDim.x) s+=row[i]*x[i];
+    sh[tid]=s;
+    __syncthreads();
+    for(int stride=blockDim.x/2;stride>0;stride>>=1){
+        if(tid<stride) sh[tid]+=sh[tid+stride];
+        __syncthreads();
+    }
+    if(tid==0) y[local_o]=sh[0];
+}
 __global__ void add_kernel(float* x,const float* y,int n){
     int i=blockIdx.x*blockDim.x+threadIdx.x; if(i<n) x[i]+=y[i];
 }
@@ -381,9 +437,7 @@ static void forward_token(const Model& m,Work& w,int token,int pos,int max_seq){
     for(int i=0;i<N_LAYERS;i++){
         const Layer& l=m.layers[i];
         rmsnorm_kernel<<<1,B,B*sizeof(float)>>>(w.x,l.ln1,w.n,HIDDEN,1e-6f);
-        linear_kernel<<<HIDDEN,B>>>(w.n,l.wq,l.bq,w.q,HIDDEN,HIDDEN);
-        linear_kernel<<<KV_DIM,B>>>(w.n,l.wk,l.bk,w.k,HIDDEN,KV_DIM);
-        linear_kernel<<<KV_DIM,B>>>(w.n,l.wv,l.bv,w.v,HIDDEN,KV_DIM);
+        qkv_linear_kernel<<<HIDDEN+2*KV_DIM,B>>>(w.n,l.wq,l.wk,l.wv,l.bq,l.bk,l.bv,w.q,w.k,w.v,HIDDEN);
         rope_kernel<<<(N_HEADS*(HEAD_DIM/2)+B-1)/B,B>>>(w.q,N_HEADS,pos);
         rope_kernel<<<(N_KV_HEADS*(HEAD_DIM/2)+B-1)/B,B>>>(w.k,N_KV_HEADS,pos);
         store_kv_kernel<<<(KV_DIM+B-1)/B,B>>>(l.kc,w.k,pos,KV_DIM);
@@ -394,8 +448,7 @@ static void forward_token(const Model& m,Work& w,int token,int pos,int max_seq){
         linear_kernel<<<HIDDEN,B>>>(w.ctx,l.wo,nullptr,w.ao,HIDDEN,HIDDEN);
         add_kernel<<<(HIDDEN+B-1)/B,B>>>(w.x,w.ao,HIDDEN);
         rmsnorm_kernel<<<1,B,B*sizeof(float)>>>(w.x,l.ln2,w.n,HIDDEN,1e-6f);
-        linear_kernel<<<INTERMEDIATE,B>>>(w.n,l.wgate,nullptr,w.gate,HIDDEN,INTERMEDIATE);
-        linear_kernel<<<INTERMEDIATE,B>>>(w.n,l.wup,nullptr,w.up,HIDDEN,INTERMEDIATE);
+        gate_up_linear_kernel<<<2*INTERMEDIATE,B>>>(w.n,l.wgate,l.wup,w.gate,w.up,HIDDEN);
         silu_mul_kernel<<<(INTERMEDIATE+B-1)/B,B>>>(w.gate,w.up,w.mid,INTERMEDIATE);
         linear_kernel<<<HIDDEN,B>>>(w.mid,l.wdown,nullptr,w.mo,INTERMEDIATE,HIDDEN);
         add_kernel<<<(HIDDEN+B-1)/B,B>>>(w.x,w.mo,HIDDEN);
