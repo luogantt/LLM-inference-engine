@@ -371,6 +371,40 @@ __global__ void store_kv_kernel(float* cache,const float* x,int pos,int dim){
     int i=blockIdx.x*blockDim.x+threadIdx.x;
     if(i<dim) cache[(size_t)pos*dim+i]=x[i];
 }
+__global__ void rope_store_kv_kernel(float* q,float* k,const float* v,float* kc,float* vc,int pos){
+    int i=blockIdx.x*blockDim.x+threadIdx.x;
+    int q_pairs=N_HEADS*(HEAD_DIM/2);
+    int k_pairs=N_KV_HEADS*(HEAD_DIM/2);
+    if(i<q_pairs){
+        int h=i/(HEAD_DIM/2);
+        int p=i%(HEAD_DIM/2);
+        int d0=p*2;
+        int d1=d0+1;
+        int base=h*HEAD_DIM;
+        float inv=powf(ROPE_THETA,-(float)d0/HEAD_DIM);
+        float a=pos*inv,c=cosf(a),s=sinf(a);
+        float v0=q[base+d0],v1=q[base+d1];
+        q[base+d0]=v0*c-v1*s;
+        q[base+d1]=v0*s+v1*c;
+    }
+    if(i<k_pairs){
+        int h=i/(HEAD_DIM/2);
+        int p=i%(HEAD_DIM/2);
+        int d0=p*2;
+        int d1=d0+1;
+        int base=h*HEAD_DIM;
+        float inv=powf(ROPE_THETA,-(float)d0/HEAD_DIM);
+        float a=pos*inv,c=cosf(a),s=sinf(a);
+        float v0=k[base+d0],v1=k[base+d1];
+        float r0=v0*c-v1*s;
+        float r1=v0*s+v1*c;
+        k[base+d0]=r0;
+        k[base+d1]=r1;
+        kc[(size_t)pos*KV_DIM+base+d0]=r0;
+        kc[(size_t)pos*KV_DIM+base+d1]=r1;
+    }
+    if(i<KV_DIM) vc[(size_t)pos*KV_DIM+i]=v[i];
+}
 __global__ void attention_scores_kernel(const float* q,const float* kc,float* scores,int pos,int max_seq){
     int h=blockIdx.x;
     int tid=threadIdx.x;
@@ -706,10 +740,7 @@ static void forward_token(const Model& m,Work& w,int token,int pos,int max_seq){
     for(int i=0;i<N_LAYERS;i++){
         const Layer& l=m.layers[i];
         launch_qkv_from_float(w.n,w.wmma_x,l.wq,l.wk,l.wv,l.bq,l.bk,l.bv,w.q,w.k,w.v,HIDDEN);
-        rope_kernel<<<(N_HEADS*(HEAD_DIM/2)+B-1)/B,B>>>(w.q,N_HEADS,pos);
-        rope_kernel<<<(N_KV_HEADS*(HEAD_DIM/2)+B-1)/B,B>>>(w.k,N_KV_HEADS,pos);
-        store_kv_kernel<<<(KV_DIM+B-1)/B,B>>>(l.kc,w.k,pos,KV_DIM);
-        store_kv_kernel<<<(KV_DIM+B-1)/B,B>>>(l.vc,w.v,pos,KV_DIM);
+        rope_store_kv_kernel<<<(N_HEADS*(HEAD_DIM/2)+B-1)/B,B>>>(w.q,w.k,w.v,l.kc,l.vc,pos);
         attention_fused_kernel<<<N_HEADS,B>>>(w.q,l.kc,l.vc,w.attn_scores,w.ctx,pos,max_seq);
         launch_linear_from_float(w.ctx,w.wmma_x,l.wo,nullptr,w.ao,HIDDEN,HIDDEN);
         add_rmsnorm_kernel<<<1,B,B*sizeof(float)>>>(w.x,w.ao,l.ln2,w.n,HIDDEN,1e-6f);
