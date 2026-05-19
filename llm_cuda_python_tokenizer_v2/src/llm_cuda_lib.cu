@@ -1,4 +1,5 @@
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -26,6 +27,7 @@ constexpr int HEAD_DIM=128;
 constexpr int KV_DIM=N_KV_HEADS*HEAD_DIM;
 constexpr int INTERMEDIATE=18944;
 constexpr int VOCAB_SIZE=152064;
+using WeightT = __nv_bfloat16;
 constexpr float ROPE_THETA=1000000.0f;
 
 static thread_local std::string g_err;
@@ -157,10 +159,30 @@ static float* load_tensor(const std::unordered_map<std::string,TensorMeta>& meta
     std::cout<<"[C++] loaded "<<name<<", dtype="<<t.dtype<<", numel="<<n<<"\n";
     return d;
 }
+static WeightT* load_tensor_bf16(const std::unordered_map<std::string,TensorMeta>& metas,const std::string& name){
+    auto it=metas.find(name);
+    if(it==metas.end()) throw std::runtime_error("missing tensor: "+name);
+    auto& t=it->second; size_t n=numel(t.shape);
+    auto raw=read_bytes(t);
+    std::vector<WeightT> h(n);
+    if(t.dtype=="BF16"){
+        if(raw.size()!=n*sizeof(WeightT)) throw std::runtime_error("bad BF16 size "+name);
+        std::memcpy(h.data(),raw.data(),raw.size());
+    }else if(t.dtype=="F16"){
+        if(raw.size()!=n*2) throw std::runtime_error("bad F16 size "+name);
+        auto* p=(const uint16_t*)raw.data(); for(size_t i=0;i<n;i++) h[i]=__float2bfloat16(f16_to_float(p[i]));
+    }else if(t.dtype=="F32"){
+        if(raw.size()!=n*4) throw std::runtime_error("bad F32 size "+name);
+        auto* p=(const float*)raw.data(); for(size_t i=0;i<n;i++) h[i]=__float2bfloat16(p[i]);
+    }else throw std::runtime_error("unsupported dtype "+t.dtype+" for "+name);
+    WeightT* d=nullptr; CK(cudaMalloc(&d,n*sizeof(WeightT))); CK(cudaMemcpy(d,h.data(),n*sizeof(WeightT),cudaMemcpyHostToDevice));
+    std::cout<<"[C++] loaded "<<name<<", dtype="<<t.dtype<<", stored=BF16, numel="<<n<<"\n";
+    return d;
+}
 
-__global__ void embedding_kernel(int token,const float* emb,float* x){
+__global__ void embedding_kernel(int token,const WeightT* emb,float* x){
     int i=blockIdx.x*blockDim.x+threadIdx.x;
-    if(i<HIDDEN) x[i]=emb[(size_t)token*HIDDEN+i];
+    if(i<HIDDEN) x[i]=__bfloat162float(emb[(size_t)token*HIDDEN+i]);
 }
 __global__ void rmsnorm_kernel(const float* x,const float* w,float* y,int D,float eps){
     extern __shared__ float sh[];
@@ -171,14 +193,14 @@ __global__ void rmsnorm_kernel(const float* x,const float* w,float* y,int D,floa
     float inv=rsqrtf(sh[0]/D+eps);
     for(int i=tid;i<D;i+=blockDim.x) y[i]=x[i]*inv*w[i];
 }
-__global__ void linear_kernel(const float* x,const float* W,const float* b,float* y,int IN,int OUT){
+__global__ void linear_kernel(const float* x,const WeightT* W,const float* b,float* y,int IN,int OUT){
     __shared__ float sh[256];
     int o=blockIdx.x;
     int tid=threadIdx.x;
     if(o>=OUT) return;
-    const float* row=W+(size_t)o*IN;
+    const WeightT* row=W+(size_t)o*IN;
     float s=0;
-    for(int i=tid;i<IN;i+=blockDim.x) s+=row[i]*x[i];
+    for(int i=tid;i<IN;i+=blockDim.x) s+=__bfloat162float(row[i])*x[i];
     sh[tid]=s;
     __syncthreads();
     for(int stride=blockDim.x/2;stride>0;stride>>=1){
@@ -189,7 +211,7 @@ __global__ void linear_kernel(const float* x,const float* W,const float* b,float
 }
 __global__ void qkv_linear_kernel(
     const float* x,
-    const float* Wq,const float* Wk,const float* Wv,
+    const WeightT* Wq,const WeightT* Wk,const WeightT* Wv,
     const float* bq,const float* bk,const float* bv,
     float* q,float* k,float* v,
     int IN
@@ -197,7 +219,7 @@ __global__ void qkv_linear_kernel(
     __shared__ float sh[256];
     int o=blockIdx.x;
     int tid=threadIdx.x;
-    const float* W=nullptr;
+    const WeightT* W=nullptr;
     const float* b=nullptr;
     float* y=nullptr;
     int local_o=o;
@@ -208,9 +230,9 @@ __global__ void qkv_linear_kernel(
     }else{
         local_o=o-HIDDEN-KV_DIM; W=Wv; b=bv; y=v;
     }
-    const float* row=W+(size_t)local_o*IN;
+    const WeightT* row=W+(size_t)local_o*IN;
     float s=0.0f;
-    for(int i=tid;i<IN;i+=blockDim.x) s+=row[i]*x[i];
+    for(int i=tid;i<IN;i+=blockDim.x) s+=__bfloat162float(row[i])*x[i];
     sh[tid]=s;
     __syncthreads();
     for(int stride=blockDim.x/2;stride>0;stride>>=1){
@@ -221,7 +243,7 @@ __global__ void qkv_linear_kernel(
 }
 __global__ void gate_up_linear_kernel(
     const float* x,
-    const float* Wgate,const float* Wup,
+    const WeightT* Wgate,const WeightT* Wup,
     float* gate,float* up,
     int IN
 ){
@@ -230,11 +252,11 @@ __global__ void gate_up_linear_kernel(
     int tid=threadIdx.x;
     bool is_gate=o<INTERMEDIATE;
     int local_o=is_gate ? o : o-INTERMEDIATE;
-    const float* W=is_gate ? Wgate : Wup;
+    const WeightT* W=is_gate ? Wgate : Wup;
     float* y=is_gate ? gate : up;
-    const float* row=W+(size_t)local_o*IN;
+    const WeightT* row=W+(size_t)local_o*IN;
     float s=0.0f;
-    for(int i=tid;i<IN;i+=blockDim.x) s+=row[i]*x[i];
+    for(int i=tid;i<IN;i+=blockDim.x) s+=__bfloat162float(row[i])*x[i];
     sh[tid]=s;
     __syncthreads();
     for(int stride=blockDim.x/2;stride>0;stride>>=1){
@@ -351,11 +373,11 @@ __global__ void argmax_kernel(const float* logits,int* out){
 }
 
 struct Layer{
-    float *ln1=nullptr,*ln2=nullptr,*wq=nullptr,*wk=nullptr,*wv=nullptr,*wo=nullptr;
-    float *bq=nullptr,*bk=nullptr,*bv=nullptr,*wgate=nullptr,*wup=nullptr,*wdown=nullptr;
+    float *ln1=nullptr,*ln2=nullptr,*bq=nullptr,*bk=nullptr,*bv=nullptr;
+    WeightT *wq=nullptr,*wk=nullptr,*wv=nullptr,*wo=nullptr,*wgate=nullptr,*wup=nullptr,*wdown=nullptr;
     float *kc=nullptr,*vc=nullptr;
 };
-struct Model{float *emb=nullptr,*norm=nullptr,*lm=nullptr; Layer layers[N_LAYERS];};
+struct Model{WeightT *emb=nullptr,*lm=nullptr; float *norm=nullptr; Layer layers[N_LAYERS];};
 struct Work{
     float *x=nullptr,*n=nullptr,*q=nullptr,*k=nullptr,*v=nullptr,*ctx=nullptr,*ao=nullptr;
     float *gate=nullptr,*up=nullptr,*mid=nullptr,*mo=nullptr,*logits=nullptr;
@@ -396,24 +418,24 @@ static void free_work(Work& w){
 static Model load_model(const std::string& dir,int max_seq){
     auto metas=scan_safetensors(dir);
     Model m;
-    m.emb=load_tensor(metas,"model.embed_tokens.weight");
+    m.emb=load_tensor_bf16(metas,"model.embed_tokens.weight");
     m.norm=load_tensor(metas,"model.norm.weight");
-    m.lm=load_tensor(metas,"lm_head.weight");
+    m.lm=load_tensor_bf16(metas,"lm_head.weight");
     for(int i=0;i<N_LAYERS;i++){
         std::cout<<"\n[C++] loading layer "<<i<<"\n";
         Layer& l=m.layers[i];
         l.ln1=load_tensor(metas,lname(i,"input_layernorm.weight"));
         l.ln2=load_tensor(metas,lname(i,"post_attention_layernorm.weight"));
-        l.wq=load_tensor(metas,lname(i,"self_attn.q_proj.weight"));
-        l.wk=load_tensor(metas,lname(i,"self_attn.k_proj.weight"));
-        l.wv=load_tensor(metas,lname(i,"self_attn.v_proj.weight"));
-        l.wo=load_tensor(metas,lname(i,"self_attn.o_proj.weight"));
+        l.wq=load_tensor_bf16(metas,lname(i,"self_attn.q_proj.weight"));
+        l.wk=load_tensor_bf16(metas,lname(i,"self_attn.k_proj.weight"));
+        l.wv=load_tensor_bf16(metas,lname(i,"self_attn.v_proj.weight"));
+        l.wo=load_tensor_bf16(metas,lname(i,"self_attn.o_proj.weight"));
         l.bq=load_tensor(metas,lname(i,"self_attn.q_proj.bias"));
         l.bk=load_tensor(metas,lname(i,"self_attn.k_proj.bias"));
         l.bv=load_tensor(metas,lname(i,"self_attn.v_proj.bias"));
-        l.wgate=load_tensor(metas,lname(i,"mlp.gate_proj.weight"));
-        l.wup=load_tensor(metas,lname(i,"mlp.up_proj.weight"));
-        l.wdown=load_tensor(metas,lname(i,"mlp.down_proj.weight"));
+        l.wgate=load_tensor_bf16(metas,lname(i,"mlp.gate_proj.weight"));
+        l.wup=load_tensor_bf16(metas,lname(i,"mlp.up_proj.weight"));
+        l.wdown=load_tensor_bf16(metas,lname(i,"mlp.down_proj.weight"));
         CK(cudaMalloc(&l.kc,(size_t)max_seq*KV_DIM*sizeof(float)));
         CK(cudaMalloc(&l.vc,(size_t)max_seq*KV_DIM*sizeof(float)));
         CK(cudaMemset(l.kc,0,(size_t)max_seq*KV_DIM*sizeof(float)));
