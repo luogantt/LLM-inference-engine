@@ -4,8 +4,10 @@
 #include <cmath>
 #include <cstdlib>
 #include <chrono>
+#include <fstream>
 #include <iostream>
 #include <random>
+#include <sstream>
 #include <vector>
 
 #define CK(call)                                                        \
@@ -23,6 +25,17 @@ using Clock = std::chrono::steady_clock;
 
 static double elapsed_ms(Clock::time_point start, Clock::time_point end) {
     return std::chrono::duration<double, std::milli>(end - start).count();
+}
+
+static void reset_time_log() {
+    std::ofstream f("log.txt", std::ios::trunc);
+    if (f) f << "[time] log reset\n";
+}
+
+static void time_log(const std::string& line) {
+    std::cout << line << "\n";
+    std::ofstream f("log.txt", std::ios::app);
+    if (f) f << line << "\n";
 }
 
 constexpr int VOCAB_SIZE = 128;
@@ -367,6 +380,7 @@ int argmax_cpu(const std::vector<float>& v) {
 }
 
 int main() {
+    reset_time_log();
     Model m = make_model();
     Work w = make_work();
 
@@ -387,14 +401,21 @@ int main() {
         forward_token(m, w, tokens[pos], pos);
         double forward_ms = elapsed_ms(forward_start, Clock::now());
         prefill_forward_ms += forward_ms;
-        std::cout << "[time] prefill token " << pos << " forward_ms=" << forward_ms << "\n";
+        {
+            std::ostringstream os;
+            os << "[time] prefill token " << pos << " forward_ms=" << forward_ms;
+            time_log(os.str());
+        }
     }
     double prefill_ms = elapsed_ms(prefill_start, Clock::now());
-    std::cout << "[time] prefill total_ms=" << prefill_ms
-              << ", forward_ms=" << prefill_forward_ms
-              << ", tokens=" << tokens.size()
-              << ", tokens_per_s=" << (prefill_ms > 0.0 ? 1000.0 * tokens.size() / prefill_ms : 0.0)
-              << "\n";
+    {
+        std::ostringstream os;
+        os << "[time] prefill total_ms=" << prefill_ms
+           << ", forward_ms=" << prefill_forward_ms
+           << ", tokens=" << tokens.size()
+           << ", tokens_per_s=" << (prefill_ms > 0.0 ? 1000.0 * tokens.size() / prefill_ms : 0.0);
+        time_log(os.str());
+    }
 
     double decode_ms_total = 0.0;
     double sample_ms_total = 0.0;
@@ -420,17 +441,24 @@ int main() {
         decode_forward_ms_total += forward_ms;
         double decode_ms = elapsed_ms(decode_start, Clock::now());
         decode_ms_total += decode_ms;
-        std::cout << "[time] decode token " << i
-                  << " step_ms=" << decode_ms
-                  << ", sample_ms=" << sample_ms
-                  << ", forward_ms=" << forward_ms << "\n";
+        {
+            std::ostringstream os;
+            os << "[time] decode token " << i
+               << " step_ms=" << decode_ms
+               << ", sample_ms=" << sample_ms
+               << ", forward_ms=" << forward_ms;
+            time_log(os.str());
+        }
     }
-    std::cout << "[time] decode total_ms=" << decode_ms_total
-              << ", sample_ms=" << sample_ms_total
-              << ", forward_ms=" << decode_forward_ms_total
-              << ", tokens=" << decode_tokens
-              << ", tokens_per_s=" << (decode_ms_total > 0.0 ? 1000.0 * decode_tokens / decode_ms_total : 0.0)
-              << "\n";
+    {
+        std::ostringstream os;
+        os << "[time] decode total_ms=" << decode_ms_total
+           << ", sample_ms=" << sample_ms_total
+           << ", forward_ms=" << decode_forward_ms_total
+           << ", tokens=" << decode_tokens
+           << ", tokens_per_s=" << (decode_ms_total > 0.0 ? 1000.0 * decode_tokens / decode_ms_total : 0.0);
+        time_log(os.str());
+    }
 
     std::cout << "all tokens: ";
     for (int t : tokens) std::cout << t << " ";

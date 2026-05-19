@@ -36,6 +36,17 @@ static double elapsed_ms(Clock::time_point start, Clock::time_point end) {
     return std::chrono::duration<double, std::milli>(end - start).count();
 }
 
+static void reset_time_log() {
+    std::ofstream f("log.txt", std::ios::trunc);
+    if (f) f << "[C++][time] log reset\n";
+}
+
+static void time_log(const std::string& line) {
+    std::cout << line << "\n";
+    std::ofstream f("log.txt", std::ios::app);
+    if (f) f << line << "\n";
+}
+
 struct ModelConfig {
     int n_layers=N_LAYERS;
     int hidden=HIDDEN;
@@ -440,6 +451,12 @@ void* llm_create(const char* model_dir,int max_seq){
         if(!model_dir) throw std::runtime_error("model_dir is null");
         Engine* e=new Engine(); e->max_seq=max_seq; e->pos=0;
         std::cout<<"[C++] create engine, model="<<model_dir<<", max_seq="<<max_seq<<"\n";
+        reset_time_log();
+        {
+            std::ostringstream os;
+            os<<"[C++][time] create engine, model="<<model_dir<<", max_seq="<<max_seq;
+            time_log(os.str());
+        }
         e->m=load_model(model_dir,max_seq); e->w=make_work();
         CK(cudaMalloc(&e->seen,VOCAB_SIZE*sizeof(unsigned char)));
         CK(cudaMalloc(&e->next_token,sizeof(int)));
@@ -481,13 +498,21 @@ int llm_prefill(void* h,const int* tokens,int n){
             mark_seen(e->seen,tokens[i]);
             e->pos++;
             e->prefill_tokens++;
-            std::cout<<"[C++][time] prefill token "<<i<<" forward_ms="<<forward_ms<<"\n";
+            {
+                std::ostringstream os;
+                os<<"[C++][time] prefill token "<<i<<" forward_ms="<<forward_ms;
+                time_log(os.str());
+            }
         }
         e->prefill_ms+=elapsed_ms(prefill_start,Clock::now());
         double tps=e->prefill_ms>0.0 ? (1000.0*e->prefill_tokens/e->prefill_ms) : 0.0;
-        std::cout<<"[C++][time] prefill total_ms="<<e->prefill_ms
-                 <<", tokens="<<e->prefill_tokens
-                 <<", tokens_per_s="<<tps<<"\n";
+        {
+            std::ostringstream os;
+            os<<"[C++][time] prefill total_ms="<<e->prefill_ms
+              <<", tokens="<<e->prefill_tokens
+              <<", tokens_per_s="<<tps;
+            time_log(os.str());
+        }
         return 0;
     }catch(const std::exception& ex){g_err=ex.what(); return -1;}
 }
@@ -513,11 +538,15 @@ int llm_decode_one(void* h,int* next){
         double decode_ms=elapsed_ms(decode_start,Clock::now());
         e->decode_ms+=decode_ms;
         double tps=e->decode_ms>0.0 ? (1000.0*e->decode_tokens/e->decode_ms) : 0.0;
-        std::cout<<"[C++][time] decode step_ms="<<decode_ms
-                 <<", sample_ms="<<sample_ms
-                 <<", forward_ms="<<forward_ms
-                 <<", decode_tokens="<<e->decode_tokens
-                 <<", decode_tokens_per_s="<<tps<<"\n";
+        {
+            std::ostringstream os;
+            os<<"[C++][time] decode step_ms="<<decode_ms
+              <<", sample_ms="<<sample_ms
+              <<", forward_ms="<<forward_ms
+              <<", decode_tokens="<<e->decode_tokens
+              <<", decode_tokens_per_s="<<tps;
+            time_log(os.str());
+        }
         return 0;
     }catch(const std::exception& ex){g_err=ex.what(); return -1;}
 }

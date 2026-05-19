@@ -33,6 +33,17 @@ static double elapsed_ms(Clock::time_point start, Clock::time_point end) {
     return std::chrono::duration<double, std::milli>(end - start).count();
 }
 
+static void reset_time_log() {
+    std::ofstream f("log.txt", std::ios::trunc);
+    if (f) f << "[time] log reset\n";
+}
+
+static void time_log(const std::string& line) {
+    std::cout << line << "\n";
+    std::ofstream f("log.txt", std::ios::app);
+    if (f) f << line << "\n";
+}
+
 // DeepSeek-R1-Distill-Qwen-7B / Qwen2ForCausalLM 常见结构参数
 constexpr int N_LAYERS = 28;
 constexpr int HIDDEN = 3584;
@@ -770,6 +781,7 @@ static Args parse_args(int argc, char** argv) {
 
 int main(int argc, char** argv) {
     Args args = parse_args(argc, argv);
+    reset_time_log();
 
     if (args.max_seq <= 0) {
         std::cerr << "bad max_seq\n";
@@ -810,15 +822,22 @@ int main(int argc, char** argv) {
         forward_token(model, work, tokens[pos], pos);
         double forward_ms = elapsed_ms(forward_start, Clock::now());
         prefill_forward_ms += forward_ms;
-        std::cout << "[time] prefill token " << pos << " forward_ms=" << forward_ms << "\n";
+        {
+            std::ostringstream os;
+            os << "[time] prefill token " << pos << " forward_ms=" << forward_ms;
+            time_log(os.str());
+        }
     }
     double prefill_ms = elapsed_ms(prefill_start, Clock::now());
     int prefill_tokens = static_cast<int>(tokens.size());
-    std::cout << "[time] prefill total_ms=" << prefill_ms
-              << ", forward_ms=" << prefill_forward_ms
-              << ", tokens=" << prefill_tokens
-              << ", tokens_per_s=" << (prefill_ms > 0.0 ? 1000.0 * prefill_tokens / prefill_ms : 0.0)
-              << "\n";
+    {
+        std::ostringstream os;
+        os << "[time] prefill total_ms=" << prefill_ms
+           << ", forward_ms=" << prefill_forward_ms
+           << ", tokens=" << prefill_tokens
+           << ", tokens_per_s=" << (prefill_ms > 0.0 ? 1000.0 * prefill_tokens / prefill_ms : 0.0);
+        time_log(os.str());
+    }
 
     std::cout << "\nDecode...\n";
 
@@ -846,24 +865,35 @@ int main(int argc, char** argv) {
             forward_token(model, work, next, pos);
             double forward_ms = elapsed_ms(forward_start, Clock::now());
             decode_forward_ms_total += forward_ms;
-            std::cout << "[time] decode token " << i
-                      << " sample_ms=" << sample_ms
-                      << ", forward_ms=" << forward_ms << "\n";
+            {
+                std::ostringstream os;
+                os << "[time] decode token " << i
+                   << " sample_ms=" << sample_ms
+                   << ", forward_ms=" << forward_ms;
+                time_log(os.str());
+            }
         } else {
-            std::cout << "[time] decode token " << i
-                      << " sample_ms=" << sample_ms
-                      << ", forward_ms=0\n";
+            {
+                std::ostringstream os;
+                os << "[time] decode token " << i
+                   << " sample_ms=" << sample_ms
+                   << ", forward_ms=0";
+                time_log(os.str());
+            }
         }
         double decode_ms = elapsed_ms(decode_start, Clock::now());
         decode_ms_total += decode_ms;
     }
 
-    std::cout << "[time] decode total_ms=" << decode_ms_total
-              << ", sample_ms=" << sample_ms_total
-              << ", forward_ms=" << decode_forward_ms_total
-              << ", tokens=" << decode_tokens
-              << ", tokens_per_s=" << (decode_ms_total > 0.0 ? 1000.0 * decode_tokens / decode_ms_total : 0.0)
-              << "\n";
+    {
+        std::ostringstream os;
+        os << "[time] decode total_ms=" << decode_ms_total
+           << ", sample_ms=" << sample_ms_total
+           << ", forward_ms=" << decode_forward_ms_total
+           << ", tokens=" << decode_tokens
+           << ", tokens_per_s=" << (decode_ms_total > 0.0 ? 1000.0 * decode_tokens / decode_ms_total : 0.0);
+        time_log(os.str());
+    }
 
     std::cout << "\nGenerated token ids:\n";
     for (int t : tokens) std::cout << t << " ";
