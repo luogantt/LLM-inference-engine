@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <chrono>
 #include <dirent.h>
 #include <fstream>
 #include <iostream>
@@ -25,6 +26,12 @@
             std::exit(1);                                               \
         }                                                               \
     } while (0)
+
+using Clock = std::chrono::steady_clock;
+
+static double elapsed_ms(Clock::time_point start, Clock::time_point end) {
+    return std::chrono::duration<double, std::milli>(end - start).count();
+}
 
 // DeepSeek-R1-Distill-Qwen-7B / Qwen2ForCausalLM 常见结构参数
 constexpr int N_LAYERS = 28;
@@ -795,27 +802,68 @@ int main(int argc, char** argv) {
 
     std::cout << "\nPrefill...\n";
 
+    double prefill_forward_ms = 0.0;
+    auto prefill_start = Clock::now();
     for (int pos = 0; pos < static_cast<int>(tokens.size()); ++pos) {
         std::cout << "prefill pos " << pos << ", token " << tokens[pos] << "\n";
+        auto forward_start = Clock::now();
         forward_token(model, work, tokens[pos], pos);
+        double forward_ms = elapsed_ms(forward_start, Clock::now());
+        prefill_forward_ms += forward_ms;
+        std::cout << "[time] prefill token " << pos << " forward_ms=" << forward_ms << "\n";
     }
+    double prefill_ms = elapsed_ms(prefill_start, Clock::now());
+    int prefill_tokens = static_cast<int>(tokens.size());
+    std::cout << "[time] prefill total_ms=" << prefill_ms
+              << ", forward_ms=" << prefill_forward_ms
+              << ", tokens=" << prefill_tokens
+              << ", tokens_per_s=" << (prefill_ms > 0.0 ? 1000.0 * prefill_tokens / prefill_ms : 0.0)
+              << "\n";
 
     std::cout << "\nDecode...\n";
 
+    double decode_ms_total = 0.0;
+    double sample_ms_total = 0.0;
+    double decode_forward_ms_total = 0.0;
+    int decode_tokens = 0;
     for (int i = 0; i < args.steps; ++i) {
+        auto decode_start = Clock::now();
+        auto sample_start = Clock::now();
         CK(cudaMemcpy(logits.data(), work.logits, VOCAB_SIZE * sizeof(float), cudaMemcpyDeviceToHost));
 
         int next = argmax_cpu(logits);
+        double sample_ms = elapsed_ms(sample_start, Clock::now());
+        sample_ms_total += sample_ms;
         int pos = static_cast<int>(tokens.size());
 
         tokens.push_back(next);
+        decode_tokens++;
 
         std::cout << "step " << i << ", next token = " << next << "\n";
 
         if (i + 1 < args.steps) {
+            auto forward_start = Clock::now();
             forward_token(model, work, next, pos);
+            double forward_ms = elapsed_ms(forward_start, Clock::now());
+            decode_forward_ms_total += forward_ms;
+            std::cout << "[time] decode token " << i
+                      << " sample_ms=" << sample_ms
+                      << ", forward_ms=" << forward_ms << "\n";
+        } else {
+            std::cout << "[time] decode token " << i
+                      << " sample_ms=" << sample_ms
+                      << ", forward_ms=0\n";
         }
+        double decode_ms = elapsed_ms(decode_start, Clock::now());
+        decode_ms_total += decode_ms;
     }
+
+    std::cout << "[time] decode total_ms=" << decode_ms_total
+              << ", sample_ms=" << sample_ms_total
+              << ", forward_ms=" << decode_forward_ms_total
+              << ", tokens=" << decode_tokens
+              << ", tokens_per_s=" << (decode_ms_total > 0.0 ? 1000.0 * decode_tokens / decode_ms_total : 0.0)
+              << "\n";
 
     std::cout << "\nGenerated token ids:\n";
     for (int t : tokens) std::cout << t << " ";

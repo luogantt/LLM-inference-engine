@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <chrono>
 #include <dirent.h>
 #include <exception>
 #include <fstream>
@@ -28,6 +29,11 @@ constexpr int VOCAB_SIZE=152064;
 constexpr float ROPE_THETA=1000000.0f;
 
 static thread_local std::string g_err;
+using Clock = std::chrono::steady_clock;
+
+static double elapsed_ms(Clock::time_point start, Clock::time_point end) {
+    return std::chrono::duration<double, std::milli>(end - start).count();
+}
 
 struct TensorMeta {
     std::string file;
@@ -250,7 +256,18 @@ struct Work{
     float *x=nullptr,*n=nullptr,*q=nullptr,*k=nullptr,*v=nullptr,*ctx=nullptr,*ao=nullptr;
     float *gate=nullptr,*up=nullptr,*mid=nullptr,*mo=nullptr,*logits=nullptr;
 };
-struct Engine{Model m; Work w; int max_seq=0,pos=0; int* next_token=nullptr;};
+struct Engine{
+    Model m;
+    Work w;
+    int max_seq=0,pos=0;
+    int* next_token=nullptr;
+    double prefill_ms=0.0;
+    double decode_ms=0.0;
+    double forward_ms=0.0;
+    double sample_ms=0.0;
+    int prefill_tokens=0;
+    int decode_tokens=0;
+};
 
 template <typename T>
 static void freep(T*& p){if(p){cudaFree(p);p=nullptr;}}
@@ -363,11 +380,28 @@ int llm_prefill(void* h,const int* tokens,int n){
         if(!tokens) throw std::runtime_error("tokens null");
         Engine* e=(Engine*)h; if(n<=0||n>e->max_seq) throw std::runtime_error("bad prefill length");
         e->pos=0;
+        e->prefill_ms=0.0;
+        e->decode_ms=0.0;
+        e->forward_ms=0.0;
+        e->sample_ms=0.0;
+        e->prefill_tokens=0;
+        e->decode_tokens=0;
+        auto prefill_start=Clock::now();
         for(int i=0;i<n;i++){
             std::cout<<"[C++] prefill pos="<<e->pos<<", token="<<tokens[i]<<"\n";
+            auto forward_start=Clock::now();
             forward_token(e->m,e->w,tokens[i],e->pos);
+            double forward_ms=elapsed_ms(forward_start,Clock::now());
+            e->forward_ms+=forward_ms;
             e->pos++;
+            e->prefill_tokens++;
+            std::cout<<"[C++][time] prefill token "<<i<<" forward_ms="<<forward_ms<<"\n";
         }
+        e->prefill_ms+=elapsed_ms(prefill_start,Clock::now());
+        double tps=e->prefill_ms>0.0 ? (1000.0*e->prefill_tokens/e->prefill_ms) : 0.0;
+        std::cout<<"[C++][time] prefill total_ms="<<e->prefill_ms
+                 <<", tokens="<<e->prefill_tokens
+                 <<", tokens_per_s="<<tps<<"\n";
         return 0;
     }catch(const std::exception& ex){g_err=ex.what(); return -1;}
 }
@@ -376,11 +410,27 @@ int llm_decode_one(void* h,int* next){
         if(!h) throw std::runtime_error("handle null");
         if(!next) throw std::runtime_error("next null");
         Engine* e=(Engine*)h; if(e->pos>=e->max_seq) throw std::runtime_error("pos >= max_seq");
+        auto decode_start=Clock::now();
+        auto sample_start=Clock::now();
         int t=argmax_gpu_to_cpu(e->w.logits,e->next_token);
+        double sample_ms=elapsed_ms(sample_start,Clock::now());
+        e->sample_ms+=sample_ms;
         *next=t;
         std::cout<<"[C++] decode pos="<<e->pos<<", token="<<t<<"\n";
+        auto forward_start=Clock::now();
         forward_token(e->m,e->w,t,e->pos);
+        double forward_ms=elapsed_ms(forward_start,Clock::now());
+        e->forward_ms+=forward_ms;
         e->pos++;
+        e->decode_tokens++;
+        double decode_ms=elapsed_ms(decode_start,Clock::now());
+        e->decode_ms+=decode_ms;
+        double tps=e->decode_ms>0.0 ? (1000.0*e->decode_tokens/e->decode_ms) : 0.0;
+        std::cout<<"[C++][time] decode step_ms="<<decode_ms
+                 <<", sample_ms="<<sample_ms
+                 <<", forward_ms="<<forward_ms
+                 <<", decode_tokens="<<e->decode_tokens
+                 <<", decode_tokens_per_s="<<tps<<"\n";
         return 0;
     }catch(const std::exception& ex){g_err=ex.what(); return -1;}
 }

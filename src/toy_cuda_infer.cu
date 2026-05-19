@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <chrono>
 #include <iostream>
 #include <random>
 #include <vector>
@@ -17,6 +18,12 @@
             std::exit(1);                                               \
         }                                                               \
     } while (0)
+
+using Clock = std::chrono::steady_clock;
+
+static double elapsed_ms(Clock::time_point start, Clock::time_point end) {
+    return std::chrono::duration<double, std::milli>(end - start).count();
+}
 
 constexpr int VOCAB_SIZE = 128;
 constexpr int MAX_SEQ = 64;
@@ -373,21 +380,57 @@ int main() {
 
     int steps = 16;
 
+    double prefill_forward_ms = 0.0;
+    auto prefill_start = Clock::now();
     for (int pos = 0; pos < static_cast<int>(tokens.size()); ++pos) {
+        auto forward_start = Clock::now();
         forward_token(m, w, tokens[pos], pos);
+        double forward_ms = elapsed_ms(forward_start, Clock::now());
+        prefill_forward_ms += forward_ms;
+        std::cout << "[time] prefill token " << pos << " forward_ms=" << forward_ms << "\n";
     }
+    double prefill_ms = elapsed_ms(prefill_start, Clock::now());
+    std::cout << "[time] prefill total_ms=" << prefill_ms
+              << ", forward_ms=" << prefill_forward_ms
+              << ", tokens=" << tokens.size()
+              << ", tokens_per_s=" << (prefill_ms > 0.0 ? 1000.0 * tokens.size() / prefill_ms : 0.0)
+              << "\n";
 
+    double decode_ms_total = 0.0;
+    double sample_ms_total = 0.0;
+    double decode_forward_ms_total = 0.0;
+    int decode_tokens = 0;
     for (int i = 0; i < steps; ++i) {
+        auto decode_start = Clock::now();
+        auto sample_start = Clock::now();
         CK(cudaMemcpy(logits.data(), w.logits, VOCAB_SIZE * sizeof(float), cudaMemcpyDeviceToHost));
         int next = argmax_cpu(logits);
+        double sample_ms = elapsed_ms(sample_start, Clock::now());
+        sample_ms_total += sample_ms;
         int pos = static_cast<int>(tokens.size());
         tokens.push_back(next);
+        decode_tokens++;
 
         std::cout << "step " << i << ", next token = " << next << "\n";
 
         if (pos >= MAX_SEQ) break;
+        auto forward_start = Clock::now();
         forward_token(m, w, next, pos);
+        double forward_ms = elapsed_ms(forward_start, Clock::now());
+        decode_forward_ms_total += forward_ms;
+        double decode_ms = elapsed_ms(decode_start, Clock::now());
+        decode_ms_total += decode_ms;
+        std::cout << "[time] decode token " << i
+                  << " step_ms=" << decode_ms
+                  << ", sample_ms=" << sample_ms
+                  << ", forward_ms=" << forward_ms << "\n";
     }
+    std::cout << "[time] decode total_ms=" << decode_ms_total
+              << ", sample_ms=" << sample_ms_total
+              << ", forward_ms=" << decode_forward_ms_total
+              << ", tokens=" << decode_tokens
+              << ", tokens_per_s=" << (decode_ms_total > 0.0 ? 1000.0 * decode_tokens / decode_ms_total : 0.0)
+              << "\n";
 
     std::cout << "all tokens: ";
     for (int t : tokens) std::cout << t << " ";
