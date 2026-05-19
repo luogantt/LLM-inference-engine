@@ -31,6 +31,8 @@ constexpr int INTERMEDIATE=18944;
 constexpr int VOCAB_SIZE=152064;
 using WeightT = half;
 constexpr int WMMA_TILE=16;
+constexpr int LINEAR_THREADS=128;
+constexpr int ARGMAX_BLOCKS=256;
 #ifndef USE_WMMA_LINEAR
 #define USE_WMMA_LINEAR 0
 #endif
@@ -190,6 +192,20 @@ static WeightT* load_tensor_bf16(const std::unordered_map<std::string,TensorMeta
 __device__ __forceinline__ float weight_to_float(WeightT w){
     return __half2float(w);
 }
+__device__ __forceinline__ float dot_weight_half2_float_x(const WeightT* row,const float* x,int IN,int tid,int stride){
+    const half2* row2=reinterpret_cast<const half2*>(row);
+    int pairs=IN>>1;
+    float s=0.0f;
+    for(int j=tid;j<pairs;j+=stride){
+        half2 hw=row2[j];
+        float2 wf=__half22float2(hw);
+        int i=j<<1;
+        s=fmaf(wf.x,__ldg(x+i),s);
+        s=fmaf(wf.y,__ldg(x+i+1),s);
+    }
+    if((IN&1) && tid==0) s=fmaf(weight_to_float(row[IN-1]),__ldg(x+IN-1),s);
+    return s;
+}
 
 __global__ void embedding_kernel(int token,const WeightT* emb,float* x){
     int i=blockIdx.x*blockDim.x+threadIdx.x;
@@ -210,8 +226,7 @@ __global__ void linear_kernel(const float* x,const WeightT* W,const float* b,flo
     int tid=threadIdx.x;
     if(o>=OUT) return;
     const WeightT* row=W+(size_t)o*IN;
-    float s=0;
-    for(int i=tid;i<IN;i+=blockDim.x) s+=weight_to_float(row[i])*x[i];
+    float s=dot_weight_half2_float_x(row,x,IN,tid,blockDim.x);
     sh[tid]=s;
     __syncthreads();
     for(int stride=blockDim.x/2;stride>0;stride>>=1){
@@ -242,8 +257,7 @@ __global__ void qkv_linear_kernel(
         local_o=o-HIDDEN-KV_DIM; W=Wv; b=bv; y=v;
     }
     const WeightT* row=W+(size_t)local_o*IN;
-    float s=0.0f;
-    for(int i=tid;i<IN;i+=blockDim.x) s+=weight_to_float(row[i])*x[i];
+    float s=dot_weight_half2_float_x(row,x,IN,tid,blockDim.x);
     sh[tid]=s;
     __syncthreads();
     for(int stride=blockDim.x/2;stride>0;stride>>=1){
@@ -266,8 +280,7 @@ __global__ void gate_up_linear_kernel(
     const WeightT* W=is_gate ? Wgate : Wup;
     float* y=is_gate ? gate : up;
     const WeightT* row=W+(size_t)local_o*IN;
-    float s=0.0f;
-    for(int i=tid;i<IN;i+=blockDim.x) s+=weight_to_float(row[i])*x[i];
+    float s=dot_weight_half2_float_x(row,x,IN,tid,blockDim.x);
     sh[tid]=s;
     __syncthreads();
     for(int stride=blockDim.x/2;stride>0;stride>>=1){
@@ -425,6 +438,62 @@ __global__ void argmax_kernel(const float* logits,int* out){
     }
     if(tid==0) *out=best_ids[0];
 }
+__global__ void argmax_stage1_kernel(const float* logits,float* block_vals,int* block_ids){
+    __shared__ float best_vals[256];
+    __shared__ int best_ids[256];
+    int tid=threadIdx.x;
+    int start=blockIdx.x*blockDim.x+tid;
+    int stride=blockDim.x*gridDim.x;
+    float best=-INFINITY;
+    int best_id=0;
+    for(int i=start;i<VOCAB_SIZE;i+=stride){
+        float v=logits[i];
+        if(v>best || (v==best && i<best_id)){
+            best=v;
+            best_id=i;
+        }
+    }
+    best_vals[tid]=best;
+    best_ids[tid]=best_id;
+    __syncthreads();
+    for(int stride2=blockDim.x/2;stride2>0;stride2>>=1){
+        if(tid<stride2){
+            float other=best_vals[tid+stride2];
+            int other_id=best_ids[tid+stride2];
+            if(other>best_vals[tid] || (other==best_vals[tid] && other_id<best_ids[tid])){
+                best_vals[tid]=other;
+                best_ids[tid]=other_id;
+            }
+        }
+        __syncthreads();
+    }
+    if(tid==0){
+        block_vals[blockIdx.x]=best_vals[0];
+        block_ids[blockIdx.x]=best_ids[0];
+    }
+}
+__global__ void argmax_stage2_kernel(const float* block_vals,const int* block_ids,int* out){
+    __shared__ float best_vals[256];
+    __shared__ int best_ids[256];
+    int tid=threadIdx.x;
+    float best=(tid<ARGMAX_BLOCKS) ? block_vals[tid] : -INFINITY;
+    int best_id=(tid<ARGMAX_BLOCKS) ? block_ids[tid] : 0;
+    best_vals[tid]=best;
+    best_ids[tid]=best_id;
+    __syncthreads();
+    for(int stride=blockDim.x/2;stride>0;stride>>=1){
+        if(tid<stride){
+            float other=best_vals[tid+stride];
+            int other_id=best_ids[tid+stride];
+            if(other>best_vals[tid] || (other==best_vals[tid] && other_id<best_ids[tid])){
+                best_vals[tid]=other;
+                best_ids[tid]=other_id;
+            }
+        }
+        __syncthreads();
+    }
+    if(tid==0) *out=best_ids[0];
+}
 
 struct Layer{
     float *ln1=nullptr,*ln2=nullptr,*bq=nullptr,*bk=nullptr,*bv=nullptr;
@@ -436,6 +505,8 @@ struct Work{
     float *x=nullptr,*n=nullptr,*q=nullptr,*k=nullptr,*v=nullptr,*ctx=nullptr,*ao=nullptr;
     float *gate=nullptr,*up=nullptr,*mid=nullptr,*mo=nullptr,*logits=nullptr;
     float *attn_scores=nullptr;
+    float *argmax_vals=nullptr;
+    int *argmax_ids=nullptr;
     half *wmma_x=nullptr;
 };
 struct Engine{
@@ -464,12 +535,15 @@ static Work make_work(int max_seq){
     CK(cudaMalloc(&w.mid,INTERMEDIATE*sizeof(float))); CK(cudaMalloc(&w.mo,HIDDEN*sizeof(float)));
     CK(cudaMalloc(&w.logits,VOCAB_SIZE*sizeof(float)));
     CK(cudaMalloc(&w.attn_scores,(size_t)N_HEADS*max_seq*sizeof(float)));
+    CK(cudaMalloc(&w.argmax_vals,ARGMAX_BLOCKS*sizeof(float)));
+    CK(cudaMalloc(&w.argmax_ids,ARGMAX_BLOCKS*sizeof(int)));
     CK(cudaMalloc(&w.wmma_x,INTERMEDIATE*sizeof(half)));
     return w;
 }
 static void free_work(Work& w){
     freep(w.x);freep(w.n);freep(w.q);freep(w.k);freep(w.v);freep(w.ctx);freep(w.ao);
-    freep(w.gate);freep(w.up);freep(w.mid);freep(w.mo);freep(w.logits);freep(w.attn_scores);freep(w.wmma_x);
+    freep(w.gate);freep(w.up);freep(w.mid);freep(w.mo);freep(w.logits);freep(w.attn_scores);
+    freep(w.argmax_vals);freep(w.argmax_ids);freep(w.wmma_x);
 }
 static Model load_model(const std::string& dir,int max_seq){
     auto metas=scan_safetensors(dir);
@@ -520,7 +594,7 @@ static void launch_linear_from_float(const float* x,half* xh,const WeightT* W,co
     prepare_wmma_x(x,xh,IN);
     launch_wmma_linear(xh,W,b,y,IN,OUT);
 #else
-    int B=256;
+    int B=LINEAR_THREADS;
     linear_kernel<<<OUT,B>>>(x,W,b,y,IN,OUT);
 #endif
 }
@@ -537,7 +611,7 @@ static void launch_qkv_from_float(
     launch_wmma_linear(xh,Wk,bk,k,IN,KV_DIM);
     launch_wmma_linear(xh,Wv,bv,v,IN,KV_DIM);
 #else
-    int B=256;
+    int B=LINEAR_THREADS;
     qkv_linear_kernel<<<HIDDEN+2*KV_DIM,B>>>(x,Wq,Wk,Wv,bq,bk,bv,q,k,v,IN);
 #endif
 }
@@ -552,7 +626,7 @@ static void launch_gate_up_from_float(
     launch_wmma_linear(xh,Wgate,nullptr,gate,IN,INTERMEDIATE);
     launch_wmma_linear(xh,Wup,nullptr,up,IN,INTERMEDIATE);
 #else
-    int B=256;
+    int B=LINEAR_THREADS;
     gate_up_linear_kernel<<<2*INTERMEDIATE,B>>>(x,Wgate,Wup,gate,up,IN);
 #endif
 }
@@ -583,8 +657,9 @@ static void forward_token(const Model& m,Work& w,int token,int pos,int max_seq){
     launch_linear_from_float(w.n,w.wmma_x,m.lm,nullptr,w.logits,HIDDEN,VOCAB_SIZE);
     CK(cudaDeviceSynchronize());
 }
-static int argmax_gpu_to_cpu(float* d,int* next_token){
-    argmax_kernel<<<1,256>>>(d,next_token);
+static int argmax_gpu_to_cpu(float* d,float* block_vals,int* block_ids,int* next_token){
+    argmax_stage1_kernel<<<ARGMAX_BLOCKS,256>>>(d,block_vals,block_ids);
+    argmax_stage2_kernel<<<1,256>>>(block_vals,block_ids,next_token);
     int h=0;
     CK(cudaMemcpy(&h,next_token,sizeof(int),cudaMemcpyDeviceToHost));
     return h;
@@ -657,7 +732,7 @@ int llm_decode_one(void* h,int* next){
         Engine* e=(Engine*)h; if(e->pos>=e->max_seq) throw std::runtime_error("pos >= max_seq");
         auto decode_start=Clock::now();
         auto sample_start=Clock::now();
-        int t=argmax_gpu_to_cpu(e->w.logits,e->next_token);
+        int t=argmax_gpu_to_cpu(e->w.logits,e->w.argmax_vals,e->w.argmax_ids,e->next_token);
         double sample_ms=elapsed_ms(sample_start,Clock::now());
         e->sample_ms+=sample_ms;
         *next=t;
