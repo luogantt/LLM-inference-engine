@@ -1,178 +1,62 @@
-# CUDA LLM From Scratch：不用 torch / transformers / llama.cpp 的最小推理框架
+# LLM CUDA Inference Engine
 
-这个项目按你的要求写：
+一个从零实现的 CUDA 大模型推理引擎，当前主要面向 DeepSeek-R1-Distill-Qwen-7B 的单 batch 推理。
 
-- 不用 PyTorch
-- 不用 Transformers
-- 不用 llama.cpp
-- 不用 vLLM
-- 不用 cuBLAS / cuDNN
-- 只用 C++17 标准库 + CUDA Runtime
-- CUDA 源码手写 RMSNorm / Linear / RoPE / GQA Attention / SwiGLU / KV Cache / greedy decode
+项目目标是尽量少依赖外部推理框架，用 C++ / CUDA 手写核心推理路径，便于学习、实验和性能优化。
 
-## 文件说明
+## 特点
 
-```text
-cuda_llm_from_scratch/
-├── Makefile
-├── README.md
-└── src/
-    ├── toy_cuda_infer.cu
-    └── deepseek7b_token_cuda_infer.cu
-```
+- 不依赖 PyTorch、Transformers、vLLM、llama.cpp
+- CUDA 手写 RMSNorm、RoPE、GQA Attention、SwiGLU、KV Cache、decode
+- 支持 HuggingFace safetensors 权重加载
+- 提供 Python tokenizer + CUDA 动态库推理入口
+- 当前 `mma` 版本针对 A100 / A800 的单步 decode 做了多轮优化
 
-## 1. toy_cuda_infer.cu
-
-完全自包含的小模型版本，随机权重，可以直接编译运行，用来验证推理链路。
+## 编译与运行
 
 ```bash
-make toy
-./toy_cuda_infer
-```
-
-它实现：
-
-```text
-Embedding
-RMSNorm
-Q/K/V Linear
-RoPE
-GQA causal attention
-O projection
-SwiGLU MLP
-Residual
-Final RMSNorm
-LM Head
-Greedy Decode
-```
-
-## 2. deepseek7b_token_cuda_infer.cu
-
-这个版本会直接扫描你的 HuggingFace safetensors 模型目录：
-
-```bash
-/home/lg/推理/推理引擎/deepseek-r1-7b
-```
-
-它会读取：
-
-```text
-model-00001-of-000002.safetensors
-model-00002-of-000002.safetensors
-```
-
-并加载这些权重：
-
-```text
-model.embed_tokens.weight
-model.layers.i.input_layernorm.weight
-model.layers.i.self_attn.q_proj.weight
-model.layers.i.self_attn.k_proj.weight
-model.layers.i.self_attn.v_proj.weight
-model.layers.i.self_attn.o_proj.weight
-model.layers.i.self_attn.q_proj.bias
-model.layers.i.self_attn.k_proj.bias
-model.layers.i.self_attn.v_proj.bias
-model.layers.i.post_attention_layernorm.weight
-model.layers.i.mlp.gate_proj.weight
-model.layers.i.mlp.up_proj.weight
-model.layers.i.mlp.down_proj.weight
-model.norm.weight
-lm_head.weight
-```
-
-## 重要限制
-
-这个版本没有实现 tokenizer。
-
-所以它的输入不是中文文本，而是 token id：
-
-```bash
-./deepseek7b_token_cuda_infer --model  ../DeepSeek-R1-Distill-Qwen-7B --tokens 1,2,3 --steps 5 --max-seq 128
-
-```
-
-输出也是 token id。
-
-为什么不直接输入中文？
-
-因为 Qwen / DeepSeek 的 tokenizer 是 BPE / byte-level / chat-template 的组合。纯 C++ 从零实现 tokenizer 是另一个独立工程。这个项目先把“模型 forward + decode”打通。
-
-## 编译
-
-A800 / A100：
-
-```bash
-make deepseek7b A=sm_80
-```
-
-RTX 4090：
-
-```bash
-make deepseek7b A=sm_89
-```
-
-默认：
-
-```bash
-make deepseek7b
-```
-
-## 运行
-
-```bash
-./deepseek7b_token_cuda_infer \
-  --model /home/lg/推理/推理引擎/deepseek-r1-7b \
-  --tokens 1,2,3 \
-  --steps 5 \
-  --max-seq 128
-```
-
-## 显存说明
-
-这个版本为了代码最简单，把 BF16 权重加载后转成 float32 放 GPU。
-
-DeepSeek-R1-Distill-Qwen-7B 权重文件大约 15GB BF16，转成 FP32 后大约 30GB 以上。
-
-所以：
-
-- A800 80GB：可以试
-- A100 80GB：可以试
-- 4090 24GB：大概率放不下
-- 3090 24GB：大概率放不下
-
-## 性能说明
-
-这个版本完全不用 cuBLAS，也没有 Tensor Core GEMM。
-
-Linear 是手写 naive GEMV：
-
-```text
-一个输出维度一个线程
-每个线程串行累加 input_dim
-```
-
-所以它很慢，但结构最清楚。
-
-真正高性能版本应该逐步替换：
-
-```text
-naive Linear      -> tiled GEMM / Tensor Core
-naive Attention   -> FlashAttention / FlashDecoding
-float32 weights   -> half / bf16
-CPU argmax        -> GPU reduce argmax
-无 tokenizer       -> C++ tokenizer
-```
-
-这个项目是“从零写推理器”的第 0 版。
-
-```
+make -f Makefile.cuda_lib lib A=sm_80
 CUDA_VISIBLE_DEVICES=4 python python_infer.py \
   --model /data3/ledi/models/DeepSeek-R1-Distill-Qwen-7B \
   --lib ./build/libllm_cuda.so \
   --prompt "你好 deepseek 介绍一下黑格尔的思想" \
   --max-new-tokens 512 \
   --max-seq 800
-
 ```
-#### 这个版本是 不用 mma 和 cublas的 极限了
+
+## 当前性能
+
+测试模型：
+
+```text
+/data3/ledi/models/DeepSeek-R1-Distill-Qwen-7B
+```
+
+当前记录：
+
+```text
+max_seq=800
+max_new_tokens=512
+512 tokens = 65.6845 tok/s
+max forward_ms = 16.1768
+```
+
+对应 tag：
+
+```text
+mma_max_forward_ms=16.1768_512_tokens=65.6845_tok_s
+```
+
+## 主要文件
+
+```text
+src/llm_cuda_lib.cu                  CUDA 推理核心
+python_infer.py                      Python 调用入口
+Makefile.cuda_lib                    动态库编译入口
+llm_cuda_python_tokenizer_v2/         tokenizer 版本相关代码
+log.txt                              性能记录
+```
+
+## 说明
+
+这个项目偏研究和实验性质，重点是理解并优化单 batch decode 路径。后续如果继续提高速度，主要方向是 CUDA Graph、decode GEMV / MLP 重写、量化和 speculative decoding。
