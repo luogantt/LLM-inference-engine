@@ -61,6 +61,9 @@ constexpr float DEFAULT_ROPE_THETA=1000000.0f;
 #ifndef USE_LINEAR_I4_DP4A2
 #define USE_LINEAR_I4_DP4A2 0
 #endif
+#ifndef USE_QKV_GATE_I4_DP4A2
+#define USE_QKV_GATE_I4_DP4A2 0
+#endif
 #ifndef USE_FP16_KV_CACHE
 #define USE_FP16_KV_CACHE 0
 #endif
@@ -827,6 +830,65 @@ __global__ void qkv_i4_dp4a_kernel(
         y[local_o]=b ? out+b[local_o] : out;
     }
 }
+__global__ void qkv_i4_dp4a2_kernel(
+    const int8_t* xq,const float* x_scale,
+    const WeightT* Wq,const WeightT* Wk,const WeightT* Wv,
+    const float* Sq,const float* Sk,const float* Sv,
+    const float* bq,const float* bk,const float* bv,
+    float* q,float* k,float* v,
+    int IN
+){
+    __shared__ int sh0[256];
+    __shared__ int sh1[256];
+    constexpr int TOTAL_QKV=HIDDEN+2*KV_DIM;
+    int o0=blockIdx.x<<1;
+    int o1=o0+1;
+    int tid=threadIdx.x;
+    if(o0>=TOTAL_QKV) return;
+    const WeightT *W0=nullptr,*W1=nullptr;
+    const float *S0=nullptr,*S1=nullptr,*b0=nullptr,*b1=nullptr;
+    float *y0=nullptr,*y1=nullptr;
+    int local0=o0,local1=o1;
+    if(o0<HIDDEN){
+        W0=Wq; S0=Sq; b0=bq; y0=q;
+    }else if(o0<HIDDEN+KV_DIM){
+        local0=o0-HIDDEN; W0=Wk; S0=Sk; b0=bk; y0=k;
+    }else{
+        local0=o0-HIDDEN-KV_DIM; W0=Wv; S0=Sv; b0=bv; y0=v;
+    }
+    if(o1<TOTAL_QKV){
+        if(o1<HIDDEN){
+            W1=Wq; S1=Sq; b1=bq; y1=q;
+        }else if(o1<HIDDEN+KV_DIM){
+            local1=o1-HIDDEN; W1=Wk; S1=Sk; b1=bk; y1=k;
+        }else{
+            local1=o1-HIDDEN-KV_DIM; W1=Wv; S1=Sv; b1=bv; y1=v;
+        }
+    }
+    const WeightT* row0=row_weight_ptr(W0,local0,IN);
+    const WeightT* row1=(o1<TOTAL_QKV) ? row_weight_ptr(W1,local1,IN) : nullptr;
+    int s0=0,s1=0;
+    dot_i4_i8_dp4a2(row0,row1,xq,IN,tid,blockDim.x,s0,s1);
+    sh0[tid]=s0;
+    sh1[tid]=s1;
+    __syncthreads();
+    for(int stride=blockDim.x/2;stride>0;stride>>=1){
+        if(tid<stride){
+            sh0[tid]+=sh0[tid+stride];
+            sh1[tid]+=sh1[tid+stride];
+        }
+        __syncthreads();
+    }
+    if(tid==0){
+        float xs=x_scale[0];
+        float out0=(float)sh0[0]*row_scale_at(S0,local0)*xs;
+        y0[local0]=b0 ? out0+b0[local0] : out0;
+        if(o1<TOTAL_QKV){
+            float out1=(float)sh1[0]*row_scale_at(S1,local1)*xs;
+            y1[local1]=b1 ? out1+b1[local1] : out1;
+        }
+    }
+}
 __global__ void gate_up_i4_dp4a_kernel(
     const int8_t* xq,const float* x_scale,
     const WeightT* Wgate,const WeightT* Wup,
@@ -851,6 +913,52 @@ __global__ void gate_up_i4_dp4a_kernel(
         __syncthreads();
     }
     if(tid==0) y[local_o]=(float)sh[0]*row_scale_at(S,local_o)*x_scale[0];
+}
+__global__ void gate_up_i4_dp4a2_kernel(
+    const int8_t* xq,const float* x_scale,
+    const WeightT* Wgate,const WeightT* Wup,
+    const float* Sgate,const float* Sup,
+    float* gate,float* up,
+    int IN
+){
+    __shared__ int sh0[256];
+    __shared__ int sh1[256];
+    constexpr int TOTAL_GATE_UP=2*INTERMEDIATE;
+    int o0=blockIdx.x<<1;
+    int o1=o0+1;
+    int tid=threadIdx.x;
+    if(o0>=TOTAL_GATE_UP) return;
+    bool is_gate0=o0<INTERMEDIATE;
+    bool is_gate1=o1<INTERMEDIATE;
+    int local0=is_gate0 ? o0 : o0-INTERMEDIATE;
+    int local1=is_gate1 ? o1 : o1-INTERMEDIATE;
+    const WeightT* W0=is_gate0 ? Wgate : Wup;
+    const WeightT* W1=(o1<TOTAL_GATE_UP) ? (is_gate1 ? Wgate : Wup) : nullptr;
+    const float* S0=is_gate0 ? Sgate : Sup;
+    const float* S1=is_gate1 ? Sgate : Sup;
+    float* y0=is_gate0 ? gate : up;
+    float* y1=is_gate1 ? gate : up;
+    const WeightT* row0=row_weight_ptr(W0,local0,IN);
+    const WeightT* row1=(o1<TOTAL_GATE_UP) ? row_weight_ptr(W1,local1,IN) : nullptr;
+    int s0=0,s1=0;
+    dot_i4_i8_dp4a2(row0,row1,xq,IN,tid,blockDim.x,s0,s1);
+    sh0[tid]=s0;
+    sh1[tid]=s1;
+    __syncthreads();
+    for(int stride=blockDim.x/2;stride>0;stride>>=1){
+        if(tid<stride){
+            sh0[tid]+=sh0[tid+stride];
+            sh1[tid]+=sh1[tid+stride];
+        }
+        __syncthreads();
+    }
+    if(tid==0){
+        float xs=x_scale[0];
+        y0[local0]=(float)sh0[0]*row_scale_at(S0,local0)*xs;
+        if(o1<TOTAL_GATE_UP){
+            y1[local1]=(float)sh1[0]*row_scale_at(S1,local1)*xs;
+        }
+    }
 }
 __global__ void float_to_half_kernel(const float* x,half* xh,int n){
     int i=blockIdx.x*blockDim.x+threadIdx.x;
@@ -1451,7 +1559,11 @@ static void launch_qkv_from_float(
 #elif USE_INT4_WEIGHTS && USE_INT4_DP4A
     prepare_int8_x(x,xq,xq_scale,IN);
     int B=LINEAR_THREADS;
+#if USE_QKV_GATE_I4_DP4A2
+    qkv_i4_dp4a2_kernel<<<(HIDDEN+2*KV_DIM+1)/2,B>>>(xq,xq_scale,Wq.data,Wk.data,Wv.data,Wq.scale,Wk.scale,Wv.scale,bq,bk,bv,q,k,v,IN);
+#else
     qkv_i4_dp4a_kernel<<<HIDDEN+2*KV_DIM,B>>>(xq,xq_scale,Wq.data,Wk.data,Wv.data,Wq.scale,Wk.scale,Wv.scale,bq,bk,bv,q,k,v,IN);
+#endif
 #else
     int B=LINEAR_THREADS;
     qkv_linear_kernel<<<HIDDEN+2*KV_DIM,B>>>(x,Wq.data,Wk.data,Wv.data,Wq.scale,Wk.scale,Wv.scale,bq,bk,bv,q,k,v,IN);
@@ -1470,7 +1582,11 @@ static void launch_gate_up_from_float(
 #elif USE_INT4_WEIGHTS && USE_INT4_DP4A
     prepare_int8_x(x,xq,xq_scale,IN);
     int B=LINEAR_THREADS;
+#if USE_QKV_GATE_I4_DP4A2
+    gate_up_i4_dp4a2_kernel<<<(2*INTERMEDIATE+1)/2,B>>>(xq,xq_scale,Wgate.data,Wup.data,Wgate.scale,Wup.scale,gate,up,IN);
+#else
     gate_up_i4_dp4a_kernel<<<2*INTERMEDIATE,B>>>(xq,xq_scale,Wgate.data,Wup.data,Wgate.scale,Wup.scale,gate,up,IN);
+#endif
 #else
     int B=LINEAR_THREADS;
     gate_up_linear_kernel<<<2*INTERMEDIATE,B>>>(x,Wgate.data,Wup.data,Wgate.scale,Wup.scale,gate,up,IN);

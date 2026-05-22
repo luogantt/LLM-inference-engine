@@ -6,7 +6,7 @@ FAST_FLAGS = $(COMMON_FLAGS) --use_fast_math
 
 .RECIPEPREFIX := >
 
-.PHONY: lib lib-int8 lib-int4 lib-int4-o2 lib-int4-kv-fp16 lib-int4-silu-fast lib-int4-fast lib-int4-attn-shm lib-int4-fused-attn lib-int4-fused-mlp lib-int4-ultra lib-int4-super lib-int4-t64 lib-int4-t256 lib-int4-prepack lib-int4-float clean-lib
+.PHONY: lib lib-int8 lib-int4 lib-int4-o2 lib-int4-o2-all lib-int4-kv-fp16 lib-int4-silu-fast lib-int4-fast lib-int4-attn-shm lib-int4-fused-attn lib-int4-fused-mlp lib-int4-ultra lib-int4-super lib-int4-t64 lib-int4-t256 lib-int4-prepack lib-int4-float clean-lib
 
 lib:
 >mkdir -p build
@@ -23,6 +23,10 @@ lib-int4:
 lib-int4-o2:
 >mkdir -p build
 >$(NVCC) $(COMMON_FLAGS) -DUSE_INT4_WEIGHTS=1 -DUSE_INT4_DP4A=1 -DUSE_LINEAR_I4_DP4A2=1 -arch=$(A) -Xcompiler -fPIC -shared src/llm_cuda_lib.cu -o build/libllm_cuda.so
+
+lib-int4-o2-all:
+>mkdir -p build
+>$(NVCC) $(COMMON_FLAGS) -DUSE_INT4_WEIGHTS=1 -DUSE_INT4_DP4A=1 -DUSE_LINEAR_I4_DP4A2=1 -DUSE_QKV_GATE_I4_DP4A2=1 -arch=$(A) -Xcompiler -fPIC -shared src/llm_cuda_lib.cu -o build/libllm_cuda.so
 
 lib-int4-kv-fp16:
 >mkdir -p build
