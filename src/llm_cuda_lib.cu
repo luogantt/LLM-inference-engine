@@ -64,6 +64,12 @@ constexpr float DEFAULT_ROPE_THETA=1000000.0f;
 #ifndef USE_QKV_GATE_I4_DP4A2
 #define USE_QKV_GATE_I4_DP4A2 0
 #endif
+#ifndef USE_LINEAR_I4_DP4A4
+#define USE_LINEAR_I4_DP4A4 0
+#endif
+#ifndef USE_QKV_GATE_I4_DP4A4
+#define USE_QKV_GATE_I4_DP4A4 0
+#endif
 #ifndef USE_FP16_KV_CACHE
 #define USE_FP16_KV_CACHE 0
 #endif
@@ -547,6 +553,75 @@ __device__ __forceinline__ void dot_i4_i8_dp4a2(
     }
 #endif
 }
+__device__ __forceinline__ void dot_i4_i8_dp4a4(
+    const WeightT* row0,const WeightT* row1,const WeightT* row2,const WeightT* row3,
+    const int8_t* x,int IN,int tid,int stride,
+    int& acc0,int& acc1,int& acc2,int& acc3
+){
+    acc0=0;
+    acc1=0;
+    acc2=0;
+    acc3=0;
+#if USE_INT4_DP4A_PREPACK
+    const int* row04=reinterpret_cast<const int*>(row0);
+    const int* row14=reinterpret_cast<const int*>(row1);
+    const int* row24=reinterpret_cast<const int*>(row2);
+    const int* row34=reinterpret_cast<const int*>(row3);
+    const int* x4=reinterpret_cast<const int*>(x);
+    int packs4=IN>>2;
+    for(int j=tid;j<packs4;j+=stride){
+        int xv=__ldg(x4+j);
+        acc0=__dp4a(__ldg(row04+j),xv,acc0);
+        if(row1) acc1=__dp4a(__ldg(row14+j),xv,acc1);
+        if(row2) acc2=__dp4a(__ldg(row24+j),xv,acc2);
+        if(row3) acc3=__dp4a(__ldg(row34+j),xv,acc3);
+    }
+    for(int i=(packs4<<2)+tid;i<IN;i+=stride){
+        int xv=(int)x[i];
+        acc0+=(int)((int8_t)row0[i])*xv;
+        if(row1) acc1+=(int)((int8_t)row1[i])*xv;
+        if(row2) acc2+=(int)((int8_t)row2[i])*xv;
+        if(row3) acc3+=(int)((int8_t)row3[i])*xv;
+    }
+#else
+    const uint32_t* row032=reinterpret_cast<const uint32_t*>(row0);
+    const uint32_t* row132=reinterpret_cast<const uint32_t*>(row1);
+    const uint32_t* row232=reinterpret_cast<const uint32_t*>(row2);
+    const uint32_t* row332=reinterpret_cast<const uint32_t*>(row3);
+    const int* x4=reinterpret_cast<const int*>(x);
+    int packs8=IN>>3;
+    for(int j=tid;j<packs8;j+=stride){
+        int i4=j<<1;
+        int xv0=__ldg(x4+i4);
+        int xv1=__ldg(x4+i4+1);
+        uint32_t packed0=__ldg(row032+j);
+        acc0=__dp4a(pack_i4x4_to_i8x4(packed0,0),xv0,acc0);
+        acc0=__dp4a(pack_i4x4_to_i8x4(packed0,16),xv1,acc0);
+        if(row1){
+            uint32_t packed1=__ldg(row132+j);
+            acc1=__dp4a(pack_i4x4_to_i8x4(packed1,0),xv0,acc1);
+            acc1=__dp4a(pack_i4x4_to_i8x4(packed1,16),xv1,acc1);
+        }
+        if(row2){
+            uint32_t packed2=__ldg(row232+j);
+            acc2=__dp4a(pack_i4x4_to_i8x4(packed2,0),xv0,acc2);
+            acc2=__dp4a(pack_i4x4_to_i8x4(packed2,16),xv1,acc2);
+        }
+        if(row3){
+            uint32_t packed3=__ldg(row332+j);
+            acc3=__dp4a(pack_i4x4_to_i8x4(packed3,0),xv0,acc3);
+            acc3=__dp4a(pack_i4x4_to_i8x4(packed3,16),xv1,acc3);
+        }
+    }
+    for(int i=(packs8<<3)+tid;i<IN;i+=stride){
+        int xv=(int)x[i];
+        acc0+=unpack_i4(row0[i>>1],(i&1)!=0)*xv;
+        if(row1) acc1+=unpack_i4(row1[i>>1],(i&1)!=0)*xv;
+        if(row2) acc2+=unpack_i4(row2[i>>1],(i&1)!=0)*xv;
+        if(row3) acc3+=unpack_i4(row3[i>>1],(i&1)!=0)*xv;
+    }
+#endif
+}
 __device__ __forceinline__ float dot_weight_float_x(const WeightT* row,const float* x,int IN,int tid,int stride,float scale){
 #if USE_INT8_WEIGHTS
     (void)scale;
@@ -794,6 +869,55 @@ __global__ void linear_i4_dp4a2_kernel(const int8_t* xq,const float* x_scale,con
         }
     }
 }
+__global__ void linear_i4_dp4a4_kernel(const int8_t* xq,const float* x_scale,const WeightT* W,const float* scales,const float* b,float* y,int IN,int OUT){
+    __shared__ int sh0[256];
+    __shared__ int sh1[256];
+    __shared__ int sh2[256];
+    __shared__ int sh3[256];
+    int o0=blockIdx.x<<2;
+    int o1=o0+1;
+    int o2=o0+2;
+    int o3=o0+3;
+    int tid=threadIdx.x;
+    if(o0>=OUT) return;
+    const WeightT* row0=row_weight_ptr(W,o0,IN);
+    const WeightT* row1=(o1<OUT) ? row_weight_ptr(W,o1,IN) : nullptr;
+    const WeightT* row2=(o2<OUT) ? row_weight_ptr(W,o2,IN) : nullptr;
+    const WeightT* row3=(o3<OUT) ? row_weight_ptr(W,o3,IN) : nullptr;
+    int s0=0,s1=0,s2=0,s3=0;
+    dot_i4_i8_dp4a4(row0,row1,row2,row3,xq,IN,tid,blockDim.x,s0,s1,s2,s3);
+    sh0[tid]=s0;
+    sh1[tid]=s1;
+    sh2[tid]=s2;
+    sh3[tid]=s3;
+    __syncthreads();
+    for(int stride=blockDim.x/2;stride>0;stride>>=1){
+        if(tid<stride){
+            sh0[tid]+=sh0[tid+stride];
+            sh1[tid]+=sh1[tid+stride];
+            sh2[tid]+=sh2[tid+stride];
+            sh3[tid]+=sh3[tid+stride];
+        }
+        __syncthreads();
+    }
+    if(tid==0){
+        float xs=x_scale[0];
+        float out0=(float)sh0[0]*row_scale_at(scales,o0)*xs;
+        y[o0]=b ? out0+b[o0] : out0;
+        if(o1<OUT){
+            float out1=(float)sh1[0]*row_scale_at(scales,o1)*xs;
+            y[o1]=b ? out1+b[o1] : out1;
+        }
+        if(o2<OUT){
+            float out2=(float)sh2[0]*row_scale_at(scales,o2)*xs;
+            y[o2]=b ? out2+b[o2] : out2;
+        }
+        if(o3<OUT){
+            float out3=(float)sh3[0]*row_scale_at(scales,o3)*xs;
+            y[o3]=b ? out3+b[o3] : out3;
+        }
+    }
+}
 __global__ void qkv_i4_dp4a_kernel(
     const int8_t* xq,const float* x_scale,
     const WeightT* Wq,const WeightT* Wk,const WeightT* Wv,
@@ -889,6 +1013,89 @@ __global__ void qkv_i4_dp4a2_kernel(
         }
     }
 }
+__device__ __forceinline__ void select_qkv_row(
+    int o,
+    const WeightT* Wq,const WeightT* Wk,const WeightT* Wv,
+    const float* Sq,const float* Sk,const float* Sv,
+    const float* bq,const float* bk,const float* bv,
+    float* q,float* k,float* v,
+    const WeightT*& W,const float*& S,const float*& b,float*& y,int& local_o
+){
+    local_o=o;
+    if(o<HIDDEN){
+        W=Wq; S=Sq; b=bq; y=q;
+    }else if(o<HIDDEN+KV_DIM){
+        local_o=o-HIDDEN; W=Wk; S=Sk; b=bk; y=k;
+    }else{
+        local_o=o-HIDDEN-KV_DIM; W=Wv; S=Sv; b=bv; y=v;
+    }
+}
+__global__ void qkv_i4_dp4a4_kernel(
+    const int8_t* xq,const float* x_scale,
+    const WeightT* Wq,const WeightT* Wk,const WeightT* Wv,
+    const float* Sq,const float* Sk,const float* Sv,
+    const float* bq,const float* bk,const float* bv,
+    float* q,float* k,float* v,
+    int IN
+){
+    __shared__ int sh0[256];
+    __shared__ int sh1[256];
+    __shared__ int sh2[256];
+    __shared__ int sh3[256];
+    constexpr int TOTAL_QKV=HIDDEN+2*KV_DIM;
+    int o0=blockIdx.x<<2;
+    int o1=o0+1;
+    int o2=o0+2;
+    int o3=o0+3;
+    int tid=threadIdx.x;
+    if(o0>=TOTAL_QKV) return;
+    const WeightT *W0=nullptr,*W1=nullptr,*W2=nullptr,*W3=nullptr;
+    const float *S0=nullptr,*S1=nullptr,*S2=nullptr,*S3=nullptr;
+    const float *b0=nullptr,*b1=nullptr,*b2=nullptr,*b3=nullptr;
+    float *y0=nullptr,*y1=nullptr,*y2=nullptr,*y3=nullptr;
+    int local0=0,local1=0,local2=0,local3=0;
+    select_qkv_row(o0,Wq,Wk,Wv,Sq,Sk,Sv,bq,bk,bv,q,k,v,W0,S0,b0,y0,local0);
+    if(o1<TOTAL_QKV) select_qkv_row(o1,Wq,Wk,Wv,Sq,Sk,Sv,bq,bk,bv,q,k,v,W1,S1,b1,y1,local1);
+    if(o2<TOTAL_QKV) select_qkv_row(o2,Wq,Wk,Wv,Sq,Sk,Sv,bq,bk,bv,q,k,v,W2,S2,b2,y2,local2);
+    if(o3<TOTAL_QKV) select_qkv_row(o3,Wq,Wk,Wv,Sq,Sk,Sv,bq,bk,bv,q,k,v,W3,S3,b3,y3,local3);
+    const WeightT* row0=row_weight_ptr(W0,local0,IN);
+    const WeightT* row1=(o1<TOTAL_QKV) ? row_weight_ptr(W1,local1,IN) : nullptr;
+    const WeightT* row2=(o2<TOTAL_QKV) ? row_weight_ptr(W2,local2,IN) : nullptr;
+    const WeightT* row3=(o3<TOTAL_QKV) ? row_weight_ptr(W3,local3,IN) : nullptr;
+    int s0=0,s1=0,s2=0,s3=0;
+    dot_i4_i8_dp4a4(row0,row1,row2,row3,xq,IN,tid,blockDim.x,s0,s1,s2,s3);
+    sh0[tid]=s0;
+    sh1[tid]=s1;
+    sh2[tid]=s2;
+    sh3[tid]=s3;
+    __syncthreads();
+    for(int stride=blockDim.x/2;stride>0;stride>>=1){
+        if(tid<stride){
+            sh0[tid]+=sh0[tid+stride];
+            sh1[tid]+=sh1[tid+stride];
+            sh2[tid]+=sh2[tid+stride];
+            sh3[tid]+=sh3[tid+stride];
+        }
+        __syncthreads();
+    }
+    if(tid==0){
+        float xs=x_scale[0];
+        float out0=(float)sh0[0]*row_scale_at(S0,local0)*xs;
+        y0[local0]=b0 ? out0+b0[local0] : out0;
+        if(o1<TOTAL_QKV){
+            float out1=(float)sh1[0]*row_scale_at(S1,local1)*xs;
+            y1[local1]=b1 ? out1+b1[local1] : out1;
+        }
+        if(o2<TOTAL_QKV){
+            float out2=(float)sh2[0]*row_scale_at(S2,local2)*xs;
+            y2[local2]=b2 ? out2+b2[local2] : out2;
+        }
+        if(o3<TOTAL_QKV){
+            float out3=(float)sh3[0]*row_scale_at(S3,local3)*xs;
+            y3[local3]=b3 ? out3+b3[local3] : out3;
+        }
+    }
+}
 __global__ void gate_up_i4_dp4a_kernel(
     const int8_t* xq,const float* x_scale,
     const WeightT* Wgate,const WeightT* Wup,
@@ -958,6 +1165,72 @@ __global__ void gate_up_i4_dp4a2_kernel(
         if(o1<TOTAL_GATE_UP){
             y1[local1]=(float)sh1[0]*row_scale_at(S1,local1)*xs;
         }
+    }
+}
+__global__ void gate_up_i4_dp4a4_kernel(
+    const int8_t* xq,const float* x_scale,
+    const WeightT* Wgate,const WeightT* Wup,
+    const float* Sgate,const float* Sup,
+    float* gate,float* up,
+    int IN
+){
+    __shared__ int sh0[256];
+    __shared__ int sh1[256];
+    __shared__ int sh2[256];
+    __shared__ int sh3[256];
+    constexpr int TOTAL_GATE_UP=2*INTERMEDIATE;
+    int o0=blockIdx.x<<2;
+    int o1=o0+1;
+    int o2=o0+2;
+    int o3=o0+3;
+    int tid=threadIdx.x;
+    if(o0>=TOTAL_GATE_UP) return;
+    bool is_gate0=o0<INTERMEDIATE;
+    bool is_gate1=o1<INTERMEDIATE;
+    bool is_gate2=o2<INTERMEDIATE;
+    bool is_gate3=o3<INTERMEDIATE;
+    int local0=is_gate0 ? o0 : o0-INTERMEDIATE;
+    int local1=is_gate1 ? o1 : o1-INTERMEDIATE;
+    int local2=is_gate2 ? o2 : o2-INTERMEDIATE;
+    int local3=is_gate3 ? o3 : o3-INTERMEDIATE;
+    const WeightT* W0=is_gate0 ? Wgate : Wup;
+    const WeightT* W1=(o1<TOTAL_GATE_UP) ? (is_gate1 ? Wgate : Wup) : nullptr;
+    const WeightT* W2=(o2<TOTAL_GATE_UP) ? (is_gate2 ? Wgate : Wup) : nullptr;
+    const WeightT* W3=(o3<TOTAL_GATE_UP) ? (is_gate3 ? Wgate : Wup) : nullptr;
+    const float* S0=is_gate0 ? Sgate : Sup;
+    const float* S1=is_gate1 ? Sgate : Sup;
+    const float* S2=is_gate2 ? Sgate : Sup;
+    const float* S3=is_gate3 ? Sgate : Sup;
+    float* y0=is_gate0 ? gate : up;
+    float* y1=is_gate1 ? gate : up;
+    float* y2=is_gate2 ? gate : up;
+    float* y3=is_gate3 ? gate : up;
+    const WeightT* row0=row_weight_ptr(W0,local0,IN);
+    const WeightT* row1=(o1<TOTAL_GATE_UP) ? row_weight_ptr(W1,local1,IN) : nullptr;
+    const WeightT* row2=(o2<TOTAL_GATE_UP) ? row_weight_ptr(W2,local2,IN) : nullptr;
+    const WeightT* row3=(o3<TOTAL_GATE_UP) ? row_weight_ptr(W3,local3,IN) : nullptr;
+    int s0=0,s1=0,s2=0,s3=0;
+    dot_i4_i8_dp4a4(row0,row1,row2,row3,xq,IN,tid,blockDim.x,s0,s1,s2,s3);
+    sh0[tid]=s0;
+    sh1[tid]=s1;
+    sh2[tid]=s2;
+    sh3[tid]=s3;
+    __syncthreads();
+    for(int stride=blockDim.x/2;stride>0;stride>>=1){
+        if(tid<stride){
+            sh0[tid]+=sh0[tid+stride];
+            sh1[tid]+=sh1[tid+stride];
+            sh2[tid]+=sh2[tid+stride];
+            sh3[tid]+=sh3[tid+stride];
+        }
+        __syncthreads();
+    }
+    if(tid==0){
+        float xs=x_scale[0];
+        y0[local0]=(float)sh0[0]*row_scale_at(S0,local0)*xs;
+        if(o1<TOTAL_GATE_UP) y1[local1]=(float)sh1[0]*row_scale_at(S1,local1)*xs;
+        if(o2<TOTAL_GATE_UP) y2[local2]=(float)sh2[0]*row_scale_at(S2,local2)*xs;
+        if(o3<TOTAL_GATE_UP) y3[local3]=(float)sh3[0]*row_scale_at(S3,local3)*xs;
     }
 }
 __global__ void float_to_half_kernel(const float* x,half* xh,int n){
@@ -1534,7 +1807,9 @@ static void launch_linear_from_float(const float* x,half* xh,int8_t* xq,float* x
 #elif USE_INT4_WEIGHTS && USE_INT4_DP4A
     prepare_int8_x(x,xq,xq_scale,IN);
     int B=LINEAR_THREADS;
-#if USE_LINEAR_I4_DP4A2
+#if USE_LINEAR_I4_DP4A4
+    linear_i4_dp4a4_kernel<<<(OUT+3)/4,B>>>(xq,xq_scale,W.data,W.scale,b,y,IN,OUT);
+#elif USE_LINEAR_I4_DP4A2
     linear_i4_dp4a2_kernel<<<(OUT+1)/2,B>>>(xq,xq_scale,W.data,W.scale,b,y,IN,OUT);
 #else
     linear_i4_dp4a_kernel<<<OUT,B>>>(xq,xq_scale,W.data,W.scale,b,y,IN,OUT);
@@ -1559,7 +1834,9 @@ static void launch_qkv_from_float(
 #elif USE_INT4_WEIGHTS && USE_INT4_DP4A
     prepare_int8_x(x,xq,xq_scale,IN);
     int B=LINEAR_THREADS;
-#if USE_QKV_GATE_I4_DP4A2
+#if USE_QKV_GATE_I4_DP4A4
+    qkv_i4_dp4a4_kernel<<<(HIDDEN+2*KV_DIM+3)/4,B>>>(xq,xq_scale,Wq.data,Wk.data,Wv.data,Wq.scale,Wk.scale,Wv.scale,bq,bk,bv,q,k,v,IN);
+#elif USE_QKV_GATE_I4_DP4A2
     qkv_i4_dp4a2_kernel<<<(HIDDEN+2*KV_DIM+1)/2,B>>>(xq,xq_scale,Wq.data,Wk.data,Wv.data,Wq.scale,Wk.scale,Wv.scale,bq,bk,bv,q,k,v,IN);
 #else
     qkv_i4_dp4a_kernel<<<HIDDEN+2*KV_DIM,B>>>(xq,xq_scale,Wq.data,Wk.data,Wv.data,Wq.scale,Wk.scale,Wv.scale,bq,bk,bv,q,k,v,IN);
@@ -1582,7 +1859,9 @@ static void launch_gate_up_from_float(
 #elif USE_INT4_WEIGHTS && USE_INT4_DP4A
     prepare_int8_x(x,xq,xq_scale,IN);
     int B=LINEAR_THREADS;
-#if USE_QKV_GATE_I4_DP4A2
+#if USE_QKV_GATE_I4_DP4A4
+    gate_up_i4_dp4a4_kernel<<<(2*INTERMEDIATE+3)/4,B>>>(xq,xq_scale,Wgate.data,Wup.data,Wgate.scale,Wup.scale,gate,up,IN);
+#elif USE_QKV_GATE_I4_DP4A2
     gate_up_i4_dp4a2_kernel<<<(2*INTERMEDIATE+1)/2,B>>>(xq,xq_scale,Wgate.data,Wup.data,Wgate.scale,Wup.scale,gate,up,IN);
 #else
     gate_up_i4_dp4a_kernel<<<2*INTERMEDIATE,B>>>(xq,xq_scale,Wgate.data,Wup.data,Wgate.scale,Wup.scale,gate,up,IN);
