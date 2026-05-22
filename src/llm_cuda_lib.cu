@@ -34,6 +34,9 @@ constexpr float DEFAULT_ROPE_THETA=1000000.0f;
 #ifndef LINEAR_THREADS_CFG
 #define LINEAR_THREADS_CFG 128
 #endif
+#ifndef USE_ATTENTION_SHM
+#define USE_ATTENTION_SHM 0
+#endif
 #ifndef USE_INT8_WEIGHTS
 #define USE_INT8_WEIGHTS 0
 #endif
@@ -799,7 +802,7 @@ __global__ void store_kv_kernel(float* cache,const float* x,int pos,int dim){
     int i=blockIdx.x*blockDim.x+threadIdx.x;
     if(i<dim) cache[(size_t)pos*dim+i]=x[i];
 }
-__global__ void rope_store_kv_kernel(float* q,float* k,const float* v,float* kc,float* vc,int pos,float rope_theta){
+__global__ void rope_store_kv_kernel(float* q,float* k,const float* v,float* kc,float* vc,const float* rope_cos,const float* rope_sin,int pos){
     int i=blockIdx.x*blockDim.x+threadIdx.x;
     int q_pairs=N_HEADS*(HEAD_DIM/2);
     int k_pairs=N_KV_HEADS*(HEAD_DIM/2);
@@ -809,8 +812,9 @@ __global__ void rope_store_kv_kernel(float* q,float* k,const float* v,float* kc,
         int d0=p;
         int d1=p+(HEAD_DIM/2);
         int base=h*HEAD_DIM;
-        float inv=powf(rope_theta,-(float)(2*p)/HEAD_DIM);
-        float a=pos*inv,c=cosf(a),s=sinf(a);
+        int rp=pos*(HEAD_DIM/2)+p;
+        float c=__ldg(rope_cos+rp);
+        float s=__ldg(rope_sin+rp);
         float v0=q[base+d0],v1=q[base+d1];
         q[base+d0]=v0*c-v1*s;
         q[base+d1]=v0*s+v1*c;
@@ -821,13 +825,12 @@ __global__ void rope_store_kv_kernel(float* q,float* k,const float* v,float* kc,
         int d0=p;
         int d1=p+(HEAD_DIM/2);
         int base=h*HEAD_DIM;
-        float inv=powf(rope_theta,-(float)(2*p)/HEAD_DIM);
-        float a=pos*inv,c=cosf(a),s=sinf(a);
+        int rp=pos*(HEAD_DIM/2)+p;
+        float c=__ldg(rope_cos+rp);
+        float s=__ldg(rope_sin+rp);
         float v0=k[base+d0],v1=k[base+d1];
         float r0=v0*c-v1*s;
         float r1=v0*s+v1*c;
-        k[base+d0]=r0;
-        k[base+d1]=r1;
         kc[(size_t)pos*KV_DIM+base+d0]=r0;
         kc[(size_t)pos*KV_DIM+base+d1]=r1;
     }
@@ -890,8 +893,16 @@ __global__ void attention_apply_kernel(const float* probs,const float* vc,float*
     ctx[idx]=out;
 }
 __global__ void attention_fused_kernel(const float* q,const float* kc,const float* vc,float* scores,float* ctx,int pos,int max_seq){
+#if USE_ATTENTION_SHM
+    (void)scores;
+    extern __shared__ float smem[];
+    float* sh=smem;
+    float* qsh=sh+blockDim.x;
+    float* score_sh=qsh+HEAD_DIM;
+#else
     __shared__ float sh[256];
     __shared__ float qsh[HEAD_DIM];
+#endif
     int h=blockIdx.x;
     int tid=threadIdx.x;
     int group=N_HEADS/N_KV_HEADS;
@@ -907,7 +918,11 @@ __global__ void attention_fused_kernel(const float* q,const float* kc,const floa
 #pragma unroll
         for(int r=0;r<HEAD_DIM;r++) dot=fmaf(qsh[r],row[r],dot);
         float s=dot*scale;
+#if USE_ATTENTION_SHM
+        score_sh[t]=s;
+#else
         scores[(size_t)h*max_seq+t]=s;
+#endif
         mx=fmaxf(mx,s);
     }
     sh[tid]=mx;
@@ -919,8 +934,13 @@ __global__ void attention_fused_kernel(const float* q,const float* kc,const floa
     mx=sh[0];
     float den=0.0f;
     for(int t=tid;t<=pos;t+=blockDim.x){
+#if USE_ATTENTION_SHM
+        float e=expf(score_sh[t]-mx);
+        score_sh[t]=e;
+#else
         float e=expf(scores[(size_t)h*max_seq+t]-mx);
         scores[(size_t)h*max_seq+t]=e;
+#endif
         den+=e;
     }
     sh[tid]=den;
@@ -930,10 +950,17 @@ __global__ void attention_fused_kernel(const float* q,const float* kc,const floa
         __syncthreads();
     }
     float inv_den=1.0f/sh[0];
+#if USE_ATTENTION_SHM
+    __syncthreads();
+#endif
     for(int d=tid;d<HEAD_DIM;d+=blockDim.x){
         float out=0.0f;
         for(int t=0;t<=pos;t++){
+#if USE_ATTENTION_SHM
+            float p=score_sh[t]*inv_den;
+#else
             float p=scores[(size_t)h*max_seq+t]*inv_den;
+#endif
             out=fmaf(p,vc[(size_t)t*KV_DIM+kh*HEAD_DIM+d],out);
         }
         ctx[h*HEAD_DIM+d]=out;
@@ -1039,7 +1066,12 @@ struct Layer{
     WeightMatrix wq,wk,wv,wo,wgate,wup,wdown;
     float *kc=nullptr,*vc=nullptr;
 };
-struct Model{WeightMatrix emb,lm; float *norm=nullptr; float rms_norm_eps=DEFAULT_RMS_NORM_EPS,rope_theta=DEFAULT_ROPE_THETA; Layer layers[N_LAYERS];};
+struct Model{
+    WeightMatrix emb,lm;
+    float *norm=nullptr,*rope_cos=nullptr,*rope_sin=nullptr;
+    float rms_norm_eps=DEFAULT_RMS_NORM_EPS,rope_theta=DEFAULT_ROPE_THETA;
+    Layer layers[N_LAYERS];
+};
 struct Work{
     float *x=nullptr,*n=nullptr,*q=nullptr,*k=nullptr,*v=nullptr,*ctx=nullptr,*ao=nullptr;
     float *gate=nullptr,*up=nullptr,*mid=nullptr,*mo=nullptr,*logits=nullptr;
@@ -1070,6 +1102,25 @@ static void freep(T*& p){if(p){cudaFree(p);p=nullptr;}}
 static void free_weight(WeightMatrix& w){freep(w.data);freep(w.scale);}
 static std::string lname(int i,const std::string& s){return "model.layers."+std::to_string(i)+"."+s;}
 
+static void init_rope_table(Model& m,int max_seq){
+    size_t n=(size_t)max_seq*(HEAD_DIM/2);
+    std::vector<float> hc(n),hs(n);
+    for(int pos=0;pos<max_seq;pos++){
+        for(int p=0;p<HEAD_DIM/2;p++){
+            float inv=std::pow(m.rope_theta,-(float)(2*p)/HEAD_DIM);
+            float a=pos*inv;
+            hc[(size_t)pos*(HEAD_DIM/2)+p]=std::cos(a);
+            hs[(size_t)pos*(HEAD_DIM/2)+p]=std::sin(a);
+        }
+    }
+    CK(cudaMalloc(&m.rope_cos,n*sizeof(float)));
+    CK(cudaMalloc(&m.rope_sin,n*sizeof(float)));
+    CK(cudaMemcpy(m.rope_cos,hc.data(),n*sizeof(float),cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(m.rope_sin,hs.data(),n*sizeof(float),cudaMemcpyHostToDevice));
+    std::cout<<"[C++] initialized RoPE table, max_seq="<<max_seq
+             <<", entries="<<n<<"\n";
+}
+
 static Work make_work(int max_seq){
     Work w;
     CK(cudaMalloc(&w.x,HIDDEN*sizeof(float))); CK(cudaMalloc(&w.n,HIDDEN*sizeof(float)));
@@ -1097,6 +1148,7 @@ static Model load_model(const std::string& dir,int max_seq){
     Model m;
     m.rms_norm_eps=cfg.rms_norm_eps;
     m.rope_theta=cfg.rope_theta;
+    init_rope_table(m,max_seq);
     m.emb=load_weight_tensor(metas,"model.embed_tokens.weight");
     m.norm=load_tensor(metas,"model.norm.weight");
     m.lm=load_weight_tensor(metas,"lm_head.weight");
@@ -1123,7 +1175,7 @@ static Model load_model(const std::string& dir,int max_seq){
     return m;
 }
 static void free_model(Model& m){
-    free_weight(m.emb); freep(m.norm); free_weight(m.lm);
+    free_weight(m.emb); freep(m.norm); freep(m.rope_cos); freep(m.rope_sin); free_weight(m.lm);
     for(int i=0;i<N_LAYERS;i++){
         Layer& l=m.layers[i];
         freep(l.ln1);freep(l.ln2);free_weight(l.wq);free_weight(l.wk);free_weight(l.wv);free_weight(l.wo);
@@ -1205,8 +1257,12 @@ static void forward_token(const Model& m,Work& w,int token,int pos,int max_seq){
     for(int i=0;i<N_LAYERS;i++){
         const Layer& l=m.layers[i];
         launch_qkv_from_float(w.n,w.wmma_x,w.xq,w.xq_scale,l.wq,l.wk,l.wv,l.bq,l.bk,l.bv,w.q,w.k,w.v,HIDDEN);
-        rope_store_kv_kernel<<<(N_HEADS*(HEAD_DIM/2)+B-1)/B,B>>>(w.q,w.k,w.v,l.kc,l.vc,pos,m.rope_theta);
+        rope_store_kv_kernel<<<(N_HEADS*(HEAD_DIM/2)+B-1)/B,B>>>(w.q,w.k,w.v,l.kc,l.vc,m.rope_cos,m.rope_sin,pos);
+#if USE_ATTENTION_SHM
+        attention_fused_kernel<<<N_HEADS,B,(B+HEAD_DIM+max_seq)*sizeof(float)>>>(w.q,l.kc,l.vc,w.attn_scores,w.ctx,pos,max_seq);
+#else
         attention_fused_kernel<<<N_HEADS,B>>>(w.q,l.kc,l.vc,w.attn_scores,w.ctx,pos,max_seq);
+#endif
         launch_linear_from_float(w.ctx,w.wmma_x,w.xq,w.xq_scale,l.wo,nullptr,w.ao,HIDDEN,HIDDEN);
         add_rmsnorm_kernel<<<1,B,B*sizeof(float)>>>(w.x,w.ao,l.ln2,w.n,HIDDEN,m.rms_norm_eps);
         launch_gate_up_from_float(w.n,w.wmma_x,w.xq,w.xq_scale,l.wgate,l.wup,w.gate,w.up,HIDDEN);
