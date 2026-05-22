@@ -43,6 +43,9 @@ constexpr float DEFAULT_ROPE_THETA=1000000.0f;
 #ifndef USE_FUSED_MLP_QUANT
 #define USE_FUSED_MLP_QUANT 0
 #endif
+#ifndef USE_FAST_SILU
+#define USE_FAST_SILU 0
+#endif
 #ifndef USE_INT8_WEIGHTS
 #define USE_INT8_WEIGHTS 0
 #endif
@@ -55,6 +58,9 @@ constexpr float DEFAULT_ROPE_THETA=1000000.0f;
 #ifndef USE_INT4_DP4A_PREPACK
 #define USE_INT4_DP4A_PREPACK 0
 #endif
+#ifndef USE_FP16_KV_CACHE
+#define USE_FP16_KV_CACHE 0
+#endif
 #if USE_INT8_WEIGHTS && USE_INT4_WEIGHTS
 #error "USE_INT8_WEIGHTS and USE_INT4_WEIGHTS cannot both be enabled"
 #endif
@@ -64,6 +70,11 @@ using WeightT = uint8_t;
 using WeightT = int8_t;
 #else
 using WeightT = half;
+#endif
+#if USE_FP16_KV_CACHE
+using KvCacheT = half;
+#else
+using KvCacheT = float;
 #endif
 struct WeightMatrix {
     WeightT* data=nullptr;
@@ -75,6 +86,22 @@ constexpr int ARGMAX_BLOCKS=256;
 #ifndef USE_WMMA_LINEAR
 #define USE_WMMA_LINEAR 0
 #endif
+
+__device__ __forceinline__ float kv_cache_load(KvCacheT v) {
+#if USE_FP16_KV_CACHE
+    return __half2float(v);
+#else
+    return v;
+#endif
+}
+
+__device__ __forceinline__ KvCacheT kv_cache_store(float v) {
+#if USE_FP16_KV_CACHE
+    return __float2half_rn(v);
+#else
+    return v;
+#endif
+}
 
 static thread_local std::string g_err;
 using Clock = std::chrono::steady_clock;
@@ -790,9 +817,16 @@ __global__ void wmma_linear_kernel(const half* xh,const WeightT* W,const float* 
 __global__ void add_kernel(float* x,const float* y,int n){
     int i=blockIdx.x*blockDim.x+threadIdx.x; if(i<n) x[i]+=y[i];
 }
+__device__ __forceinline__ float silu_value(float x){
+#if USE_FAST_SILU
+    return x/(1.f+__expf(-x));
+#else
+    return x/(1.f+expf(-x));
+#endif
+}
 __global__ void silu_mul_kernel(const float* g,const float* u,float* o,int n){
     int i=blockIdx.x*blockDim.x+threadIdx.x;
-    if(i<n){float x=g[i]; o[i]=(x/(1.f+expf(-x)))*u[i];}
+    if(i<n){float x=g[i]; o[i]=silu_value(x)*u[i];}
 }
 __global__ void silu_quantize_int8_kernel(const float* g,const float* u,int8_t* q,float* scale,int n){
     __shared__ float sh[256];
@@ -800,7 +834,7 @@ __global__ void silu_quantize_int8_kernel(const float* g,const float* u,int8_t* 
     float m=0.0f;
     for(int i=tid;i<n;i+=blockDim.x){
         float x=g[i];
-        float v=(x/(1.f+expf(-x)))*u[i];
+        float v=silu_value(x)*u[i];
         m=fmaxf(m,fabsf(v));
     }
     sh[tid]=m;
@@ -815,7 +849,7 @@ __global__ void silu_quantize_int8_kernel(const float* g,const float* u,int8_t* 
     __syncthreads();
     for(int i=tid;i<n;i+=blockDim.x){
         float x=g[i];
-        float y=(x/(1.f+expf(-x)))*u[i];
+        float y=silu_value(x)*u[i];
         int v=max_abs>0.0f ? (int)lrintf(y*inv) : 0;
         v=v<-127 ? -127 : (v>127 ? 127 : v);
         q[i]=(int8_t)v;
@@ -835,7 +869,7 @@ __global__ void store_kv_kernel(float* cache,const float* x,int pos,int dim){
     int i=blockIdx.x*blockDim.x+threadIdx.x;
     if(i<dim) cache[(size_t)pos*dim+i]=x[i];
 }
-__global__ void rope_store_kv_kernel(float* q,float* k,const float* v,float* kc,float* vc,const float* rope_cos,const float* rope_sin,int pos){
+__global__ void rope_store_kv_kernel(float* q,float* k,const float* v,KvCacheT* kc,KvCacheT* vc,const float* rope_cos,const float* rope_sin,int pos){
     int i=blockIdx.x*blockDim.x+threadIdx.x;
     int q_pairs=N_HEADS*(HEAD_DIM/2);
     int k_pairs=N_KV_HEADS*(HEAD_DIM/2);
@@ -864,12 +898,12 @@ __global__ void rope_store_kv_kernel(float* q,float* k,const float* v,float* kc,
         float v0=k[base+d0],v1=k[base+d1];
         float r0=v0*c-v1*s;
         float r1=v0*s+v1*c;
-        kc[(size_t)pos*KV_DIM+base+d0]=r0;
-        kc[(size_t)pos*KV_DIM+base+d1]=r1;
+        kc[(size_t)pos*KV_DIM+base+d0]=kv_cache_store(r0);
+        kc[(size_t)pos*KV_DIM+base+d1]=kv_cache_store(r1);
     }
-    if(i<KV_DIM) vc[(size_t)pos*KV_DIM+i]=v[i];
+    if(i<KV_DIM) vc[(size_t)pos*KV_DIM+i]=kv_cache_store(v[i]);
 }
-__global__ void attention_scores_kernel(const float* q,const float* kc,float* scores,int pos,int max_seq){
+__global__ void attention_scores_kernel(const float* q,const KvCacheT* kc,float* scores,int pos,int max_seq){
     int h=blockIdx.x;
     int tid=threadIdx.x;
     int group=N_HEADS/N_KV_HEADS, kh=h/group;
@@ -877,8 +911,8 @@ __global__ void attention_scores_kernel(const float* q,const float* kc,float* sc
     for(int t=tid;t<=pos;t+=blockDim.x){
         float dot=0.0f;
         const float* qh=q+h*HEAD_DIM;
-        const float* row=kc+(size_t)t*KV_DIM+kh*HEAD_DIM;
-        for(int r=0;r<HEAD_DIM;r++) dot+=qh[r]*row[r];
+        const KvCacheT* row=kc+(size_t)t*KV_DIM+kh*HEAD_DIM;
+        for(int r=0;r<HEAD_DIM;r++) dot+=qh[r]*kv_cache_load(row[r]);
         scores[(size_t)h*max_seq+t]=dot*scale;
     }
 }
@@ -914,18 +948,18 @@ __global__ void attention_softmax_kernel(float* scores,int pos,int max_seq){
         scores[(size_t)h*max_seq+t]/=den;
     }
 }
-__global__ void attention_apply_kernel(const float* probs,const float* vc,float* ctx,int pos,int max_seq){
+__global__ void attention_apply_kernel(const float* probs,const KvCacheT* vc,float* ctx,int pos,int max_seq){
     int idx=blockIdx.x*blockDim.x+threadIdx.x; if(idx>=HIDDEN) return;
     int d=idx%HEAD_DIM, h=idx/HEAD_DIM;
     int group=N_HEADS/N_KV_HEADS, kh=h/group;
     float out=0.0f;
     for(int t=0;t<=pos;t++){
         float p=probs[(size_t)h*max_seq+t];
-        out+=p*vc[(size_t)t*KV_DIM+kh*HEAD_DIM+d];
+        out+=p*kv_cache_load(vc[(size_t)t*KV_DIM+kh*HEAD_DIM+d]);
     }
     ctx[idx]=out;
 }
-__global__ void attention_fused_kernel(const float* q,const float* kc,const float* vc,float* scores,float* ctx,int pos,int max_seq){
+__global__ void attention_fused_kernel(const float* q,const KvCacheT* kc,const KvCacheT* vc,float* scores,float* ctx,int pos,int max_seq){
 #if USE_ATTENTION_SHM
     (void)scores;
     extern __shared__ float smem[];
@@ -946,10 +980,10 @@ __global__ void attention_fused_kernel(const float* q,const float* kc,const floa
     const float scale=rsqrtf((float)HEAD_DIM);
     float mx=-INFINITY;
     for(int t=tid;t<=pos;t+=blockDim.x){
-        const float* row=kc+(size_t)t*KV_DIM+kh*HEAD_DIM;
+        const KvCacheT* row=kc+(size_t)t*KV_DIM+kh*HEAD_DIM;
         float dot=0.0f;
 #pragma unroll
-        for(int r=0;r<HEAD_DIM;r++) dot=fmaf(qsh[r],row[r],dot);
+        for(int r=0;r<HEAD_DIM;r++) dot=fmaf(qsh[r],kv_cache_load(row[r]),dot);
         float s=dot*scale;
 #if USE_ATTENTION_SHM
         score_sh[t]=s;
@@ -994,14 +1028,14 @@ __global__ void attention_fused_kernel(const float* q,const float* kc,const floa
 #else
             float p=scores[(size_t)h*max_seq+t]*inv_den;
 #endif
-            out=fmaf(p,vc[(size_t)t*KV_DIM+kh*HEAD_DIM+d],out);
+            out=fmaf(p,kv_cache_load(vc[(size_t)t*KV_DIM+kh*HEAD_DIM+d]),out);
         }
         ctx[h*HEAD_DIM+d]=out;
     }
 }
 __global__ void attention_rope_fused_kernel(
     const float* q,const float* k,const float* v,
-    float* kc,float* vc,float* scores,float* ctx,
+    KvCacheT* kc,KvCacheT* vc,float* scores,float* ctx,
     const float* rope_cos,const float* rope_sin,
     int pos,int max_seq
 ){
@@ -1015,8 +1049,8 @@ __global__ void attention_rope_fused_kernel(
     const float* qh=q+h*HEAD_DIM;
     const float* kk=k+kh*HEAD_DIM;
     const float* vv=v+kh*HEAD_DIM;
-    float* kc_row=kc+(size_t)pos*KV_DIM+kh*HEAD_DIM;
-    float* vc_row=vc+(size_t)pos*KV_DIM+kh*HEAD_DIM;
+    KvCacheT* kc_row=kc+(size_t)pos*KV_DIM+kh*HEAD_DIM;
+    KvCacheT* vc_row=vc+(size_t)pos*KV_DIM+kh*HEAD_DIM;
     if(tid<HEAD_DIM/2){
         int d0=tid;
         int d1=tid+(HEAD_DIM/2);
@@ -1026,18 +1060,18 @@ __global__ void attention_rope_fused_kernel(
         float k0=kk[d0],k1=kk[d1];
         qsh[d0]=q0*c-q1*s;
         qsh[d1]=q0*s+q1*c;
-        kc_row[d0]=k0*c-k1*s;
-        kc_row[d1]=k0*s+k1*c;
+        kc_row[d0]=kv_cache_store(k0*c-k1*s);
+        kc_row[d1]=kv_cache_store(k0*s+k1*c);
     }
-    if(tid<HEAD_DIM) vc_row[tid]=vv[tid];
+    if(tid<HEAD_DIM) vc_row[tid]=kv_cache_store(vv[tid]);
     __syncthreads();
     const float scale=rsqrtf((float)HEAD_DIM);
     float mx=-INFINITY;
     for(int t=tid;t<=pos;t+=blockDim.x){
-        const float* row=kc+(size_t)t*KV_DIM+kh*HEAD_DIM;
+        const KvCacheT* row=kc+(size_t)t*KV_DIM+kh*HEAD_DIM;
         float dot=0.0f;
 #pragma unroll
-        for(int r=0;r<HEAD_DIM;r++) dot=fmaf(qsh[r],row[r],dot);
+        for(int r=0;r<HEAD_DIM;r++) dot=fmaf(qsh[r],kv_cache_load(row[r]),dot);
         float s=dot*scale;
         scores[(size_t)h*max_seq+t]=s;
         mx=fmaxf(mx,s);
@@ -1066,7 +1100,7 @@ __global__ void attention_rope_fused_kernel(
         float out=0.0f;
         for(int t=0;t<=pos;t++){
             float p=scores[(size_t)h*max_seq+t]*inv_den;
-            out=fmaf(p,vc[(size_t)t*KV_DIM+kh*HEAD_DIM+d],out);
+            out=fmaf(p,kv_cache_load(vc[(size_t)t*KV_DIM+kh*HEAD_DIM+d]),out);
         }
         ctx[h*HEAD_DIM+d]=out;
     }
@@ -1169,7 +1203,7 @@ __global__ void argmax_stage2_kernel(const float* block_vals,const int* block_id
 struct Layer{
     float *ln1=nullptr,*ln2=nullptr,*bq=nullptr,*bk=nullptr,*bv=nullptr;
     WeightMatrix wq,wk,wv,wo,wgate,wup,wdown;
-    float *kc=nullptr,*vc=nullptr;
+    KvCacheT *kc=nullptr,*vc=nullptr;
 };
 struct Model{
     WeightMatrix emb,lm;
@@ -1272,10 +1306,10 @@ static Model load_model(const std::string& dir,int max_seq){
         l.wgate=load_weight_tensor(metas,lname(i,"mlp.gate_proj.weight"));
         l.wup=load_weight_tensor(metas,lname(i,"mlp.up_proj.weight"));
         l.wdown=load_weight_tensor(metas,lname(i,"mlp.down_proj.weight"));
-        CK(cudaMalloc(&l.kc,(size_t)max_seq*KV_DIM*sizeof(float)));
-        CK(cudaMalloc(&l.vc,(size_t)max_seq*KV_DIM*sizeof(float)));
-        CK(cudaMemset(l.kc,0,(size_t)max_seq*KV_DIM*sizeof(float)));
-        CK(cudaMemset(l.vc,0,(size_t)max_seq*KV_DIM*sizeof(float)));
+        CK(cudaMalloc(&l.kc,(size_t)max_seq*KV_DIM*sizeof(KvCacheT)));
+        CK(cudaMalloc(&l.vc,(size_t)max_seq*KV_DIM*sizeof(KvCacheT)));
+        CK(cudaMemset(l.kc,0,(size_t)max_seq*KV_DIM*sizeof(KvCacheT)));
+        CK(cudaMemset(l.vc,0,(size_t)max_seq*KV_DIM*sizeof(KvCacheT)));
     }
     return m;
 }
