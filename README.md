@@ -15,9 +15,10 @@
 ## 编译与运行
 
 ```bash
-make -f Makefile.cuda_lib lib A=sm_80
-CUDA_VISIBLE_DEVICES=4 python python_infer.py \
-  --model /data3/ledi/models/DeepSeek-R1-Distill-Qwen-7B \
+make -f Makefile.cuda_lib clean-lib
+make -f Makefile.cuda_lib lib A=sm_87
+CUDA_VISIBLE_DEVICES=0 python python_infer.py \
+  --model /data/project/deepseek-r1-7b \
   --lib ./build/libllm_cuda.so \
   --prompt "你好 deepseek 介绍一下黑格尔的思想" \
   --max-new-tokens 512 \
