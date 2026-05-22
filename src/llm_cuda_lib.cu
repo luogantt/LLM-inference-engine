@@ -58,6 +58,9 @@ constexpr float DEFAULT_ROPE_THETA=1000000.0f;
 #ifndef USE_INT4_DP4A_PREPACK
 #define USE_INT4_DP4A_PREPACK 0
 #endif
+#ifndef USE_LINEAR_I4_DP4A2
+#define USE_LINEAR_I4_DP4A2 0
+#endif
 #ifndef USE_FP16_KV_CACHE
 #define USE_FP16_KV_CACHE 0
 #endif
@@ -494,6 +497,53 @@ __device__ __forceinline__ int dot_i4_i8_dp4a(const WeightT* row,const int8_t* x
     return acc;
 #endif
 }
+__device__ __forceinline__ void dot_i4_i8_dp4a2(
+    const WeightT* row0,const WeightT* row1,
+    const int8_t* x,int IN,int tid,int stride,
+    int& acc0,int& acc1
+){
+    acc0=0;
+    acc1=0;
+#if USE_INT4_DP4A_PREPACK
+    const int* row04=reinterpret_cast<const int*>(row0);
+    const int* row14=reinterpret_cast<const int*>(row1);
+    const int* x4=reinterpret_cast<const int*>(x);
+    int packs4=IN>>2;
+    for(int j=tid;j<packs4;j+=stride){
+        int xv=__ldg(x4+j);
+        acc0=__dp4a(__ldg(row04+j),xv,acc0);
+        if(row1) acc1=__dp4a(__ldg(row14+j),xv,acc1);
+    }
+    for(int i=(packs4<<2)+tid;i<IN;i+=stride){
+        int xv=(int)x[i];
+        acc0+=(int)((int8_t)row0[i])*xv;
+        if(row1) acc1+=(int)((int8_t)row1[i])*xv;
+    }
+#else
+    const uint32_t* row032=reinterpret_cast<const uint32_t*>(row0);
+    const uint32_t* row132=reinterpret_cast<const uint32_t*>(row1);
+    const int* x4=reinterpret_cast<const int*>(x);
+    int packs8=IN>>3;
+    for(int j=tid;j<packs8;j+=stride){
+        int i4=j<<1;
+        int xv0=__ldg(x4+i4);
+        int xv1=__ldg(x4+i4+1);
+        uint32_t packed0=__ldg(row032+j);
+        acc0=__dp4a(pack_i4x4_to_i8x4(packed0,0),xv0,acc0);
+        acc0=__dp4a(pack_i4x4_to_i8x4(packed0,16),xv1,acc0);
+        if(row1){
+            uint32_t packed1=__ldg(row132+j);
+            acc1=__dp4a(pack_i4x4_to_i8x4(packed1,0),xv0,acc1);
+            acc1=__dp4a(pack_i4x4_to_i8x4(packed1,16),xv1,acc1);
+        }
+    }
+    for(int i=(packs8<<3)+tid;i<IN;i+=stride){
+        int xv=(int)x[i];
+        acc0+=unpack_i4(row0[i>>1],(i&1)!=0)*xv;
+        if(row1) acc1+=unpack_i4(row1[i>>1],(i&1)!=0)*xv;
+    }
+#endif
+}
 __device__ __forceinline__ float dot_weight_float_x(const WeightT* row,const float* x,int IN,int tid,int stride,float scale){
 #if USE_INT8_WEIGHTS
     (void)scale;
@@ -708,6 +758,37 @@ __global__ void linear_i4_dp4a_kernel(const int8_t* xq,const float* x_scale,cons
     if(tid==0){
         float out=(float)sh[0]*row_scale_at(scales,o)*x_scale[0];
         y[o]=b ? out+b[o] : out;
+    }
+}
+__global__ void linear_i4_dp4a2_kernel(const int8_t* xq,const float* x_scale,const WeightT* W,const float* scales,const float* b,float* y,int IN,int OUT){
+    __shared__ int sh0[256];
+    __shared__ int sh1[256];
+    int o0=blockIdx.x<<1;
+    int o1=o0+1;
+    int tid=threadIdx.x;
+    if(o0>=OUT) return;
+    const WeightT* row0=row_weight_ptr(W,o0,IN);
+    const WeightT* row1=(o1<OUT) ? row_weight_ptr(W,o1,IN) : nullptr;
+    int s0=0,s1=0;
+    dot_i4_i8_dp4a2(row0,row1,xq,IN,tid,blockDim.x,s0,s1);
+    sh0[tid]=s0;
+    sh1[tid]=s1;
+    __syncthreads();
+    for(int stride=blockDim.x/2;stride>0;stride>>=1){
+        if(tid<stride){
+            sh0[tid]+=sh0[tid+stride];
+            sh1[tid]+=sh1[tid+stride];
+        }
+        __syncthreads();
+    }
+    if(tid==0){
+        float xs=x_scale[0];
+        float out0=(float)sh0[0]*row_scale_at(scales,o0)*xs;
+        y[o0]=b ? out0+b[o0] : out0;
+        if(o1<OUT){
+            float out1=(float)sh1[0]*row_scale_at(scales,o1)*xs;
+            y[o1]=b ? out1+b[o1] : out1;
+        }
     }
 }
 __global__ void qkv_i4_dp4a_kernel(
@@ -1345,7 +1426,11 @@ static void launch_linear_from_float(const float* x,half* xh,int8_t* xq,float* x
 #elif USE_INT4_WEIGHTS && USE_INT4_DP4A
     prepare_int8_x(x,xq,xq_scale,IN);
     int B=LINEAR_THREADS;
+#if USE_LINEAR_I4_DP4A2
+    linear_i4_dp4a2_kernel<<<(OUT+1)/2,B>>>(xq,xq_scale,W.data,W.scale,b,y,IN,OUT);
+#else
     linear_i4_dp4a_kernel<<<OUT,B>>>(xq,xq_scale,W.data,W.scale,b,y,IN,OUT);
+#endif
 #else
     int B=LINEAR_THREADS;
     linear_kernel<<<OUT,B>>>(x,W.data,W.scale,b,y,IN,OUT);
