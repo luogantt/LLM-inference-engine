@@ -70,12 +70,6 @@ constexpr float DEFAULT_ROPE_THETA=1000000.0f;
 #ifndef USE_QKV_GATE_I4_DP4A4
 #define USE_QKV_GATE_I4_DP4A4 0
 #endif
-#ifndef USE_LINEAR_I4_DP4A8
-#define USE_LINEAR_I4_DP4A8 0
-#endif
-#ifndef USE_QKV_GATE_I4_DP4A8
-#define USE_QKV_GATE_I4_DP4A8 0
-#endif
 #ifndef USE_FP16_KV_CACHE
 #define USE_FP16_KV_CACHE 0
 #endif
@@ -628,114 +622,6 @@ __device__ __forceinline__ void dot_i4_i8_dp4a4(
     }
 #endif
 }
-__device__ __forceinline__ void dot_i4_i8_dp4a8(
-    const WeightT* row0,const WeightT* row1,const WeightT* row2,const WeightT* row3,
-    const WeightT* row4,const WeightT* row5,const WeightT* row6,const WeightT* row7,
-    const int8_t* x,int IN,int tid,int stride,
-    int& acc0,int& acc1,int& acc2,int& acc3,int& acc4,int& acc5,int& acc6,int& acc7
-){
-    acc0=0; acc1=0; acc2=0; acc3=0;
-    acc4=0; acc5=0; acc6=0; acc7=0;
-#if USE_INT4_DP4A_PREPACK
-    const int* row04=reinterpret_cast<const int*>(row0);
-    const int* row14=reinterpret_cast<const int*>(row1);
-    const int* row24=reinterpret_cast<const int*>(row2);
-    const int* row34=reinterpret_cast<const int*>(row3);
-    const int* row44=reinterpret_cast<const int*>(row4);
-    const int* row54=reinterpret_cast<const int*>(row5);
-    const int* row64=reinterpret_cast<const int*>(row6);
-    const int* row74=reinterpret_cast<const int*>(row7);
-    const int* x4=reinterpret_cast<const int*>(x);
-    int packs4=IN>>2;
-    for(int j=tid;j<packs4;j+=stride){
-        int xv=__ldg(x4+j);
-        acc0=__dp4a(__ldg(row04+j),xv,acc0);
-        if(row1) acc1=__dp4a(__ldg(row14+j),xv,acc1);
-        if(row2) acc2=__dp4a(__ldg(row24+j),xv,acc2);
-        if(row3) acc3=__dp4a(__ldg(row34+j),xv,acc3);
-        if(row4) acc4=__dp4a(__ldg(row44+j),xv,acc4);
-        if(row5) acc5=__dp4a(__ldg(row54+j),xv,acc5);
-        if(row6) acc6=__dp4a(__ldg(row64+j),xv,acc6);
-        if(row7) acc7=__dp4a(__ldg(row74+j),xv,acc7);
-    }
-    for(int i=(packs4<<2)+tid;i<IN;i+=stride){
-        int xv=(int)x[i];
-        acc0+=(int)((int8_t)row0[i])*xv;
-        if(row1) acc1+=(int)((int8_t)row1[i])*xv;
-        if(row2) acc2+=(int)((int8_t)row2[i])*xv;
-        if(row3) acc3+=(int)((int8_t)row3[i])*xv;
-        if(row4) acc4+=(int)((int8_t)row4[i])*xv;
-        if(row5) acc5+=(int)((int8_t)row5[i])*xv;
-        if(row6) acc6+=(int)((int8_t)row6[i])*xv;
-        if(row7) acc7+=(int)((int8_t)row7[i])*xv;
-    }
-#else
-    const uint32_t* row032=reinterpret_cast<const uint32_t*>(row0);
-    const uint32_t* row132=reinterpret_cast<const uint32_t*>(row1);
-    const uint32_t* row232=reinterpret_cast<const uint32_t*>(row2);
-    const uint32_t* row332=reinterpret_cast<const uint32_t*>(row3);
-    const uint32_t* row432=reinterpret_cast<const uint32_t*>(row4);
-    const uint32_t* row532=reinterpret_cast<const uint32_t*>(row5);
-    const uint32_t* row632=reinterpret_cast<const uint32_t*>(row6);
-    const uint32_t* row732=reinterpret_cast<const uint32_t*>(row7);
-    const int* x4=reinterpret_cast<const int*>(x);
-    int packs8=IN>>3;
-    for(int j=tid;j<packs8;j+=stride){
-        int i4=j<<1;
-        int xv0=__ldg(x4+i4);
-        int xv1=__ldg(x4+i4+1);
-        uint32_t packed0=__ldg(row032+j);
-        acc0=__dp4a(pack_i4x4_to_i8x4(packed0,0),xv0,acc0);
-        acc0=__dp4a(pack_i4x4_to_i8x4(packed0,16),xv1,acc0);
-        if(row1){
-            uint32_t packed1=__ldg(row132+j);
-            acc1=__dp4a(pack_i4x4_to_i8x4(packed1,0),xv0,acc1);
-            acc1=__dp4a(pack_i4x4_to_i8x4(packed1,16),xv1,acc1);
-        }
-        if(row2){
-            uint32_t packed2=__ldg(row232+j);
-            acc2=__dp4a(pack_i4x4_to_i8x4(packed2,0),xv0,acc2);
-            acc2=__dp4a(pack_i4x4_to_i8x4(packed2,16),xv1,acc2);
-        }
-        if(row3){
-            uint32_t packed3=__ldg(row332+j);
-            acc3=__dp4a(pack_i4x4_to_i8x4(packed3,0),xv0,acc3);
-            acc3=__dp4a(pack_i4x4_to_i8x4(packed3,16),xv1,acc3);
-        }
-        if(row4){
-            uint32_t packed4=__ldg(row432+j);
-            acc4=__dp4a(pack_i4x4_to_i8x4(packed4,0),xv0,acc4);
-            acc4=__dp4a(pack_i4x4_to_i8x4(packed4,16),xv1,acc4);
-        }
-        if(row5){
-            uint32_t packed5=__ldg(row532+j);
-            acc5=__dp4a(pack_i4x4_to_i8x4(packed5,0),xv0,acc5);
-            acc5=__dp4a(pack_i4x4_to_i8x4(packed5,16),xv1,acc5);
-        }
-        if(row6){
-            uint32_t packed6=__ldg(row632+j);
-            acc6=__dp4a(pack_i4x4_to_i8x4(packed6,0),xv0,acc6);
-            acc6=__dp4a(pack_i4x4_to_i8x4(packed6,16),xv1,acc6);
-        }
-        if(row7){
-            uint32_t packed7=__ldg(row732+j);
-            acc7=__dp4a(pack_i4x4_to_i8x4(packed7,0),xv0,acc7);
-            acc7=__dp4a(pack_i4x4_to_i8x4(packed7,16),xv1,acc7);
-        }
-    }
-    for(int i=(packs8<<3)+tid;i<IN;i+=stride){
-        int xv=(int)x[i];
-        acc0+=unpack_i4(row0[i>>1],(i&1)!=0)*xv;
-        if(row1) acc1+=unpack_i4(row1[i>>1],(i&1)!=0)*xv;
-        if(row2) acc2+=unpack_i4(row2[i>>1],(i&1)!=0)*xv;
-        if(row3) acc3+=unpack_i4(row3[i>>1],(i&1)!=0)*xv;
-        if(row4) acc4+=unpack_i4(row4[i>>1],(i&1)!=0)*xv;
-        if(row5) acc5+=unpack_i4(row5[i>>1],(i&1)!=0)*xv;
-        if(row6) acc6+=unpack_i4(row6[i>>1],(i&1)!=0)*xv;
-        if(row7) acc7+=unpack_i4(row7[i>>1],(i&1)!=0)*xv;
-    }
-#endif
-}
 __device__ __forceinline__ float dot_weight_float_x(const WeightT* row,const float* x,int IN,int tid,int stride,float scale){
 #if USE_INT8_WEIGHTS
     (void)scale;
@@ -1032,48 +918,6 @@ __global__ void linear_i4_dp4a4_kernel(const int8_t* xq,const float* x_scale,con
         }
     }
 }
-__global__ void linear_i4_dp4a8_kernel(const int8_t* xq,const float* x_scale,const WeightT* W,const float* scales,const float* b,float* y,int IN,int OUT){
-    __shared__ int sh0[256],sh1[256],sh2[256],sh3[256];
-    __shared__ int sh4[256],sh5[256],sh6[256],sh7[256];
-    int o0=blockIdx.x<<3;
-    int o1=o0+1,o2=o0+2,o3=o0+3,o4=o0+4,o5=o0+5,o6=o0+6,o7=o0+7;
-    int tid=threadIdx.x;
-    if(o0>=OUT) return;
-    const WeightT* row0=row_weight_ptr(W,o0,IN);
-    const WeightT* row1=(o1<OUT) ? row_weight_ptr(W,o1,IN) : nullptr;
-    const WeightT* row2=(o2<OUT) ? row_weight_ptr(W,o2,IN) : nullptr;
-    const WeightT* row3=(o3<OUT) ? row_weight_ptr(W,o3,IN) : nullptr;
-    const WeightT* row4=(o4<OUT) ? row_weight_ptr(W,o4,IN) : nullptr;
-    const WeightT* row5=(o5<OUT) ? row_weight_ptr(W,o5,IN) : nullptr;
-    const WeightT* row6=(o6<OUT) ? row_weight_ptr(W,o6,IN) : nullptr;
-    const WeightT* row7=(o7<OUT) ? row_weight_ptr(W,o7,IN) : nullptr;
-    int s0=0,s1=0,s2=0,s3=0,s4=0,s5=0,s6=0,s7=0;
-    dot_i4_i8_dp4a8(row0,row1,row2,row3,row4,row5,row6,row7,xq,IN,tid,blockDim.x,s0,s1,s2,s3,s4,s5,s6,s7);
-    sh0[tid]=s0; sh1[tid]=s1; sh2[tid]=s2; sh3[tid]=s3;
-    sh4[tid]=s4; sh5[tid]=s5; sh6[tid]=s6; sh7[tid]=s7;
-    __syncthreads();
-    for(int stride=blockDim.x/2;stride>0;stride>>=1){
-        if(tid<stride){
-            sh0[tid]+=sh0[tid+stride]; sh1[tid]+=sh1[tid+stride];
-            sh2[tid]+=sh2[tid+stride]; sh3[tid]+=sh3[tid+stride];
-            sh4[tid]+=sh4[tid+stride]; sh5[tid]+=sh5[tid+stride];
-            sh6[tid]+=sh6[tid+stride]; sh7[tid]+=sh7[tid+stride];
-        }
-        __syncthreads();
-    }
-    if(tid==0){
-        float xs=x_scale[0];
-        float out0=(float)sh0[0]*row_scale_at(scales,o0)*xs;
-        y[o0]=b ? out0+b[o0] : out0;
-        if(o1<OUT){ float out1=(float)sh1[0]*row_scale_at(scales,o1)*xs; y[o1]=b ? out1+b[o1] : out1; }
-        if(o2<OUT){ float out2=(float)sh2[0]*row_scale_at(scales,o2)*xs; y[o2]=b ? out2+b[o2] : out2; }
-        if(o3<OUT){ float out3=(float)sh3[0]*row_scale_at(scales,o3)*xs; y[o3]=b ? out3+b[o3] : out3; }
-        if(o4<OUT){ float out4=(float)sh4[0]*row_scale_at(scales,o4)*xs; y[o4]=b ? out4+b[o4] : out4; }
-        if(o5<OUT){ float out5=(float)sh5[0]*row_scale_at(scales,o5)*xs; y[o5]=b ? out5+b[o5] : out5; }
-        if(o6<OUT){ float out6=(float)sh6[0]*row_scale_at(scales,o6)*xs; y[o6]=b ? out6+b[o6] : out6; }
-        if(o7<OUT){ float out7=(float)sh7[0]*row_scale_at(scales,o7)*xs; y[o7]=b ? out7+b[o7] : out7; }
-    }
-}
 __global__ void qkv_i4_dp4a_kernel(
     const int8_t* xq,const float* x_scale,
     const WeightT* Wq,const WeightT* Wk,const WeightT* Wv,
@@ -1252,69 +1096,6 @@ __global__ void qkv_i4_dp4a4_kernel(
         }
     }
 }
-__global__ void qkv_i4_dp4a8_kernel(
-    const int8_t* xq,const float* x_scale,
-    const WeightT* Wq,const WeightT* Wk,const WeightT* Wv,
-    const float* Sq,const float* Sk,const float* Sv,
-    const float* bq,const float* bk,const float* bv,
-    float* q,float* k,float* v,
-    int IN
-){
-    __shared__ int sh0[256],sh1[256],sh2[256],sh3[256];
-    __shared__ int sh4[256],sh5[256],sh6[256],sh7[256];
-    constexpr int TOTAL_QKV=HIDDEN+2*KV_DIM;
-    int o0=blockIdx.x<<3;
-    int o1=o0+1,o2=o0+2,o3=o0+3,o4=o0+4,o5=o0+5,o6=o0+6,o7=o0+7;
-    int tid=threadIdx.x;
-    if(o0>=TOTAL_QKV) return;
-    const WeightT *W0=nullptr,*W1=nullptr,*W2=nullptr,*W3=nullptr,*W4=nullptr,*W5=nullptr,*W6=nullptr,*W7=nullptr;
-    const float *S0=nullptr,*S1=nullptr,*S2=nullptr,*S3=nullptr,*S4=nullptr,*S5=nullptr,*S6=nullptr,*S7=nullptr;
-    const float *b0=nullptr,*b1=nullptr,*b2=nullptr,*b3=nullptr,*b4=nullptr,*b5=nullptr,*b6=nullptr,*b7=nullptr;
-    float *y0=nullptr,*y1=nullptr,*y2=nullptr,*y3=nullptr,*y4=nullptr,*y5=nullptr,*y6=nullptr,*y7=nullptr;
-    int local0=0,local1=0,local2=0,local3=0,local4=0,local5=0,local6=0,local7=0;
-    select_qkv_row(o0,Wq,Wk,Wv,Sq,Sk,Sv,bq,bk,bv,q,k,v,W0,S0,b0,y0,local0);
-    if(o1<TOTAL_QKV) select_qkv_row(o1,Wq,Wk,Wv,Sq,Sk,Sv,bq,bk,bv,q,k,v,W1,S1,b1,y1,local1);
-    if(o2<TOTAL_QKV) select_qkv_row(o2,Wq,Wk,Wv,Sq,Sk,Sv,bq,bk,bv,q,k,v,W2,S2,b2,y2,local2);
-    if(o3<TOTAL_QKV) select_qkv_row(o3,Wq,Wk,Wv,Sq,Sk,Sv,bq,bk,bv,q,k,v,W3,S3,b3,y3,local3);
-    if(o4<TOTAL_QKV) select_qkv_row(o4,Wq,Wk,Wv,Sq,Sk,Sv,bq,bk,bv,q,k,v,W4,S4,b4,y4,local4);
-    if(o5<TOTAL_QKV) select_qkv_row(o5,Wq,Wk,Wv,Sq,Sk,Sv,bq,bk,bv,q,k,v,W5,S5,b5,y5,local5);
-    if(o6<TOTAL_QKV) select_qkv_row(o6,Wq,Wk,Wv,Sq,Sk,Sv,bq,bk,bv,q,k,v,W6,S6,b6,y6,local6);
-    if(o7<TOTAL_QKV) select_qkv_row(o7,Wq,Wk,Wv,Sq,Sk,Sv,bq,bk,bv,q,k,v,W7,S7,b7,y7,local7);
-    const WeightT* row0=row_weight_ptr(W0,local0,IN);
-    const WeightT* row1=(o1<TOTAL_QKV) ? row_weight_ptr(W1,local1,IN) : nullptr;
-    const WeightT* row2=(o2<TOTAL_QKV) ? row_weight_ptr(W2,local2,IN) : nullptr;
-    const WeightT* row3=(o3<TOTAL_QKV) ? row_weight_ptr(W3,local3,IN) : nullptr;
-    const WeightT* row4=(o4<TOTAL_QKV) ? row_weight_ptr(W4,local4,IN) : nullptr;
-    const WeightT* row5=(o5<TOTAL_QKV) ? row_weight_ptr(W5,local5,IN) : nullptr;
-    const WeightT* row6=(o6<TOTAL_QKV) ? row_weight_ptr(W6,local6,IN) : nullptr;
-    const WeightT* row7=(o7<TOTAL_QKV) ? row_weight_ptr(W7,local7,IN) : nullptr;
-    int s0=0,s1=0,s2=0,s3=0,s4=0,s5=0,s6=0,s7=0;
-    dot_i4_i8_dp4a8(row0,row1,row2,row3,row4,row5,row6,row7,xq,IN,tid,blockDim.x,s0,s1,s2,s3,s4,s5,s6,s7);
-    sh0[tid]=s0; sh1[tid]=s1; sh2[tid]=s2; sh3[tid]=s3;
-    sh4[tid]=s4; sh5[tid]=s5; sh6[tid]=s6; sh7[tid]=s7;
-    __syncthreads();
-    for(int stride=blockDim.x/2;stride>0;stride>>=1){
-        if(tid<stride){
-            sh0[tid]+=sh0[tid+stride]; sh1[tid]+=sh1[tid+stride];
-            sh2[tid]+=sh2[tid+stride]; sh3[tid]+=sh3[tid+stride];
-            sh4[tid]+=sh4[tid+stride]; sh5[tid]+=sh5[tid+stride];
-            sh6[tid]+=sh6[tid+stride]; sh7[tid]+=sh7[tid+stride];
-        }
-        __syncthreads();
-    }
-    if(tid==0){
-        float xs=x_scale[0];
-        float out0=(float)sh0[0]*row_scale_at(S0,local0)*xs;
-        y0[local0]=b0 ? out0+b0[local0] : out0;
-        if(o1<TOTAL_QKV){ float out1=(float)sh1[0]*row_scale_at(S1,local1)*xs; y1[local1]=b1 ? out1+b1[local1] : out1; }
-        if(o2<TOTAL_QKV){ float out2=(float)sh2[0]*row_scale_at(S2,local2)*xs; y2[local2]=b2 ? out2+b2[local2] : out2; }
-        if(o3<TOTAL_QKV){ float out3=(float)sh3[0]*row_scale_at(S3,local3)*xs; y3[local3]=b3 ? out3+b3[local3] : out3; }
-        if(o4<TOTAL_QKV){ float out4=(float)sh4[0]*row_scale_at(S4,local4)*xs; y4[local4]=b4 ? out4+b4[local4] : out4; }
-        if(o5<TOTAL_QKV){ float out5=(float)sh5[0]*row_scale_at(S5,local5)*xs; y5[local5]=b5 ? out5+b5[local5] : out5; }
-        if(o6<TOTAL_QKV){ float out6=(float)sh6[0]*row_scale_at(S6,local6)*xs; y6[local6]=b6 ? out6+b6[local6] : out6; }
-        if(o7<TOTAL_QKV){ float out7=(float)sh7[0]*row_scale_at(S7,local7)*xs; y7[local7]=b7 ? out7+b7[local7] : out7; }
-    }
-}
 __global__ void gate_up_i4_dp4a_kernel(
     const int8_t* xq,const float* x_scale,
     const WeightT* Wgate,const WeightT* Wup,
@@ -1450,88 +1231,6 @@ __global__ void gate_up_i4_dp4a4_kernel(
         if(o1<TOTAL_GATE_UP) y1[local1]=(float)sh1[0]*row_scale_at(S1,local1)*xs;
         if(o2<TOTAL_GATE_UP) y2[local2]=(float)sh2[0]*row_scale_at(S2,local2)*xs;
         if(o3<TOTAL_GATE_UP) y3[local3]=(float)sh3[0]*row_scale_at(S3,local3)*xs;
-    }
-}
-__global__ void gate_up_i4_dp4a8_kernel(
-    const int8_t* xq,const float* x_scale,
-    const WeightT* Wgate,const WeightT* Wup,
-    const float* Sgate,const float* Sup,
-    float* gate,float* up,
-    int IN
-){
-    __shared__ int sh0[256],sh1[256],sh2[256],sh3[256];
-    __shared__ int sh4[256],sh5[256],sh6[256],sh7[256];
-    constexpr int TOTAL_GATE_UP=2*INTERMEDIATE;
-    int o0=blockIdx.x<<3;
-    int o1=o0+1,o2=o0+2,o3=o0+3,o4=o0+4,o5=o0+5,o6=o0+6,o7=o0+7;
-    int tid=threadIdx.x;
-    if(o0>=TOTAL_GATE_UP) return;
-    bool is_gate0=o0<INTERMEDIATE, is_gate1=o1<INTERMEDIATE, is_gate2=o2<INTERMEDIATE, is_gate3=o3<INTERMEDIATE;
-    bool is_gate4=o4<INTERMEDIATE, is_gate5=o5<INTERMEDIATE, is_gate6=o6<INTERMEDIATE, is_gate7=o7<INTERMEDIATE;
-    int local0=is_gate0 ? o0 : o0-INTERMEDIATE;
-    int local1=is_gate1 ? o1 : o1-INTERMEDIATE;
-    int local2=is_gate2 ? o2 : o2-INTERMEDIATE;
-    int local3=is_gate3 ? o3 : o3-INTERMEDIATE;
-    int local4=is_gate4 ? o4 : o4-INTERMEDIATE;
-    int local5=is_gate5 ? o5 : o5-INTERMEDIATE;
-    int local6=is_gate6 ? o6 : o6-INTERMEDIATE;
-    int local7=is_gate7 ? o7 : o7-INTERMEDIATE;
-    const WeightT* W0=is_gate0 ? Wgate : Wup;
-    const WeightT* W1=(o1<TOTAL_GATE_UP) ? (is_gate1 ? Wgate : Wup) : nullptr;
-    const WeightT* W2=(o2<TOTAL_GATE_UP) ? (is_gate2 ? Wgate : Wup) : nullptr;
-    const WeightT* W3=(o3<TOTAL_GATE_UP) ? (is_gate3 ? Wgate : Wup) : nullptr;
-    const WeightT* W4=(o4<TOTAL_GATE_UP) ? (is_gate4 ? Wgate : Wup) : nullptr;
-    const WeightT* W5=(o5<TOTAL_GATE_UP) ? (is_gate5 ? Wgate : Wup) : nullptr;
-    const WeightT* W6=(o6<TOTAL_GATE_UP) ? (is_gate6 ? Wgate : Wup) : nullptr;
-    const WeightT* W7=(o7<TOTAL_GATE_UP) ? (is_gate7 ? Wgate : Wup) : nullptr;
-    const float* S0=is_gate0 ? Sgate : Sup;
-    const float* S1=is_gate1 ? Sgate : Sup;
-    const float* S2=is_gate2 ? Sgate : Sup;
-    const float* S3=is_gate3 ? Sgate : Sup;
-    const float* S4=is_gate4 ? Sgate : Sup;
-    const float* S5=is_gate5 ? Sgate : Sup;
-    const float* S6=is_gate6 ? Sgate : Sup;
-    const float* S7=is_gate7 ? Sgate : Sup;
-    float* y0=is_gate0 ? gate : up;
-    float* y1=is_gate1 ? gate : up;
-    float* y2=is_gate2 ? gate : up;
-    float* y3=is_gate3 ? gate : up;
-    float* y4=is_gate4 ? gate : up;
-    float* y5=is_gate5 ? gate : up;
-    float* y6=is_gate6 ? gate : up;
-    float* y7=is_gate7 ? gate : up;
-    const WeightT* row0=row_weight_ptr(W0,local0,IN);
-    const WeightT* row1=(o1<TOTAL_GATE_UP) ? row_weight_ptr(W1,local1,IN) : nullptr;
-    const WeightT* row2=(o2<TOTAL_GATE_UP) ? row_weight_ptr(W2,local2,IN) : nullptr;
-    const WeightT* row3=(o3<TOTAL_GATE_UP) ? row_weight_ptr(W3,local3,IN) : nullptr;
-    const WeightT* row4=(o4<TOTAL_GATE_UP) ? row_weight_ptr(W4,local4,IN) : nullptr;
-    const WeightT* row5=(o5<TOTAL_GATE_UP) ? row_weight_ptr(W5,local5,IN) : nullptr;
-    const WeightT* row6=(o6<TOTAL_GATE_UP) ? row_weight_ptr(W6,local6,IN) : nullptr;
-    const WeightT* row7=(o7<TOTAL_GATE_UP) ? row_weight_ptr(W7,local7,IN) : nullptr;
-    int s0=0,s1=0,s2=0,s3=0,s4=0,s5=0,s6=0,s7=0;
-    dot_i4_i8_dp4a8(row0,row1,row2,row3,row4,row5,row6,row7,xq,IN,tid,blockDim.x,s0,s1,s2,s3,s4,s5,s6,s7);
-    sh0[tid]=s0; sh1[tid]=s1; sh2[tid]=s2; sh3[tid]=s3;
-    sh4[tid]=s4; sh5[tid]=s5; sh6[tid]=s6; sh7[tid]=s7;
-    __syncthreads();
-    for(int stride=blockDim.x/2;stride>0;stride>>=1){
-        if(tid<stride){
-            sh0[tid]+=sh0[tid+stride]; sh1[tid]+=sh1[tid+stride];
-            sh2[tid]+=sh2[tid+stride]; sh3[tid]+=sh3[tid+stride];
-            sh4[tid]+=sh4[tid+stride]; sh5[tid]+=sh5[tid+stride];
-            sh6[tid]+=sh6[tid+stride]; sh7[tid]+=sh7[tid+stride];
-        }
-        __syncthreads();
-    }
-    if(tid==0){
-        float xs=x_scale[0];
-        y0[local0]=(float)sh0[0]*row_scale_at(S0,local0)*xs;
-        if(o1<TOTAL_GATE_UP) y1[local1]=(float)sh1[0]*row_scale_at(S1,local1)*xs;
-        if(o2<TOTAL_GATE_UP) y2[local2]=(float)sh2[0]*row_scale_at(S2,local2)*xs;
-        if(o3<TOTAL_GATE_UP) y3[local3]=(float)sh3[0]*row_scale_at(S3,local3)*xs;
-        if(o4<TOTAL_GATE_UP) y4[local4]=(float)sh4[0]*row_scale_at(S4,local4)*xs;
-        if(o5<TOTAL_GATE_UP) y5[local5]=(float)sh5[0]*row_scale_at(S5,local5)*xs;
-        if(o6<TOTAL_GATE_UP) y6[local6]=(float)sh6[0]*row_scale_at(S6,local6)*xs;
-        if(o7<TOTAL_GATE_UP) y7[local7]=(float)sh7[0]*row_scale_at(S7,local7)*xs;
     }
 }
 __global__ void float_to_half_kernel(const float* x,half* xh,int n){
@@ -2108,9 +1807,7 @@ static void launch_linear_from_float(const float* x,half* xh,int8_t* xq,float* x
 #elif USE_INT4_WEIGHTS && USE_INT4_DP4A
     prepare_int8_x(x,xq,xq_scale,IN);
     int B=LINEAR_THREADS;
-#if USE_LINEAR_I4_DP4A8
-    linear_i4_dp4a8_kernel<<<(OUT+7)/8,B>>>(xq,xq_scale,W.data,W.scale,b,y,IN,OUT);
-#elif USE_LINEAR_I4_DP4A4
+#if USE_LINEAR_I4_DP4A4
     linear_i4_dp4a4_kernel<<<(OUT+3)/4,B>>>(xq,xq_scale,W.data,W.scale,b,y,IN,OUT);
 #elif USE_LINEAR_I4_DP4A2
     linear_i4_dp4a2_kernel<<<(OUT+1)/2,B>>>(xq,xq_scale,W.data,W.scale,b,y,IN,OUT);
@@ -2137,9 +1834,7 @@ static void launch_qkv_from_float(
 #elif USE_INT4_WEIGHTS && USE_INT4_DP4A
     prepare_int8_x(x,xq,xq_scale,IN);
     int B=LINEAR_THREADS;
-#if USE_QKV_GATE_I4_DP4A8
-    qkv_i4_dp4a8_kernel<<<(HIDDEN+2*KV_DIM+7)/8,B>>>(xq,xq_scale,Wq.data,Wk.data,Wv.data,Wq.scale,Wk.scale,Wv.scale,bq,bk,bv,q,k,v,IN);
-#elif USE_QKV_GATE_I4_DP4A4
+#if USE_QKV_GATE_I4_DP4A4
     qkv_i4_dp4a4_kernel<<<(HIDDEN+2*KV_DIM+3)/4,B>>>(xq,xq_scale,Wq.data,Wk.data,Wv.data,Wq.scale,Wk.scale,Wv.scale,bq,bk,bv,q,k,v,IN);
 #elif USE_QKV_GATE_I4_DP4A2
     qkv_i4_dp4a2_kernel<<<(HIDDEN+2*KV_DIM+1)/2,B>>>(xq,xq_scale,Wq.data,Wk.data,Wv.data,Wq.scale,Wk.scale,Wv.scale,bq,bk,bv,q,k,v,IN);
@@ -2164,9 +1859,7 @@ static void launch_gate_up_from_float(
 #elif USE_INT4_WEIGHTS && USE_INT4_DP4A
     prepare_int8_x(x,xq,xq_scale,IN);
     int B=LINEAR_THREADS;
-#if USE_QKV_GATE_I4_DP4A8
-    gate_up_i4_dp4a8_kernel<<<(2*INTERMEDIATE+7)/8,B>>>(xq,xq_scale,Wgate.data,Wup.data,Wgate.scale,Wup.scale,gate,up,IN);
-#elif USE_QKV_GATE_I4_DP4A4
+#if USE_QKV_GATE_I4_DP4A4
     gate_up_i4_dp4a4_kernel<<<(2*INTERMEDIATE+3)/4,B>>>(xq,xq_scale,Wgate.data,Wup.data,Wgate.scale,Wup.scale,gate,up,IN);
 #elif USE_QKV_GATE_I4_DP4A2
     gate_up_i4_dp4a2_kernel<<<(2*INTERMEDIATE+1)/2,B>>>(xq,xq_scale,Wgate.data,Wup.data,Wgate.scale,Wup.scale,gate,up,IN);
