@@ -40,6 +40,9 @@ constexpr float DEFAULT_ROPE_THETA=1000000.0f;
 #ifndef USE_INT4_DP4A
 #define USE_INT4_DP4A 0
 #endif
+#ifndef USE_INT4_DP4A_PREPACK
+#define USE_INT4_DP4A_PREPACK 0
+#endif
 #if USE_INT8_WEIGHTS && USE_INT4_WEIGHTS
 #error "USE_INT8_WEIGHTS and USE_INT4_WEIGHTS cannot both be enabled"
 #endif
@@ -259,7 +262,7 @@ static WeightMatrix load_weight_tensor(const std::unordered_map<std::string,Tens
     size_t rows=t.shape.empty() ? 1 : t.shape[0];
     if(rows==0 || n%rows!=0) throw std::runtime_error("bad weight shape for "+name);
     size_t cols=n/rows;
-#if USE_INT4_WEIGHTS
+#if USE_INT4_WEIGHTS && !USE_INT4_DP4A_PREPACK
     size_t packed_cols=(cols+1)/2;
     size_t packed_n=rows*packed_cols;
     std::vector<WeightT> h(packed_n);
@@ -283,7 +286,13 @@ static WeightMatrix load_weight_tensor(const std::unordered_map<std::string,Tens
             float scale=max_abs>0.0f ? max_abs/127.0f : 1.0f;
 #endif
             scales[r]=scale;
-#if USE_INT4_WEIGHTS
+#if USE_INT4_WEIGHTS && USE_INT4_DP4A_PREPACK
+            for(size_t c=0;c<cols;c++){
+                int q=max_abs>0.0f ? (int)lrintf(value_at(base+c)*inv) : 0;
+                q=std::max(-7,std::min(7,q));
+                h[base+c]=(WeightT)((uint8_t)((int8_t)q));
+            }
+#elif USE_INT4_WEIGHTS
             size_t packed_base=r*packed_cols;
             for(size_t c=0;c<cols;c+=2){
                 int q0=max_abs>0.0f ? (int)lrintf(value_at(base+c)*inv) : 0;
@@ -322,9 +331,15 @@ static WeightMatrix load_weight_tensor(const std::unordered_map<std::string,Tens
     CK(cudaMalloc(&w.scale,rows*sizeof(float)));
     CK(cudaMemcpy(w.scale,scales.data(),rows*sizeof(float),cudaMemcpyHostToDevice));
 #if USE_INT4_WEIGHTS
+#if USE_INT4_DP4A_PREPACK
+    std::cout<<"[C++] loaded "<<name<<", dtype="<<t.dtype
+             <<", stored=INT4(dp4a_i8_prepack,rowwise), rows="<<rows
+             <<", cols="<<cols<<", bytes="<<h.size()<<", numel="<<n<<"\n";
+#else
     std::cout<<"[C++] loaded "<<name<<", dtype="<<t.dtype
              <<", stored=INT4(rowwise), rows="<<rows<<", cols="<<cols
              <<", packed_bytes="<<h.size()<<", numel="<<n<<"\n";
+#endif
 #else
     std::cout<<"[C++] loaded "<<name<<", dtype="<<t.dtype
              <<", stored=INT8(rowwise), rows="<<rows<<", cols="<<cols
@@ -355,9 +370,13 @@ __device__ __forceinline__ float weight_to_float(WeightT w,float scale=1.0f){
 #if USE_INT8_WEIGHTS
     return (float)w*scale;
 #elif USE_INT4_WEIGHTS
+#if USE_INT4_DP4A_PREPACK
+    return (float)((int8_t)w)*scale;
+#else
     int q=(int)(w&0x0F);
     q=(q>=8) ? q-16 : q;
     return (float)q*scale;
+#endif
 #else
     return __half2float(w);
 #endif
@@ -371,7 +390,7 @@ __device__ __forceinline__ float row_scale_at(const float* scales,int row){
 #endif
 }
 __device__ __forceinline__ const WeightT* row_weight_ptr(const WeightT* W,int row,int IN){
-#if USE_INT4_WEIGHTS
+#if USE_INT4_WEIGHTS && !USE_INT4_DP4A_PREPACK
     return W+(size_t)row*((IN+1)>>1);
 #else
     return W+(size_t)row*IN;
@@ -405,6 +424,19 @@ __device__ __forceinline__ float packed_i4_at(const WeightT* row,int i,float sca
     return (float)unpack_i4(packed,(i&1)!=0)*scale;
 }
 __device__ __forceinline__ int dot_i4_i8_dp4a(const WeightT* row,const int8_t* x,int IN,int tid,int stride){
+#if USE_INT4_DP4A_PREPACK
+    const int* row4=reinterpret_cast<const int*>(row);
+    const int* x4=reinterpret_cast<const int*>(x);
+    int packs4=IN>>2;
+    int acc=0;
+    for(int j=tid;j<packs4;j+=stride){
+        acc=__dp4a(__ldg(row4+j),__ldg(x4+j),acc);
+    }
+    for(int i=(packs4<<2)+tid;i<IN;i+=stride){
+        acc+=(int)((int8_t)row[i])*(int)x[i];
+    }
+    return acc;
+#else
     const uint32_t* row32=reinterpret_cast<const uint32_t*>(row);
     const int* x4=reinterpret_cast<const int*>(x);
     int packs8=IN>>3;
@@ -420,6 +452,7 @@ __device__ __forceinline__ int dot_i4_i8_dp4a(const WeightT* row,const int8_t* x
         acc+=q*(int)x[i];
     }
     return acc;
+#endif
 }
 __device__ __forceinline__ float dot_weight_float_x(const WeightT* row,const float* x,int IN,int tid,int stride,float scale){
 #if USE_INT8_WEIGHTS
@@ -482,7 +515,7 @@ __device__ __forceinline__ float dot_weight_float_x(const WeightT* row,const flo
 __global__ void embedding_kernel(int token,const WeightT* emb,const float* scales,float* x){
     int i=blockIdx.x*blockDim.x+threadIdx.x;
     if(i<HIDDEN){
-#if USE_INT4_WEIGHTS
+#if USE_INT4_WEIGHTS && !USE_INT4_DP4A_PREPACK
         x[i]=packed_i4_at(row_weight_ptr(emb,token,HIDDEN),i,row_scale_at(scales,token));
 #else
         x[i]=weight_to_float(emb[(size_t)token*HIDDEN+i],row_scale_at(scales,token));
