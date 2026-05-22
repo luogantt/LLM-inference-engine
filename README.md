@@ -54,6 +54,22 @@ CUDA_VISIBLE_DEVICES=0 python python_infer.py \
 
 运行时如果日志中出现 `stored=INT4(rowwise)`，说明已经启用 INT4 权重路径。
 
+## Jetson Orin AGX INT4 o2-all 编译运行
+
+`lib-int4-o2-all` 使用 INT4 weight-only + INT8 activation + DP4A，并在普通 linear、QKV、gate/up 路径中启用 2-output GEMV kernel，用于减少 kernel 调度和 activation 重复读取开销。
+
+```bash
+make -f Makefile.cuda_lib clean-lib
+make -f Makefile.cuda_lib lib-int4-o2-all A=sm_87
+
+CUDA_VISIBLE_DEVICES=0 python python_infer.py \
+  --model /data/project/deepseek-r1-7b \
+  --lib ./build/libllm_cuda.so \
+  --prompt "你好 deepseek 介绍一下黑格尔的思想" \
+  --max-new-tokens 512 \
+  --max-seq 800
+```
+
 ## 当前性能
 
 测试模型：
@@ -84,7 +100,11 @@ INT8 speedup ≈ 1.63x
 Jetson Orin AGX weight-only INT4 版本：
 
 ```text
-待测试
+lib-int4 baseline ≈ 20.7 tok/s
+lib-int4-o2 ≈ 21.1 tok/s
+lib-int4-o2-all ≈ 22.54 tok/s
+decode forward_ms ≈ 45-46 ms
+tag = jetson_orin_agx_int4_o2_all_forward_ms=46.4326_474_tokens=22.5382_tok_s
 ```
 
 ## 主要文件
