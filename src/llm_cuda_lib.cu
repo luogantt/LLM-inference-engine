@@ -37,6 +37,9 @@ constexpr float DEFAULT_ROPE_THETA=1000000.0f;
 #ifndef USE_INT4_WEIGHTS
 #define USE_INT4_WEIGHTS 0
 #endif
+#ifndef USE_INT4_DP4A
+#define USE_INT4_DP4A 0
+#endif
 #if USE_INT8_WEIGHTS && USE_INT4_WEIGHTS
 #error "USE_INT8_WEIGHTS and USE_INT4_WEIGHTS cannot both be enabled"
 #endif
@@ -382,9 +385,41 @@ __device__ __forceinline__ int unpack_i4_shift(uint32_t packed,int shift){
     int q=(packed>>shift)&0x0F;
     return q>=8 ? q-16 : q;
 }
+__device__ __forceinline__ int pack_i8x4(int q0,int q1,int q2,int q3){
+    uint32_t packed=((uint32_t)((uint8_t)((int8_t)q0))) |
+                    ((uint32_t)((uint8_t)((int8_t)q1))<<8) |
+                    ((uint32_t)((uint8_t)((int8_t)q2))<<16) |
+                    ((uint32_t)((uint8_t)((int8_t)q3))<<24);
+    return (int)packed;
+}
+__device__ __forceinline__ int pack_i4x4_to_i8x4(uint32_t packed,int shift){
+    return pack_i8x4(
+        unpack_i4_shift(packed,shift),
+        unpack_i4_shift(packed,shift+4),
+        unpack_i4_shift(packed,shift+8),
+        unpack_i4_shift(packed,shift+12)
+    );
+}
 __device__ __forceinline__ float packed_i4_at(const WeightT* row,int i,float scale){
     uint8_t packed=row[i>>1];
     return (float)unpack_i4(packed,(i&1)!=0)*scale;
+}
+__device__ __forceinline__ int dot_i4_i8_dp4a(const WeightT* row,const int8_t* x,int IN,int tid,int stride){
+    const uint32_t* row32=reinterpret_cast<const uint32_t*>(row);
+    const int* x4=reinterpret_cast<const int*>(x);
+    int packs8=IN>>3;
+    int acc=0;
+    for(int j=tid;j<packs8;j+=stride){
+        uint32_t packed=__ldg(row32+j);
+        int i4=j<<1;
+        acc=__dp4a(pack_i4x4_to_i8x4(packed,0),__ldg(x4+i4),acc);
+        acc=__dp4a(pack_i4x4_to_i8x4(packed,16),__ldg(x4+i4+1),acc);
+    }
+    for(int i=(packs8<<3)+tid;i<IN;i+=stride){
+        int q=unpack_i4(row[i>>1],(i&1)!=0);
+        acc+=q*(int)x[i];
+    }
+    return acc;
 }
 __device__ __forceinline__ float dot_weight_float_x(const WeightT* row,const float* x,int IN,int tid,int stride,float scale){
 #if USE_INT8_WEIGHTS
@@ -562,6 +597,106 @@ __global__ void gate_up_linear_kernel(
         __syncthreads();
     }
     if(tid==0) y[local_o]=sh[0]*weight_scale;
+}
+__global__ void quantize_int8_kernel(const float* x,int8_t* q,float* scale,int n){
+    __shared__ float sh[256];
+    int tid=threadIdx.x;
+    float m=0.0f;
+    for(int i=tid;i<n;i+=blockDim.x) m=fmaxf(m,fabsf(x[i]));
+    sh[tid]=m;
+    __syncthreads();
+    for(int stride=blockDim.x/2;stride>0;stride>>=1){
+        if(tid<stride) sh[tid]=fmaxf(sh[tid],sh[tid+stride]);
+        __syncthreads();
+    }
+    float max_abs=sh[0];
+    float inv=max_abs>0.0f ? 127.0f/max_abs : 0.0f;
+    if(tid==0) scale[0]=max_abs>0.0f ? max_abs/127.0f : 1.0f;
+    __syncthreads();
+    for(int i=tid;i<n;i+=blockDim.x){
+        int v=max_abs>0.0f ? (int)lrintf(x[i]*inv) : 0;
+        v=v<-127 ? -127 : (v>127 ? 127 : v);
+        q[i]=(int8_t)v;
+    }
+}
+__global__ void linear_i4_dp4a_kernel(const int8_t* xq,const float* x_scale,const WeightT* W,const float* scales,const float* b,float* y,int IN,int OUT){
+    __shared__ int sh[256];
+    int o=blockIdx.x;
+    int tid=threadIdx.x;
+    if(o>=OUT) return;
+    const WeightT* row=row_weight_ptr(W,o,IN);
+    int s=dot_i4_i8_dp4a(row,xq,IN,tid,blockDim.x);
+    sh[tid]=s;
+    __syncthreads();
+    for(int stride=blockDim.x/2;stride>0;stride>>=1){
+        if(tid<stride) sh[tid]+=sh[tid+stride];
+        __syncthreads();
+    }
+    if(tid==0){
+        float out=(float)sh[0]*row_scale_at(scales,o)*x_scale[0];
+        y[o]=b ? out+b[o] : out;
+    }
+}
+__global__ void qkv_i4_dp4a_kernel(
+    const int8_t* xq,const float* x_scale,
+    const WeightT* Wq,const WeightT* Wk,const WeightT* Wv,
+    const float* Sq,const float* Sk,const float* Sv,
+    const float* bq,const float* bk,const float* bv,
+    float* q,float* k,float* v,
+    int IN
+){
+    __shared__ int sh[256];
+    int o=blockIdx.x;
+    int tid=threadIdx.x;
+    const WeightT* W=nullptr;
+    const float* S=nullptr;
+    const float* b=nullptr;
+    float* y=nullptr;
+    int local_o=o;
+    if(o<HIDDEN){
+        W=Wq; S=Sq; b=bq; y=q;
+    }else if(o<HIDDEN+KV_DIM){
+        local_o=o-HIDDEN; W=Wk; S=Sk; b=bk; y=k;
+    }else{
+        local_o=o-HIDDEN-KV_DIM; W=Wv; S=Sv; b=bv; y=v;
+    }
+    const WeightT* row=row_weight_ptr(W,local_o,IN);
+    int s=dot_i4_i8_dp4a(row,xq,IN,tid,blockDim.x);
+    sh[tid]=s;
+    __syncthreads();
+    for(int stride=blockDim.x/2;stride>0;stride>>=1){
+        if(tid<stride) sh[tid]+=sh[tid+stride];
+        __syncthreads();
+    }
+    if(tid==0){
+        float out=(float)sh[0]*row_scale_at(S,local_o)*x_scale[0];
+        y[local_o]=b ? out+b[local_o] : out;
+    }
+}
+__global__ void gate_up_i4_dp4a_kernel(
+    const int8_t* xq,const float* x_scale,
+    const WeightT* Wgate,const WeightT* Wup,
+    const float* Sgate,const float* Sup,
+    float* gate,float* up,
+    int IN
+){
+    __shared__ int sh[256];
+    int o=blockIdx.x;
+    int tid=threadIdx.x;
+    bool is_gate=o<INTERMEDIATE;
+    int local_o=is_gate ? o : o-INTERMEDIATE;
+    const WeightT* W=is_gate ? Wgate : Wup;
+    const float* S=is_gate ? Sgate : Sup;
+    float* y=is_gate ? gate : up;
+    const WeightT* row=row_weight_ptr(W,local_o,IN);
+    int s=dot_i4_i8_dp4a(row,xq,IN,tid,blockDim.x);
+    sh[tid]=s;
+    __syncthreads();
+    for(int stride=blockDim.x/2;stride>0;stride>>=1){
+        if(tid<stride) sh[tid]+=sh[tid+stride];
+        __syncthreads();
+    }
+    if(tid==0) y[local_o]=(float)sh[0]*row_scale_at(S,local_o)*x_scale[0];
 }
 __global__ void float_to_half_kernel(const float* x,half* xh,int n){
     int i=blockIdx.x*blockDim.x+threadIdx.x;
@@ -873,7 +1008,9 @@ struct Work{
     float *gate=nullptr,*up=nullptr,*mid=nullptr,*mo=nullptr,*logits=nullptr;
     float *attn_scores=nullptr;
     float *argmax_vals=nullptr;
+    float *xq_scale=nullptr;
     int *argmax_ids=nullptr;
+    int8_t *xq=nullptr;
     half *wmma_x=nullptr;
 };
 struct Engine{
@@ -906,14 +1043,16 @@ static Work make_work(int max_seq){
     CK(cudaMalloc(&w.logits,VOCAB_SIZE*sizeof(float)));
     CK(cudaMalloc(&w.attn_scores,(size_t)N_HEADS*max_seq*sizeof(float)));
     CK(cudaMalloc(&w.argmax_vals,ARGMAX_BLOCKS*sizeof(float)));
+    CK(cudaMalloc(&w.xq_scale,sizeof(float)));
     CK(cudaMalloc(&w.argmax_ids,ARGMAX_BLOCKS*sizeof(int)));
+    CK(cudaMalloc(&w.xq,INTERMEDIATE*sizeof(int8_t)));
     CK(cudaMalloc(&w.wmma_x,INTERMEDIATE*sizeof(half)));
     return w;
 }
 static void free_work(Work& w){
     freep(w.x);freep(w.n);freep(w.q);freep(w.k);freep(w.v);freep(w.ctx);freep(w.ao);
     freep(w.gate);freep(w.up);freep(w.mid);freep(w.mo);freep(w.logits);freep(w.attn_scores);
-    freep(w.argmax_vals);freep(w.argmax_ids);freep(w.wmma_x);
+    freep(w.argmax_vals);freep(w.xq_scale);freep(w.argmax_ids);freep(w.xq);freep(w.wmma_x);
 }
 static Model load_model(const std::string& dir,int max_seq){
     ModelConfig cfg=load_config(dir);
@@ -965,17 +1104,24 @@ static void prepare_wmma_x(const float* x,half* xh,int n){
 static void launch_wmma_linear(const half* xh,const WeightMatrix& W,const float* b,float* y,int IN,int OUT){
     wmma_linear_kernel<<<(OUT+WMMA_TILE-1)/WMMA_TILE,32>>>(xh,W.data,b,y,IN,OUT);
 }
-static void launch_linear_from_float(const float* x,half* xh,const WeightMatrix& W,const float* b,float* y,int IN,int OUT){
+static void prepare_int8_x(const float* x,int8_t* xq,float* xq_scale,int n){
+    quantize_int8_kernel<<<1,256>>>(x,xq,xq_scale,n);
+}
+static void launch_linear_from_float(const float* x,half* xh,int8_t* xq,float* xq_scale,const WeightMatrix& W,const float* b,float* y,int IN,int OUT){
 #if USE_WMMA_LINEAR && !USE_INT8_WEIGHTS && !USE_INT4_WEIGHTS
     prepare_wmma_x(x,xh,IN);
     launch_wmma_linear(xh,W,b,y,IN,OUT);
+#elif USE_INT4_WEIGHTS && USE_INT4_DP4A
+    prepare_int8_x(x,xq,xq_scale,IN);
+    int B=LINEAR_THREADS;
+    linear_i4_dp4a_kernel<<<OUT,B>>>(xq,xq_scale,W.data,W.scale,b,y,IN,OUT);
 #else
     int B=LINEAR_THREADS;
     linear_kernel<<<OUT,B>>>(x,W.data,W.scale,b,y,IN,OUT);
 #endif
 }
 static void launch_qkv_from_float(
-    const float* x,half* xh,
+    const float* x,half* xh,int8_t* xq,float* xq_scale,
     const WeightMatrix& Wq,const WeightMatrix& Wk,const WeightMatrix& Wv,
     const float* bq,const float* bk,const float* bv,
     float* q,float* k,float* v,
@@ -986,13 +1132,17 @@ static void launch_qkv_from_float(
     launch_wmma_linear(xh,Wq,bq,q,IN,HIDDEN);
     launch_wmma_linear(xh,Wk,bk,k,IN,KV_DIM);
     launch_wmma_linear(xh,Wv,bv,v,IN,KV_DIM);
+#elif USE_INT4_WEIGHTS && USE_INT4_DP4A
+    prepare_int8_x(x,xq,xq_scale,IN);
+    int B=LINEAR_THREADS;
+    qkv_i4_dp4a_kernel<<<HIDDEN+2*KV_DIM,B>>>(xq,xq_scale,Wq.data,Wk.data,Wv.data,Wq.scale,Wk.scale,Wv.scale,bq,bk,bv,q,k,v,IN);
 #else
     int B=LINEAR_THREADS;
     qkv_linear_kernel<<<HIDDEN+2*KV_DIM,B>>>(x,Wq.data,Wk.data,Wv.data,Wq.scale,Wk.scale,Wv.scale,bq,bk,bv,q,k,v,IN);
 #endif
 }
 static void launch_gate_up_from_float(
-    const float* x,half* xh,
+    const float* x,half* xh,int8_t* xq,float* xq_scale,
     const WeightMatrix& Wgate,const WeightMatrix& Wup,
     float* gate,float* up,
     int IN
@@ -1001,6 +1151,10 @@ static void launch_gate_up_from_float(
     prepare_wmma_x(x,xh,IN);
     launch_wmma_linear(xh,Wgate,nullptr,gate,IN,INTERMEDIATE);
     launch_wmma_linear(xh,Wup,nullptr,up,IN,INTERMEDIATE);
+#elif USE_INT4_WEIGHTS && USE_INT4_DP4A
+    prepare_int8_x(x,xq,xq_scale,IN);
+    int B=LINEAR_THREADS;
+    gate_up_i4_dp4a_kernel<<<2*INTERMEDIATE,B>>>(xq,xq_scale,Wgate.data,Wup.data,Wgate.scale,Wup.scale,gate,up,IN);
 #else
     int B=LINEAR_THREADS;
     gate_up_linear_kernel<<<2*INTERMEDIATE,B>>>(x,Wgate.data,Wup.data,Wgate.scale,Wup.scale,gate,up,IN);
@@ -1013,14 +1167,14 @@ static void forward_token(const Model& m,Work& w,int token,int pos,int max_seq){
     rmsnorm_kernel<<<1,B,B*sizeof(float)>>>(w.x,m.layers[0].ln1,w.n,HIDDEN,m.rms_norm_eps);
     for(int i=0;i<N_LAYERS;i++){
         const Layer& l=m.layers[i];
-        launch_qkv_from_float(w.n,w.wmma_x,l.wq,l.wk,l.wv,l.bq,l.bk,l.bv,w.q,w.k,w.v,HIDDEN);
+        launch_qkv_from_float(w.n,w.wmma_x,w.xq,w.xq_scale,l.wq,l.wk,l.wv,l.bq,l.bk,l.bv,w.q,w.k,w.v,HIDDEN);
         rope_store_kv_kernel<<<(N_HEADS*(HEAD_DIM/2)+B-1)/B,B>>>(w.q,w.k,w.v,l.kc,l.vc,pos,m.rope_theta);
         attention_fused_kernel<<<N_HEADS,B>>>(w.q,l.kc,l.vc,w.attn_scores,w.ctx,pos,max_seq);
-        launch_linear_from_float(w.ctx,w.wmma_x,l.wo,nullptr,w.ao,HIDDEN,HIDDEN);
+        launch_linear_from_float(w.ctx,w.wmma_x,w.xq,w.xq_scale,l.wo,nullptr,w.ao,HIDDEN,HIDDEN);
         add_rmsnorm_kernel<<<1,B,B*sizeof(float)>>>(w.x,w.ao,l.ln2,w.n,HIDDEN,m.rms_norm_eps);
-        launch_gate_up_from_float(w.n,w.wmma_x,l.wgate,l.wup,w.gate,w.up,HIDDEN);
+        launch_gate_up_from_float(w.n,w.wmma_x,w.xq,w.xq_scale,l.wgate,l.wup,w.gate,w.up,HIDDEN);
         silu_mul_kernel<<<(INTERMEDIATE+B-1)/B,B>>>(w.gate,w.up,w.mid,INTERMEDIATE);
-        launch_linear_from_float(w.mid,w.wmma_x,l.wdown,nullptr,w.mo,INTERMEDIATE,HIDDEN);
+        launch_linear_from_float(w.mid,w.wmma_x,w.xq,w.xq_scale,l.wdown,nullptr,w.mo,INTERMEDIATE,HIDDEN);
         if(i+1<N_LAYERS){
             add_rmsnorm_kernel<<<1,B,B*sizeof(float)>>>(w.x,w.mo,m.layers[i+1].ln1,w.n,HIDDEN,m.rms_norm_eps);
         }else{
@@ -1028,7 +1182,7 @@ static void forward_token(const Model& m,Work& w,int token,int pos,int max_seq){
         }
     }
     rmsnorm_kernel<<<1,B,B*sizeof(float)>>>(w.x,m.norm,w.n,HIDDEN,m.rms_norm_eps);
-    launch_linear_from_float(w.n,w.wmma_x,m.lm,nullptr,w.logits,HIDDEN,VOCAB_SIZE);
+    launch_linear_from_float(w.n,w.wmma_x,w.xq,w.xq_scale,m.lm,nullptr,w.logits,HIDDEN,VOCAB_SIZE);
     CK(cudaDeviceSynchronize());
 }
 static int argmax_gpu_to_cpu(float* logits,const unsigned char* seen,float repetition_penalty,float* block_vals,int* block_ids,int* next_token){
