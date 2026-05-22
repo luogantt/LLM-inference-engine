@@ -37,6 +37,9 @@ constexpr float DEFAULT_ROPE_THETA=1000000.0f;
 #ifndef USE_ATTENTION_SHM
 #define USE_ATTENTION_SHM 0
 #endif
+#ifndef USE_FUSED_ROPE_ATTENTION
+#define USE_FUSED_ROPE_ATTENTION 0
+#endif
 #ifndef USE_INT8_WEIGHTS
 #define USE_INT8_WEIGHTS 0
 #endif
@@ -966,6 +969,78 @@ __global__ void attention_fused_kernel(const float* q,const float* kc,const floa
         ctx[h*HEAD_DIM+d]=out;
     }
 }
+__global__ void attention_rope_fused_kernel(
+    const float* q,const float* k,const float* v,
+    float* kc,float* vc,float* scores,float* ctx,
+    const float* rope_cos,const float* rope_sin,
+    int pos,int max_seq
+){
+    __shared__ float sh[256];
+    __shared__ float qsh[HEAD_DIM];
+    int h=blockIdx.x;
+    int tid=threadIdx.x;
+    int group=N_HEADS/N_KV_HEADS;
+    int kh=h/group;
+    int rp_base=pos*(HEAD_DIM/2);
+    const float* qh=q+h*HEAD_DIM;
+    const float* kk=k+kh*HEAD_DIM;
+    const float* vv=v+kh*HEAD_DIM;
+    float* kc_row=kc+(size_t)pos*KV_DIM+kh*HEAD_DIM;
+    float* vc_row=vc+(size_t)pos*KV_DIM+kh*HEAD_DIM;
+    if(tid<HEAD_DIM/2){
+        int d0=tid;
+        int d1=tid+(HEAD_DIM/2);
+        float c=__ldg(rope_cos+rp_base+tid);
+        float s=__ldg(rope_sin+rp_base+tid);
+        float q0=qh[d0],q1=qh[d1];
+        float k0=kk[d0],k1=kk[d1];
+        qsh[d0]=q0*c-q1*s;
+        qsh[d1]=q0*s+q1*c;
+        kc_row[d0]=k0*c-k1*s;
+        kc_row[d1]=k0*s+k1*c;
+    }
+    if(tid<HEAD_DIM) vc_row[tid]=vv[tid];
+    __syncthreads();
+    const float scale=rsqrtf((float)HEAD_DIM);
+    float mx=-INFINITY;
+    for(int t=tid;t<=pos;t+=blockDim.x){
+        const float* row=kc+(size_t)t*KV_DIM+kh*HEAD_DIM;
+        float dot=0.0f;
+#pragma unroll
+        for(int r=0;r<HEAD_DIM;r++) dot=fmaf(qsh[r],row[r],dot);
+        float s=dot*scale;
+        scores[(size_t)h*max_seq+t]=s;
+        mx=fmaxf(mx,s);
+    }
+    sh[tid]=mx;
+    __syncthreads();
+    for(int stride=blockDim.x/2;stride>0;stride>>=1){
+        if(tid<stride) sh[tid]=fmaxf(sh[tid],sh[tid+stride]);
+        __syncthreads();
+    }
+    mx=sh[0];
+    float den=0.0f;
+    for(int t=tid;t<=pos;t+=blockDim.x){
+        float e=expf(scores[(size_t)h*max_seq+t]-mx);
+        scores[(size_t)h*max_seq+t]=e;
+        den+=e;
+    }
+    sh[tid]=den;
+    __syncthreads();
+    for(int stride=blockDim.x/2;stride>0;stride>>=1){
+        if(tid<stride) sh[tid]+=sh[tid+stride];
+        __syncthreads();
+    }
+    float inv_den=1.0f/sh[0];
+    for(int d=tid;d<HEAD_DIM;d+=blockDim.x){
+        float out=0.0f;
+        for(int t=0;t<=pos;t++){
+            float p=scores[(size_t)h*max_seq+t]*inv_den;
+            out=fmaf(p,vc[(size_t)t*KV_DIM+kh*HEAD_DIM+d],out);
+        }
+        ctx[h*HEAD_DIM+d]=out;
+    }
+}
 __global__ void mark_token_seen_kernel(unsigned char* seen,int token){
     if(token>=0 && token<VOCAB_SIZE) seen[token]=1;
 }
@@ -1257,11 +1332,15 @@ static void forward_token(const Model& m,Work& w,int token,int pos,int max_seq){
     for(int i=0;i<N_LAYERS;i++){
         const Layer& l=m.layers[i];
         launch_qkv_from_float(w.n,w.wmma_x,w.xq,w.xq_scale,l.wq,l.wk,l.wv,l.bq,l.bk,l.bv,w.q,w.k,w.v,HIDDEN);
+#if USE_FUSED_ROPE_ATTENTION
+        attention_rope_fused_kernel<<<N_HEADS,B>>>(w.q,w.k,w.v,l.kc,l.vc,w.attn_scores,w.ctx,m.rope_cos,m.rope_sin,pos,max_seq);
+#else
         rope_store_kv_kernel<<<(N_HEADS*(HEAD_DIM/2)+B-1)/B,B>>>(w.q,w.k,w.v,l.kc,l.vc,m.rope_cos,m.rope_sin,pos);
 #if USE_ATTENTION_SHM
         attention_fused_kernel<<<N_HEADS,B,(B+HEAD_DIM+max_seq)*sizeof(float)>>>(w.q,l.kc,l.vc,w.attn_scores,w.ctx,pos,max_seq);
 #else
         attention_fused_kernel<<<N_HEADS,B>>>(w.q,l.kc,l.vc,w.attn_scores,w.ctx,pos,max_seq);
+#endif
 #endif
         launch_linear_from_float(w.ctx,w.wmma_x,w.xq,w.xq_scale,l.wo,nullptr,w.ao,HIDDEN,HIDDEN);
         add_rmsnorm_kernel<<<1,B,B*sizeof(float)>>>(w.x,w.ao,l.ln2,w.n,HIDDEN,m.rms_norm_eps);
