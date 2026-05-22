@@ -31,7 +31,18 @@ constexpr int INTERMEDIATE=18944;
 constexpr int VOCAB_SIZE=152064;
 constexpr float DEFAULT_RMS_NORM_EPS=1e-6f;
 constexpr float DEFAULT_ROPE_THETA=1000000.0f;
+#ifndef USE_INT8_WEIGHTS
+#define USE_INT8_WEIGHTS 0
+#endif
+#if USE_INT8_WEIGHTS
+using WeightT = int8_t;
+#else
 using WeightT = half;
+#endif
+struct WeightMatrix {
+    WeightT* data=nullptr;
+    float* scale=nullptr;
+};
 constexpr int WMMA_TILE=16;
 constexpr int LINEAR_THREADS=128;
 constexpr int ARGMAX_BLOCKS=256;
@@ -227,11 +238,57 @@ static float* load_tensor(const std::unordered_map<std::string,TensorMeta>& meta
     std::cout<<"[C++] loaded "<<name<<", dtype="<<t.dtype<<", numel="<<n<<"\n";
     return d;
 }
-static WeightT* load_tensor_bf16(const std::unordered_map<std::string,TensorMeta>& metas,const std::string& name){
+static WeightMatrix load_weight_tensor(const std::unordered_map<std::string,TensorMeta>& metas,const std::string& name){
     auto it=metas.find(name);
     if(it==metas.end()) throw std::runtime_error("missing tensor: "+name);
     auto& t=it->second; size_t n=numel(t.shape);
     auto raw=read_bytes(t);
+    WeightMatrix w;
+#if USE_INT8_WEIGHTS
+    size_t rows=t.shape.empty() ? 1 : t.shape[0];
+    if(rows==0 || n%rows!=0) throw std::runtime_error("bad weight shape for "+name);
+    size_t cols=n/rows;
+    std::vector<WeightT> h(n);
+    std::vector<float> scales(rows);
+    auto quantize_rows = [&](auto value_at){
+        for(size_t r=0;r<rows;r++){
+            float max_abs=0.0f;
+            size_t base=r*cols;
+            for(size_t c=0;c<cols;c++){
+                float v=value_at(base+c);
+                max_abs=fmaxf(max_abs,fabsf(v));
+            }
+            float inv=max_abs>0.0f ? 127.0f/max_abs : 0.0f;
+            float scale=max_abs>0.0f ? max_abs/127.0f : 1.0f;
+            scales[r]=scale;
+            for(size_t c=0;c<cols;c++){
+                int q=max_abs>0.0f ? (int)lrintf(value_at(base+c)*inv) : 0;
+                q=std::max(-127,std::min(127,q));
+                h[base+c]=(WeightT)q;
+            }
+        }
+    };
+    if(t.dtype=="BF16"){
+        if(raw.size()!=n*2) throw std::runtime_error("bad BF16 size "+name);
+        auto* p=(const uint16_t*)raw.data();
+        quantize_rows([&](size_t i){ return bf16_to_float(p[i]); });
+    }else if(t.dtype=="F16"){
+        if(raw.size()!=n*2) throw std::runtime_error("bad F16 size "+name);
+        auto* p=(const uint16_t*)raw.data();
+        quantize_rows([&](size_t i){ return f16_to_float(p[i]); });
+    }else if(t.dtype=="F32"){
+        if(raw.size()!=n*4) throw std::runtime_error("bad F32 size "+name);
+        auto* p=(const float*)raw.data();
+        quantize_rows([&](size_t i){ return p[i]; });
+    }else throw std::runtime_error("unsupported dtype "+t.dtype+" for "+name);
+    CK(cudaMalloc(&w.data,n*sizeof(WeightT)));
+    CK(cudaMemcpy(w.data,h.data(),n*sizeof(WeightT),cudaMemcpyHostToDevice));
+    CK(cudaMalloc(&w.scale,rows*sizeof(float)));
+    CK(cudaMemcpy(w.scale,scales.data(),rows*sizeof(float),cudaMemcpyHostToDevice));
+    std::cout<<"[C++] loaded "<<name<<", dtype="<<t.dtype
+             <<", stored=INT8(rowwise), rows="<<rows<<", cols="<<cols
+             <<", numel="<<n<<"\n";
+#else
     std::vector<WeightT> h(n);
     if(t.dtype=="BF16"){
         if(raw.size()!=n*2) throw std::runtime_error("bad BF16 size "+name);
@@ -245,15 +302,45 @@ static WeightT* load_tensor_bf16(const std::unordered_map<std::string,TensorMeta
         auto* p=(const float*)raw.data();
         for(size_t i=0;i<n;i++) h[i]=__float2half_rn(p[i]);
     }else throw std::runtime_error("unsupported dtype "+t.dtype+" for "+name);
-    WeightT* d=nullptr; CK(cudaMalloc(&d,n*sizeof(WeightT))); CK(cudaMemcpy(d,h.data(),n*sizeof(WeightT),cudaMemcpyHostToDevice));
+    CK(cudaMalloc(&w.data,n*sizeof(WeightT)));
+    CK(cudaMemcpy(w.data,h.data(),n*sizeof(WeightT),cudaMemcpyHostToDevice));
     std::cout<<"[C++] loaded "<<name<<", dtype="<<t.dtype<<", stored=FP16, numel="<<n<<"\n";
-    return d;
+#endif
+    return w;
 }
 
-__device__ __forceinline__ float weight_to_float(WeightT w){
+__device__ __forceinline__ float weight_to_float(WeightT w,float scale=1.0f){
+#if USE_INT8_WEIGHTS
+    return (float)w*scale;
+#else
     return __half2float(w);
+#endif
 }
-__device__ __forceinline__ float dot_weight_half2_float_x(const WeightT* row,const float* x,int IN,int tid,int stride){
+__device__ __forceinline__ float row_scale_at(const float* scales,int row){
+#if USE_INT8_WEIGHTS
+    return scales ? __ldg(scales+row) : 1.0f;
+#else
+    (void)scales; (void)row;
+    return 1.0f;
+#endif
+}
+__device__ __forceinline__ float dot_weight_float_x(const WeightT* row,const float* x,int IN,int tid,int stride,float scale){
+#if USE_INT8_WEIGHTS
+    const char4* row4=reinterpret_cast<const char4*>(row);
+    int packs=IN>>2;
+    float s=0.0f;
+    for(int j=tid;j<packs;j+=stride){
+        char4 q=row4[j];
+        int i=j<<2;
+        s=fmaf((float)q.x,__ldg(x+i),s);
+        s=fmaf((float)q.y,__ldg(x+i+1),s);
+        s=fmaf((float)q.z,__ldg(x+i+2),s);
+        s=fmaf((float)q.w,__ldg(x+i+3),s);
+    }
+    for(int i=(packs<<2)+tid;i<IN;i+=stride) s=fmaf((float)row[i],__ldg(x+i),s);
+    return s*scale;
+#else
+    (void)scale;
     const half2* row2=reinterpret_cast<const half2*>(row);
     int pairs=IN>>1;
     float s=0.0f;
@@ -266,11 +353,12 @@ __device__ __forceinline__ float dot_weight_half2_float_x(const WeightT* row,con
     }
     if((IN&1) && tid==0) s=fmaf(weight_to_float(row[IN-1]),__ldg(x+IN-1),s);
     return s;
+#endif
 }
 
-__global__ void embedding_kernel(int token,const WeightT* emb,float* x){
+__global__ void embedding_kernel(int token,const WeightT* emb,const float* scales,float* x){
     int i=blockIdx.x*blockDim.x+threadIdx.x;
-    if(i<HIDDEN) x[i]=weight_to_float(emb[(size_t)token*HIDDEN+i]);
+    if(i<HIDDEN) x[i]=weight_to_float(emb[(size_t)token*HIDDEN+i],row_scale_at(scales,token));
 }
 __global__ void rmsnorm_kernel(const float* x,const float* w,float* y,int D,float eps){
     extern __shared__ float sh[];
@@ -299,13 +387,13 @@ __global__ void add_rmsnorm_kernel(float* x,const float* res,const float* w,floa
     float inv=rsqrtf(sh[0]/D+eps);
     for(int i=tid;i<D;i+=blockDim.x) y[i]=x[i]*inv*w[i];
 }
-__global__ void linear_kernel(const float* x,const WeightT* W,const float* b,float* y,int IN,int OUT){
+__global__ void linear_kernel(const float* x,const WeightT* W,const float* scales,const float* b,float* y,int IN,int OUT){
     __shared__ float sh[256];
     int o=blockIdx.x;
     int tid=threadIdx.x;
     if(o>=OUT) return;
     const WeightT* row=W+(size_t)o*IN;
-    float s=dot_weight_half2_float_x(row,x,IN,tid,blockDim.x);
+    float s=dot_weight_float_x(row,x,IN,tid,blockDim.x,row_scale_at(scales,o));
     sh[tid]=s;
     __syncthreads();
     for(int stride=blockDim.x/2;stride>0;stride>>=1){
@@ -317,6 +405,7 @@ __global__ void linear_kernel(const float* x,const WeightT* W,const float* b,flo
 __global__ void qkv_linear_kernel(
     const float* x,
     const WeightT* Wq,const WeightT* Wk,const WeightT* Wv,
+    const float* Sq,const float* Sk,const float* Sv,
     const float* bq,const float* bk,const float* bv,
     float* q,float* k,float* v,
     int IN
@@ -325,18 +414,19 @@ __global__ void qkv_linear_kernel(
     int o=blockIdx.x;
     int tid=threadIdx.x;
     const WeightT* W=nullptr;
+    const float* S=nullptr;
     const float* b=nullptr;
     float* y=nullptr;
     int local_o=o;
     if(o<HIDDEN){
-        W=Wq; b=bq; y=q;
+        W=Wq; S=Sq; b=bq; y=q;
     }else if(o<HIDDEN+KV_DIM){
-        local_o=o-HIDDEN; W=Wk; b=bk; y=k;
+        local_o=o-HIDDEN; W=Wk; S=Sk; b=bk; y=k;
     }else{
-        local_o=o-HIDDEN-KV_DIM; W=Wv; b=bv; y=v;
+        local_o=o-HIDDEN-KV_DIM; W=Wv; S=Sv; b=bv; y=v;
     }
     const WeightT* row=W+(size_t)local_o*IN;
-    float s=dot_weight_half2_float_x(row,x,IN,tid,blockDim.x);
+    float s=dot_weight_float_x(row,x,IN,tid,blockDim.x,row_scale_at(S,local_o));
     sh[tid]=s;
     __syncthreads();
     for(int stride=blockDim.x/2;stride>0;stride>>=1){
@@ -348,6 +438,7 @@ __global__ void qkv_linear_kernel(
 __global__ void gate_up_linear_kernel(
     const float* x,
     const WeightT* Wgate,const WeightT* Wup,
+    const float* Sgate,const float* Sup,
     float* gate,float* up,
     int IN
 ){
@@ -357,9 +448,10 @@ __global__ void gate_up_linear_kernel(
     bool is_gate=o<INTERMEDIATE;
     int local_o=is_gate ? o : o-INTERMEDIATE;
     const WeightT* W=is_gate ? Wgate : Wup;
+    const float* S=is_gate ? Sgate : Sup;
     float* y=is_gate ? gate : up;
     const WeightT* row=W+(size_t)local_o*IN;
-    float s=dot_weight_half2_float_x(row,x,IN,tid,blockDim.x);
+    float s=dot_weight_float_x(row,x,IN,tid,blockDim.x,row_scale_at(S,local_o));
     sh[tid]=s;
     __syncthreads();
     for(int stride=blockDim.x/2;stride>0;stride>>=1){
@@ -373,7 +465,7 @@ __global__ void float_to_half_kernel(const float* x,half* xh,int n){
     if(i<n) xh[i]=__float2half_rn(x[i]);
 }
 __global__ void wmma_linear_kernel(const half* xh,const WeightT* W,const float* b,float* y,int IN,int OUT){
-#if __CUDA_ARCH__ >= 700
+#if !USE_INT8_WEIGHTS && __CUDA_ARCH__ >= 700
     using namespace nvcuda;
     __shared__ half a_tile[WMMA_TILE*WMMA_TILE];
     __shared__ half b_tile[WMMA_TILE*WMMA_TILE];
@@ -669,10 +761,10 @@ __global__ void argmax_stage2_kernel(const float* block_vals,const int* block_id
 
 struct Layer{
     float *ln1=nullptr,*ln2=nullptr,*bq=nullptr,*bk=nullptr,*bv=nullptr;
-    WeightT *wq=nullptr,*wk=nullptr,*wv=nullptr,*wo=nullptr,*wgate=nullptr,*wup=nullptr,*wdown=nullptr;
+    WeightMatrix wq,wk,wv,wo,wgate,wup,wdown;
     float *kc=nullptr,*vc=nullptr;
 };
-struct Model{WeightT *emb=nullptr,*lm=nullptr; float *norm=nullptr; float rms_norm_eps=DEFAULT_RMS_NORM_EPS,rope_theta=DEFAULT_ROPE_THETA; Layer layers[N_LAYERS];};
+struct Model{WeightMatrix emb,lm; float *norm=nullptr; float rms_norm_eps=DEFAULT_RMS_NORM_EPS,rope_theta=DEFAULT_ROPE_THETA; Layer layers[N_LAYERS];};
 struct Work{
     float *x=nullptr,*n=nullptr,*q=nullptr,*k=nullptr,*v=nullptr,*ctx=nullptr,*ao=nullptr;
     float *gate=nullptr,*up=nullptr,*mid=nullptr,*mo=nullptr,*logits=nullptr;
@@ -698,6 +790,7 @@ struct Engine{
 
 template <typename T>
 static void freep(T*& p){if(p){cudaFree(p);p=nullptr;}}
+static void free_weight(WeightMatrix& w){freep(w.data);freep(w.scale);}
 static std::string lname(int i,const std::string& s){return "model.layers."+std::to_string(i)+"."+s;}
 
 static Work make_work(int max_seq){
@@ -725,24 +818,24 @@ static Model load_model(const std::string& dir,int max_seq){
     Model m;
     m.rms_norm_eps=cfg.rms_norm_eps;
     m.rope_theta=cfg.rope_theta;
-    m.emb=load_tensor_bf16(metas,"model.embed_tokens.weight");
+    m.emb=load_weight_tensor(metas,"model.embed_tokens.weight");
     m.norm=load_tensor(metas,"model.norm.weight");
-    m.lm=load_tensor_bf16(metas,"lm_head.weight");
+    m.lm=load_weight_tensor(metas,"lm_head.weight");
     for(int i=0;i<N_LAYERS;i++){
         std::cout<<"\n[C++] loading layer "<<i<<"\n";
         Layer& l=m.layers[i];
         l.ln1=load_tensor(metas,lname(i,"input_layernorm.weight"));
         l.ln2=load_tensor(metas,lname(i,"post_attention_layernorm.weight"));
-        l.wq=load_tensor_bf16(metas,lname(i,"self_attn.q_proj.weight"));
-        l.wk=load_tensor_bf16(metas,lname(i,"self_attn.k_proj.weight"));
-        l.wv=load_tensor_bf16(metas,lname(i,"self_attn.v_proj.weight"));
-        l.wo=load_tensor_bf16(metas,lname(i,"self_attn.o_proj.weight"));
+        l.wq=load_weight_tensor(metas,lname(i,"self_attn.q_proj.weight"));
+        l.wk=load_weight_tensor(metas,lname(i,"self_attn.k_proj.weight"));
+        l.wv=load_weight_tensor(metas,lname(i,"self_attn.v_proj.weight"));
+        l.wo=load_weight_tensor(metas,lname(i,"self_attn.o_proj.weight"));
         l.bq=load_tensor(metas,lname(i,"self_attn.q_proj.bias"));
         l.bk=load_tensor(metas,lname(i,"self_attn.k_proj.bias"));
         l.bv=load_tensor(metas,lname(i,"self_attn.v_proj.bias"));
-        l.wgate=load_tensor_bf16(metas,lname(i,"mlp.gate_proj.weight"));
-        l.wup=load_tensor_bf16(metas,lname(i,"mlp.up_proj.weight"));
-        l.wdown=load_tensor_bf16(metas,lname(i,"mlp.down_proj.weight"));
+        l.wgate=load_weight_tensor(metas,lname(i,"mlp.gate_proj.weight"));
+        l.wup=load_weight_tensor(metas,lname(i,"mlp.up_proj.weight"));
+        l.wdown=load_weight_tensor(metas,lname(i,"mlp.down_proj.weight"));
         CK(cudaMalloc(&l.kc,(size_t)max_seq*KV_DIM*sizeof(float)));
         CK(cudaMalloc(&l.vc,(size_t)max_seq*KV_DIM*sizeof(float)));
         CK(cudaMemset(l.kc,0,(size_t)max_seq*KV_DIM*sizeof(float)));
@@ -751,11 +844,11 @@ static Model load_model(const std::string& dir,int max_seq){
     return m;
 }
 static void free_model(Model& m){
-    freep(m.emb); freep(m.norm); freep(m.lm);
+    free_weight(m.emb); freep(m.norm); free_weight(m.lm);
     for(int i=0;i<N_LAYERS;i++){
         Layer& l=m.layers[i];
-        freep(l.ln1);freep(l.ln2);freep(l.wq);freep(l.wk);freep(l.wv);freep(l.wo);
-        freep(l.bq);freep(l.bk);freep(l.bv);freep(l.wgate);freep(l.wup);freep(l.wdown);
+        freep(l.ln1);freep(l.ln2);free_weight(l.wq);free_weight(l.wk);free_weight(l.wv);free_weight(l.wo);
+        freep(l.bq);freep(l.bk);freep(l.bv);free_weight(l.wgate);free_weight(l.wup);free_weight(l.wdown);
         freep(l.kc);freep(l.vc);
     }
 }
@@ -766,54 +859,54 @@ static void prepare_wmma_x(const float* x,half* xh,int n){
     int B=256;
     float_to_half_kernel<<<(n+B-1)/B,B>>>(x,xh,n);
 }
-static void launch_wmma_linear(const half* xh,const WeightT* W,const float* b,float* y,int IN,int OUT){
-    wmma_linear_kernel<<<(OUT+WMMA_TILE-1)/WMMA_TILE,32>>>(xh,W,b,y,IN,OUT);
+static void launch_wmma_linear(const half* xh,const WeightMatrix& W,const float* b,float* y,int IN,int OUT){
+    wmma_linear_kernel<<<(OUT+WMMA_TILE-1)/WMMA_TILE,32>>>(xh,W.data,b,y,IN,OUT);
 }
-static void launch_linear_from_float(const float* x,half* xh,const WeightT* W,const float* b,float* y,int IN,int OUT){
-#if USE_WMMA_LINEAR
+static void launch_linear_from_float(const float* x,half* xh,const WeightMatrix& W,const float* b,float* y,int IN,int OUT){
+#if USE_WMMA_LINEAR && !USE_INT8_WEIGHTS
     prepare_wmma_x(x,xh,IN);
     launch_wmma_linear(xh,W,b,y,IN,OUT);
 #else
     int B=LINEAR_THREADS;
-    linear_kernel<<<OUT,B>>>(x,W,b,y,IN,OUT);
+    linear_kernel<<<OUT,B>>>(x,W.data,W.scale,b,y,IN,OUT);
 #endif
 }
 static void launch_qkv_from_float(
     const float* x,half* xh,
-    const WeightT* Wq,const WeightT* Wk,const WeightT* Wv,
+    const WeightMatrix& Wq,const WeightMatrix& Wk,const WeightMatrix& Wv,
     const float* bq,const float* bk,const float* bv,
     float* q,float* k,float* v,
     int IN
 ){
-#if USE_WMMA_LINEAR
+#if USE_WMMA_LINEAR && !USE_INT8_WEIGHTS
     prepare_wmma_x(x,xh,IN);
     launch_wmma_linear(xh,Wq,bq,q,IN,HIDDEN);
     launch_wmma_linear(xh,Wk,bk,k,IN,KV_DIM);
     launch_wmma_linear(xh,Wv,bv,v,IN,KV_DIM);
 #else
     int B=LINEAR_THREADS;
-    qkv_linear_kernel<<<HIDDEN+2*KV_DIM,B>>>(x,Wq,Wk,Wv,bq,bk,bv,q,k,v,IN);
+    qkv_linear_kernel<<<HIDDEN+2*KV_DIM,B>>>(x,Wq.data,Wk.data,Wv.data,Wq.scale,Wk.scale,Wv.scale,bq,bk,bv,q,k,v,IN);
 #endif
 }
 static void launch_gate_up_from_float(
     const float* x,half* xh,
-    const WeightT* Wgate,const WeightT* Wup,
+    const WeightMatrix& Wgate,const WeightMatrix& Wup,
     float* gate,float* up,
     int IN
 ){
-#if USE_WMMA_LINEAR
+#if USE_WMMA_LINEAR && !USE_INT8_WEIGHTS
     prepare_wmma_x(x,xh,IN);
     launch_wmma_linear(xh,Wgate,nullptr,gate,IN,INTERMEDIATE);
     launch_wmma_linear(xh,Wup,nullptr,up,IN,INTERMEDIATE);
 #else
     int B=LINEAR_THREADS;
-    gate_up_linear_kernel<<<2*INTERMEDIATE,B>>>(x,Wgate,Wup,gate,up,IN);
+    gate_up_linear_kernel<<<2*INTERMEDIATE,B>>>(x,Wgate.data,Wup.data,Wgate.scale,Wup.scale,gate,up,IN);
 #endif
 }
 static void forward_token(const Model& m,Work& w,int token,int pos,int max_seq){
     if(token<0||token>=VOCAB_SIZE) throw std::runtime_error("bad token id "+std::to_string(token));
     int B=256;
-    embedding_kernel<<<(HIDDEN+B-1)/B,B>>>(token,m.emb,w.x);
+    embedding_kernel<<<(HIDDEN+B-1)/B,B>>>(token,m.emb.data,m.emb.scale,w.x);
     rmsnorm_kernel<<<1,B,B*sizeof(float)>>>(w.x,m.layers[0].ln1,w.n,HIDDEN,m.rms_norm_eps);
     for(int i=0;i<N_LAYERS;i++){
         const Layer& l=m.layers[i];
