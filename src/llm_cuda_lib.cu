@@ -378,36 +378,55 @@ __device__ __forceinline__ int unpack_i4(uint8_t packed,bool high){
     int q=high ? ((packed>>4)&0x0F) : (packed&0x0F);
     return q>=8 ? q-16 : q;
 }
+__device__ __forceinline__ int unpack_i4_shift(uint32_t packed,int shift){
+    int q=(packed>>shift)&0x0F;
+    return q>=8 ? q-16 : q;
+}
 __device__ __forceinline__ float packed_i4_at(const WeightT* row,int i,float scale){
     uint8_t packed=row[i>>1];
     return (float)unpack_i4(packed,(i&1)!=0)*scale;
 }
 __device__ __forceinline__ float dot_weight_float_x(const WeightT* row,const float* x,int IN,int tid,int stride,float scale){
 #if USE_INT8_WEIGHTS
+    (void)scale;
     const char4* row4=reinterpret_cast<const char4*>(row);
     int packs=IN>>2;
-    float s=0.0f;
+    float s0=0.0f,s1=0.0f,s2=0.0f,s3=0.0f;
     for(int j=tid;j<packs;j+=stride){
         char4 q=row4[j];
         int i=j<<2;
-        s=fmaf((float)q.x,__ldg(x+i),s);
-        s=fmaf((float)q.y,__ldg(x+i+1),s);
-        s=fmaf((float)q.z,__ldg(x+i+2),s);
-        s=fmaf((float)q.w,__ldg(x+i+3),s);
+        s0=fmaf((float)q.x,__ldg(x+i),s0);
+        s1=fmaf((float)q.y,__ldg(x+i+1),s1);
+        s2=fmaf((float)q.z,__ldg(x+i+2),s2);
+        s3=fmaf((float)q.w,__ldg(x+i+3),s3);
     }
-    for(int i=(packs<<2)+tid;i<IN;i+=stride) s=fmaf((float)row[i],__ldg(x+i),s);
-    return s*scale;
+    for(int i=(packs<<2)+tid;i<IN;i+=stride) s0=fmaf((float)row[i],__ldg(x+i),s0);
+    return (s0+s1)+(s2+s3);
 #elif USE_INT4_WEIGHTS
-    int packs=IN>>1;
-    float s=0.0f;
-    for(int j=tid;j<packs;j+=stride){
+    (void)scale;
+    const uint32_t* row32=reinterpret_cast<const uint32_t*>(row);
+    int packed_bytes=(IN+1)>>1;
+    int packs32=packed_bytes>>2;
+    float s0=0.0f,s1=0.0f,s2=0.0f,s3=0.0f;
+    for(int j=tid;j<packs32;j+=stride){
+        uint32_t packed=__ldg(row32+j);
+        int i=j<<3;
+        s0=fmaf((float)unpack_i4_shift(packed,0),__ldg(x+i),s0);
+        s1=fmaf((float)unpack_i4_shift(packed,4),__ldg(x+i+1),s1);
+        s2=fmaf((float)unpack_i4_shift(packed,8),__ldg(x+i+2),s2);
+        s3=fmaf((float)unpack_i4_shift(packed,12),__ldg(x+i+3),s3);
+        s0=fmaf((float)unpack_i4_shift(packed,16),__ldg(x+i+4),s0);
+        s1=fmaf((float)unpack_i4_shift(packed,20),__ldg(x+i+5),s1);
+        s2=fmaf((float)unpack_i4_shift(packed,24),__ldg(x+i+6),s2);
+        s3=fmaf((float)unpack_i4_shift(packed,28),__ldg(x+i+7),s3);
+    }
+    for(int j=(packs32<<2)+tid;j<packed_bytes;j+=stride){
         uint8_t packed=row[j];
         int i=j<<1;
-        s=fmaf((float)unpack_i4(packed,false),__ldg(x+i),s);
-        s=fmaf((float)unpack_i4(packed,true),__ldg(x+i+1),s);
+        if(i<IN) s0=fmaf((float)unpack_i4(packed,false),__ldg(x+i),s0);
+        if(i+1<IN) s1=fmaf((float)unpack_i4(packed,true),__ldg(x+i+1),s1);
     }
-    if((IN&1) && tid==0) s=fmaf((float)unpack_i4(row[packs],false),__ldg(x+IN-1),s);
-    return s*scale;
+    return (s0+s1)+(s2+s3);
 #else
     (void)scale;
     const half2* row2=reinterpret_cast<const half2*>(row);
@@ -468,14 +487,18 @@ __global__ void linear_kernel(const float* x,const WeightT* W,const float* scale
     int tid=threadIdx.x;
     if(o>=OUT) return;
     const WeightT* row=row_weight_ptr(W,o,IN);
-    float s=dot_weight_float_x(row,x,IN,tid,blockDim.x,row_scale_at(scales,o));
+    float weight_scale=row_scale_at(scales,o);
+    float s=dot_weight_float_x(row,x,IN,tid,blockDim.x,weight_scale);
     sh[tid]=s;
     __syncthreads();
     for(int stride=blockDim.x/2;stride>0;stride>>=1){
         if(tid<stride) sh[tid]+=sh[tid+stride];
         __syncthreads();
     }
-    if(tid==0) y[o]=b ? sh[0]+b[o] : sh[0];
+    if(tid==0){
+        float out=sh[0]*weight_scale;
+        y[o]=b ? out+b[o] : out;
+    }
 }
 __global__ void qkv_linear_kernel(
     const float* x,
@@ -501,14 +524,18 @@ __global__ void qkv_linear_kernel(
         local_o=o-HIDDEN-KV_DIM; W=Wv; S=Sv; b=bv; y=v;
     }
     const WeightT* row=row_weight_ptr(W,local_o,IN);
-    float s=dot_weight_float_x(row,x,IN,tid,blockDim.x,row_scale_at(S,local_o));
+    float weight_scale=row_scale_at(S,local_o);
+    float s=dot_weight_float_x(row,x,IN,tid,blockDim.x,weight_scale);
     sh[tid]=s;
     __syncthreads();
     for(int stride=blockDim.x/2;stride>0;stride>>=1){
         if(tid<stride) sh[tid]+=sh[tid+stride];
         __syncthreads();
     }
-    if(tid==0) y[local_o]=b ? sh[0]+b[local_o] : sh[0];
+    if(tid==0){
+        float out=sh[0]*weight_scale;
+        y[local_o]=b ? out+b[local_o] : out;
+    }
 }
 __global__ void gate_up_linear_kernel(
     const float* x,
@@ -526,14 +553,15 @@ __global__ void gate_up_linear_kernel(
     const float* S=is_gate ? Sgate : Sup;
     float* y=is_gate ? gate : up;
     const WeightT* row=row_weight_ptr(W,local_o,IN);
-    float s=dot_weight_float_x(row,x,IN,tid,blockDim.x,row_scale_at(S,local_o));
+    float weight_scale=row_scale_at(S,local_o);
+    float s=dot_weight_float_x(row,x,IN,tid,blockDim.x,weight_scale);
     sh[tid]=s;
     __syncthreads();
     for(int stride=blockDim.x/2;stride>0;stride>>=1){
         if(tid<stride) sh[tid]+=sh[tid+stride];
         __syncthreads();
     }
-    if(tid==0) y[local_o]=sh[0];
+    if(tid==0) y[local_o]=sh[0]*weight_scale;
 }
 __global__ void float_to_half_kernel(const float* x,half* xh,int n){
     int i=blockIdx.x*blockDim.x+threadIdx.x;
