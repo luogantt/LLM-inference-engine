@@ -31,6 +31,9 @@ constexpr int INTERMEDIATE=18944;
 constexpr int VOCAB_SIZE=152064;
 constexpr float DEFAULT_RMS_NORM_EPS=1e-6f;
 constexpr float DEFAULT_ROPE_THETA=1000000.0f;
+#ifndef LINEAR_THREADS_CFG
+#define LINEAR_THREADS_CFG 128
+#endif
 #ifndef USE_INT8_WEIGHTS
 #define USE_INT8_WEIGHTS 0
 #endif
@@ -58,7 +61,7 @@ struct WeightMatrix {
     float* scale=nullptr;
 };
 constexpr int WMMA_TILE=16;
-constexpr int LINEAR_THREADS=128;
+constexpr int LINEAR_THREADS=LINEAR_THREADS_CFG;
 constexpr int ARGMAX_BLOCKS=256;
 #ifndef USE_WMMA_LINEAR
 #define USE_WMMA_LINEAR 0
@@ -412,12 +415,13 @@ __device__ __forceinline__ int pack_i8x4(int q0,int q1,int q2,int q3){
     return (int)packed;
 }
 __device__ __forceinline__ int pack_i4x4_to_i8x4(uint32_t packed,int shift){
-    return pack_i8x4(
-        unpack_i4_shift(packed,shift),
-        unpack_i4_shift(packed,shift+4),
-        unpack_i4_shift(packed,shift+8),
-        unpack_i4_shift(packed,shift+12)
-    );
+    uint32_t x=(packed>>shift)&0xFFFFu;
+    uint32_t y=(x&0x000Fu) |
+               ((x&0x00F0u)<<4) |
+               ((x&0x0F00u)<<8) |
+               ((x&0xF000u)<<12);
+    y|=(y&0x08080808u)*0x1Eu;
+    return (int)y;
 }
 __device__ __forceinline__ float packed_i4_at(const WeightT* row,int i,float scale){
     uint8_t packed=row[i>>1];

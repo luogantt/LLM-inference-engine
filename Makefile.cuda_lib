@@ -5,7 +5,7 @@ COMMON_FLAGS = -O3 -std=c++17 -lineinfo
 
 .RECIPEPREFIX := >
 
-.PHONY: lib lib-int8 lib-int4 lib-int4-packed lib-int4-float clean-lib
+.PHONY: lib lib-int8 lib-int4 lib-int4-t64 lib-int4-t256 lib-int4-prepack lib-int4-float clean-lib
 
 lib:
 >mkdir -p build
@@ -17,11 +17,19 @@ lib-int8:
 
 lib-int4:
 >mkdir -p build
->$(NVCC) $(COMMON_FLAGS) -DUSE_INT4_WEIGHTS=1 -DUSE_INT4_DP4A=1 -DUSE_INT4_DP4A_PREPACK=1 -arch=$(A) -Xcompiler -fPIC -shared src/llm_cuda_lib.cu -o build/libllm_cuda.so
-
-lib-int4-packed:
->mkdir -p build
 >$(NVCC) $(COMMON_FLAGS) -DUSE_INT4_WEIGHTS=1 -DUSE_INT4_DP4A=1 -arch=$(A) -Xcompiler -fPIC -shared src/llm_cuda_lib.cu -o build/libllm_cuda.so
+
+lib-int4-t64:
+>mkdir -p build
+>$(NVCC) $(COMMON_FLAGS) -DUSE_INT4_WEIGHTS=1 -DUSE_INT4_DP4A=1 -DLINEAR_THREADS_CFG=64 -arch=$(A) -Xcompiler -fPIC -shared src/llm_cuda_lib.cu -o build/libllm_cuda.so
+
+lib-int4-t256:
+>mkdir -p build
+>$(NVCC) $(COMMON_FLAGS) -DUSE_INT4_WEIGHTS=1 -DUSE_INT4_DP4A=1 -DLINEAR_THREADS_CFG=256 -arch=$(A) -Xcompiler -fPIC -shared src/llm_cuda_lib.cu -o build/libllm_cuda.so
+
+lib-int4-prepack:
+>mkdir -p build
+>$(NVCC) $(COMMON_FLAGS) -DUSE_INT4_WEIGHTS=1 -DUSE_INT4_DP4A=1 -DUSE_INT4_DP4A_PREPACK=1 -arch=$(A) -Xcompiler -fPIC -shared src/llm_cuda_lib.cu -o build/libllm_cuda.so
 
 lib-int4-float:
 >mkdir -p build
