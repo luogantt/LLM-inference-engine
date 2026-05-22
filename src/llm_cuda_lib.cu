@@ -40,6 +40,9 @@ constexpr float DEFAULT_ROPE_THETA=1000000.0f;
 #ifndef USE_FUSED_ROPE_ATTENTION
 #define USE_FUSED_ROPE_ATTENTION 0
 #endif
+#ifndef USE_FUSED_MLP_QUANT
+#define USE_FUSED_MLP_QUANT 0
+#endif
 #ifndef USE_INT8_WEIGHTS
 #define USE_INT8_WEIGHTS 0
 #endif
@@ -791,6 +794,33 @@ __global__ void silu_mul_kernel(const float* g,const float* u,float* o,int n){
     int i=blockIdx.x*blockDim.x+threadIdx.x;
     if(i<n){float x=g[i]; o[i]=(x/(1.f+expf(-x)))*u[i];}
 }
+__global__ void silu_quantize_int8_kernel(const float* g,const float* u,int8_t* q,float* scale,int n){
+    __shared__ float sh[256];
+    int tid=threadIdx.x;
+    float m=0.0f;
+    for(int i=tid;i<n;i+=blockDim.x){
+        float x=g[i];
+        float v=(x/(1.f+expf(-x)))*u[i];
+        m=fmaxf(m,fabsf(v));
+    }
+    sh[tid]=m;
+    __syncthreads();
+    for(int stride=blockDim.x/2;stride>0;stride>>=1){
+        if(tid<stride) sh[tid]=fmaxf(sh[tid],sh[tid+stride]);
+        __syncthreads();
+    }
+    float max_abs=sh[0];
+    float inv=max_abs>0.0f ? 127.0f/max_abs : 0.0f;
+    if(tid==0) scale[0]=max_abs>0.0f ? max_abs/127.0f : 1.0f;
+    __syncthreads();
+    for(int i=tid;i<n;i+=blockDim.x){
+        float x=g[i];
+        float y=(x/(1.f+expf(-x)))*u[i];
+        int v=max_abs>0.0f ? (int)lrintf(y*inv) : 0;
+        v=v<-127 ? -127 : (v>127 ? 127 : v);
+        q[i]=(int8_t)v;
+    }
+}
 __global__ void rope_kernel(float* x,int heads,int pos,float rope_theta){
     int pair=blockIdx.x*blockDim.x+threadIdx.x;
     int total=heads*(HEAD_DIM/2); if(pair>=total) return;
@@ -1271,6 +1301,9 @@ static void launch_wmma_linear(const half* xh,const WeightMatrix& W,const float*
 static void prepare_int8_x(const float* x,int8_t* xq,float* xq_scale,int n){
     quantize_int8_kernel<<<1,256>>>(x,xq,xq_scale,n);
 }
+static void prepare_silu_int8_x(const float* gate,const float* up,int8_t* xq,float* xq_scale,int n){
+    silu_quantize_int8_kernel<<<1,256>>>(gate,up,xq,xq_scale,n);
+}
 static void launch_linear_from_float(const float* x,half* xh,int8_t* xq,float* xq_scale,const WeightMatrix& W,const float* b,float* y,int IN,int OUT){
 #if USE_WMMA_LINEAR && !USE_INT8_WEIGHTS && !USE_INT4_WEIGHTS
     prepare_wmma_x(x,xh,IN);
@@ -1345,8 +1378,13 @@ static void forward_token(const Model& m,Work& w,int token,int pos,int max_seq){
         launch_linear_from_float(w.ctx,w.wmma_x,w.xq,w.xq_scale,l.wo,nullptr,w.ao,HIDDEN,HIDDEN);
         add_rmsnorm_kernel<<<1,B,B*sizeof(float)>>>(w.x,w.ao,l.ln2,w.n,HIDDEN,m.rms_norm_eps);
         launch_gate_up_from_float(w.n,w.wmma_x,w.xq,w.xq_scale,l.wgate,l.wup,w.gate,w.up,HIDDEN);
+#if USE_INT4_WEIGHTS && USE_INT4_DP4A && USE_FUSED_MLP_QUANT
+        prepare_silu_int8_x(w.gate,w.up,w.xq,w.xq_scale,INTERMEDIATE);
+        linear_i4_dp4a_kernel<<<HIDDEN,LINEAR_THREADS>>>(w.xq,w.xq_scale,l.wdown.data,l.wdown.scale,nullptr,w.mo,INTERMEDIATE,HIDDEN);
+#else
         silu_mul_kernel<<<(INTERMEDIATE+B-1)/B,B>>>(w.gate,w.up,w.mid,INTERMEDIATE);
         launch_linear_from_float(w.mid,w.wmma_x,w.xq,w.xq_scale,l.wdown,nullptr,w.mo,INTERMEDIATE,HIDDEN);
+#endif
         if(i+1<N_LAYERS){
             add_rmsnorm_kernel<<<1,B,B*sizeof(float)>>>(w.x,w.mo,m.layers[i+1].ln1,w.n,HIDDEN,m.rms_norm_eps);
         }else{
