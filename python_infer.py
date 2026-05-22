@@ -87,6 +87,16 @@ class CudaLLM:
             self.handle = None
 
 
+def normalize_token_ids(ids) -> List[int]:
+    if hasattr(ids, "keys") and "input_ids" in ids:
+        ids = ids["input_ids"]
+    if hasattr(ids, "tolist"):
+        ids = ids.tolist()
+    while isinstance(ids, (list, tuple)) and len(ids) == 1 and isinstance(ids[0], (list, tuple)):
+        ids = ids[0]
+    return [int(x) for x in ids]
+
+
 def encode_prompt(tokenizer, prompt: str, use_chat_template: bool) -> List[int]:
     if use_chat_template and getattr(tokenizer, "chat_template", None):
         messages = [{"role": "user", "content": prompt}]
@@ -95,9 +105,9 @@ def encode_prompt(tokenizer, prompt: str, use_chat_template: bool) -> List[int]:
             tokenize=True,
             add_generation_prompt=True,
         )
-        return [int(x) for x in ids]
+        return normalize_token_ids(ids)
 
-    return [int(x) for x in tokenizer.encode(prompt, add_special_tokens=True)]
+    return normalize_token_ids(tokenizer.encode(prompt, add_special_tokens=True))
 
 
 def eos_set(tokenizer):
