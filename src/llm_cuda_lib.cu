@@ -34,7 +34,15 @@ constexpr float DEFAULT_ROPE_THETA=1000000.0f;
 #ifndef USE_INT8_WEIGHTS
 #define USE_INT8_WEIGHTS 0
 #endif
-#if USE_INT8_WEIGHTS
+#ifndef USE_INT4_WEIGHTS
+#define USE_INT4_WEIGHTS 0
+#endif
+#if USE_INT8_WEIGHTS && USE_INT4_WEIGHTS
+#error "USE_INT8_WEIGHTS and USE_INT4_WEIGHTS cannot both be enabled"
+#endif
+#if USE_INT4_WEIGHTS
+using WeightT = uint8_t;
+#elif USE_INT8_WEIGHTS
 using WeightT = int8_t;
 #else
 using WeightT = half;
@@ -244,11 +252,17 @@ static WeightMatrix load_weight_tensor(const std::unordered_map<std::string,Tens
     auto& t=it->second; size_t n=numel(t.shape);
     auto raw=read_bytes(t);
     WeightMatrix w;
-#if USE_INT8_WEIGHTS
+#if USE_INT8_WEIGHTS || USE_INT4_WEIGHTS
     size_t rows=t.shape.empty() ? 1 : t.shape[0];
     if(rows==0 || n%rows!=0) throw std::runtime_error("bad weight shape for "+name);
     size_t cols=n/rows;
+#if USE_INT4_WEIGHTS
+    size_t packed_cols=(cols+1)/2;
+    size_t packed_n=rows*packed_cols;
+    std::vector<WeightT> h(packed_n);
+#else
     std::vector<WeightT> h(n);
+#endif
     std::vector<float> scales(rows);
     auto quantize_rows = [&](auto value_at){
         for(size_t r=0;r<rows;r++){
@@ -258,14 +272,33 @@ static WeightMatrix load_weight_tensor(const std::unordered_map<std::string,Tens
                 float v=value_at(base+c);
                 max_abs=fmaxf(max_abs,fabsf(v));
             }
+#if USE_INT4_WEIGHTS
+            float inv=max_abs>0.0f ? 7.0f/max_abs : 0.0f;
+            float scale=max_abs>0.0f ? max_abs/7.0f : 1.0f;
+#else
             float inv=max_abs>0.0f ? 127.0f/max_abs : 0.0f;
             float scale=max_abs>0.0f ? max_abs/127.0f : 1.0f;
+#endif
             scales[r]=scale;
+#if USE_INT4_WEIGHTS
+            size_t packed_base=r*packed_cols;
+            for(size_t c=0;c<cols;c+=2){
+                int q0=max_abs>0.0f ? (int)lrintf(value_at(base+c)*inv) : 0;
+                q0=std::max(-7,std::min(7,q0));
+                int q1=0;
+                if(c+1<cols){
+                    q1=max_abs>0.0f ? (int)lrintf(value_at(base+c+1)*inv) : 0;
+                    q1=std::max(-7,std::min(7,q1));
+                }
+                h[packed_base+(c>>1)]=(WeightT)((q0&0x0F)|((q1&0x0F)<<4));
+            }
+#else
             for(size_t c=0;c<cols;c++){
                 int q=max_abs>0.0f ? (int)lrintf(value_at(base+c)*inv) : 0;
                 q=std::max(-127,std::min(127,q));
                 h[base+c]=(WeightT)q;
             }
+#endif
         }
     };
     if(t.dtype=="BF16"){
@@ -281,13 +314,19 @@ static WeightMatrix load_weight_tensor(const std::unordered_map<std::string,Tens
         auto* p=(const float*)raw.data();
         quantize_rows([&](size_t i){ return p[i]; });
     }else throw std::runtime_error("unsupported dtype "+t.dtype+" for "+name);
-    CK(cudaMalloc(&w.data,n*sizeof(WeightT)));
-    CK(cudaMemcpy(w.data,h.data(),n*sizeof(WeightT),cudaMemcpyHostToDevice));
+    CK(cudaMalloc(&w.data,h.size()*sizeof(WeightT)));
+    CK(cudaMemcpy(w.data,h.data(),h.size()*sizeof(WeightT),cudaMemcpyHostToDevice));
     CK(cudaMalloc(&w.scale,rows*sizeof(float)));
     CK(cudaMemcpy(w.scale,scales.data(),rows*sizeof(float),cudaMemcpyHostToDevice));
+#if USE_INT4_WEIGHTS
+    std::cout<<"[C++] loaded "<<name<<", dtype="<<t.dtype
+             <<", stored=INT4(rowwise), rows="<<rows<<", cols="<<cols
+             <<", packed_bytes="<<h.size()<<", numel="<<n<<"\n";
+#else
     std::cout<<"[C++] loaded "<<name<<", dtype="<<t.dtype
              <<", stored=INT8(rowwise), rows="<<rows<<", cols="<<cols
              <<", numel="<<n<<"\n";
+#endif
 #else
     std::vector<WeightT> h(n);
     if(t.dtype=="BF16"){
@@ -312,17 +351,36 @@ static WeightMatrix load_weight_tensor(const std::unordered_map<std::string,Tens
 __device__ __forceinline__ float weight_to_float(WeightT w,float scale=1.0f){
 #if USE_INT8_WEIGHTS
     return (float)w*scale;
+#elif USE_INT4_WEIGHTS
+    int q=(int)(w&0x0F);
+    q=(q>=8) ? q-16 : q;
+    return (float)q*scale;
 #else
     return __half2float(w);
 #endif
 }
 __device__ __forceinline__ float row_scale_at(const float* scales,int row){
-#if USE_INT8_WEIGHTS
+#if USE_INT8_WEIGHTS || USE_INT4_WEIGHTS
     return scales ? __ldg(scales+row) : 1.0f;
 #else
     (void)scales; (void)row;
     return 1.0f;
 #endif
+}
+__device__ __forceinline__ const WeightT* row_weight_ptr(const WeightT* W,int row,int IN){
+#if USE_INT4_WEIGHTS
+    return W+(size_t)row*((IN+1)>>1);
+#else
+    return W+(size_t)row*IN;
+#endif
+}
+__device__ __forceinline__ int unpack_i4(uint8_t packed,bool high){
+    int q=high ? ((packed>>4)&0x0F) : (packed&0x0F);
+    return q>=8 ? q-16 : q;
+}
+__device__ __forceinline__ float packed_i4_at(const WeightT* row,int i,float scale){
+    uint8_t packed=row[i>>1];
+    return (float)unpack_i4(packed,(i&1)!=0)*scale;
 }
 __device__ __forceinline__ float dot_weight_float_x(const WeightT* row,const float* x,int IN,int tid,int stride,float scale){
 #if USE_INT8_WEIGHTS
@@ -338,6 +396,17 @@ __device__ __forceinline__ float dot_weight_float_x(const WeightT* row,const flo
         s=fmaf((float)q.w,__ldg(x+i+3),s);
     }
     for(int i=(packs<<2)+tid;i<IN;i+=stride) s=fmaf((float)row[i],__ldg(x+i),s);
+    return s*scale;
+#elif USE_INT4_WEIGHTS
+    int packs=IN>>1;
+    float s=0.0f;
+    for(int j=tid;j<packs;j+=stride){
+        uint8_t packed=row[j];
+        int i=j<<1;
+        s=fmaf((float)unpack_i4(packed,false),__ldg(x+i),s);
+        s=fmaf((float)unpack_i4(packed,true),__ldg(x+i+1),s);
+    }
+    if((IN&1) && tid==0) s=fmaf((float)unpack_i4(row[packs],false),__ldg(x+IN-1),s);
     return s*scale;
 #else
     (void)scale;
@@ -358,7 +427,13 @@ __device__ __forceinline__ float dot_weight_float_x(const WeightT* row,const flo
 
 __global__ void embedding_kernel(int token,const WeightT* emb,const float* scales,float* x){
     int i=blockIdx.x*blockDim.x+threadIdx.x;
-    if(i<HIDDEN) x[i]=weight_to_float(emb[(size_t)token*HIDDEN+i],row_scale_at(scales,token));
+    if(i<HIDDEN){
+#if USE_INT4_WEIGHTS
+        x[i]=packed_i4_at(row_weight_ptr(emb,token,HIDDEN),i,row_scale_at(scales,token));
+#else
+        x[i]=weight_to_float(emb[(size_t)token*HIDDEN+i],row_scale_at(scales,token));
+#endif
+    }
 }
 __global__ void rmsnorm_kernel(const float* x,const float* w,float* y,int D,float eps){
     extern __shared__ float sh[];
@@ -392,7 +467,7 @@ __global__ void linear_kernel(const float* x,const WeightT* W,const float* scale
     int o=blockIdx.x;
     int tid=threadIdx.x;
     if(o>=OUT) return;
-    const WeightT* row=W+(size_t)o*IN;
+    const WeightT* row=row_weight_ptr(W,o,IN);
     float s=dot_weight_float_x(row,x,IN,tid,blockDim.x,row_scale_at(scales,o));
     sh[tid]=s;
     __syncthreads();
@@ -425,7 +500,7 @@ __global__ void qkv_linear_kernel(
     }else{
         local_o=o-HIDDEN-KV_DIM; W=Wv; S=Sv; b=bv; y=v;
     }
-    const WeightT* row=W+(size_t)local_o*IN;
+    const WeightT* row=row_weight_ptr(W,local_o,IN);
     float s=dot_weight_float_x(row,x,IN,tid,blockDim.x,row_scale_at(S,local_o));
     sh[tid]=s;
     __syncthreads();
@@ -450,7 +525,7 @@ __global__ void gate_up_linear_kernel(
     const WeightT* W=is_gate ? Wgate : Wup;
     const float* S=is_gate ? Sgate : Sup;
     float* y=is_gate ? gate : up;
-    const WeightT* row=W+(size_t)local_o*IN;
+    const WeightT* row=row_weight_ptr(W,local_o,IN);
     float s=dot_weight_float_x(row,x,IN,tid,blockDim.x,row_scale_at(S,local_o));
     sh[tid]=s;
     __syncthreads();
@@ -465,7 +540,7 @@ __global__ void float_to_half_kernel(const float* x,half* xh,int n){
     if(i<n) xh[i]=__float2half_rn(x[i]);
 }
 __global__ void wmma_linear_kernel(const half* xh,const WeightT* W,const float* b,float* y,int IN,int OUT){
-#if !USE_INT8_WEIGHTS && __CUDA_ARCH__ >= 700
+#if !USE_INT8_WEIGHTS && !USE_INT4_WEIGHTS && __CUDA_ARCH__ >= 700
     using namespace nvcuda;
     __shared__ half a_tile[WMMA_TILE*WMMA_TILE];
     __shared__ half b_tile[WMMA_TILE*WMMA_TILE];
@@ -863,7 +938,7 @@ static void launch_wmma_linear(const half* xh,const WeightMatrix& W,const float*
     wmma_linear_kernel<<<(OUT+WMMA_TILE-1)/WMMA_TILE,32>>>(xh,W.data,b,y,IN,OUT);
 }
 static void launch_linear_from_float(const float* x,half* xh,const WeightMatrix& W,const float* b,float* y,int IN,int OUT){
-#if USE_WMMA_LINEAR && !USE_INT8_WEIGHTS
+#if USE_WMMA_LINEAR && !USE_INT8_WEIGHTS && !USE_INT4_WEIGHTS
     prepare_wmma_x(x,xh,IN);
     launch_wmma_linear(xh,W,b,y,IN,OUT);
 #else
@@ -878,7 +953,7 @@ static void launch_qkv_from_float(
     float* q,float* k,float* v,
     int IN
 ){
-#if USE_WMMA_LINEAR && !USE_INT8_WEIGHTS
+#if USE_WMMA_LINEAR && !USE_INT8_WEIGHTS && !USE_INT4_WEIGHTS
     prepare_wmma_x(x,xh,IN);
     launch_wmma_linear(xh,Wq,bq,q,IN,HIDDEN);
     launch_wmma_linear(xh,Wk,bk,k,IN,KV_DIM);
@@ -894,7 +969,7 @@ static void launch_gate_up_from_float(
     float* gate,float* up,
     int IN
 ){
-#if USE_WMMA_LINEAR && !USE_INT8_WEIGHTS
+#if USE_WMMA_LINEAR && !USE_INT8_WEIGHTS && !USE_INT4_WEIGHTS
     prepare_wmma_x(x,xh,IN);
     launch_wmma_linear(xh,Wgate,nullptr,gate,IN,INTERMEDIATE);
     launch_wmma_linear(xh,Wup,nullptr,up,IN,INTERMEDIATE);

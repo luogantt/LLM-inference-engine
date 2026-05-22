@@ -10,7 +10,7 @@
 - 支持 HuggingFace safetensors 权重加载
 - 手写 RMSNorm、RoPE、GQA Attention、SwiGLU、KV Cache、decode
 - 提供 Python tokenizer + CUDA 动态库调用入口
-- 支持 FP16 权重推理和 Jetson Orin AGX weight-only INT8 推理
+- 支持 FP16 权重推理和 Jetson Orin AGX weight-only INT8 / INT4 推理
 
 ## A100 / A800 编译运行
 
@@ -39,6 +39,21 @@ CUDA_VISIBLE_DEVICES=0 python python_infer.py \
 
 运行时如果日志中出现 `stored=INT8(rowwise)`，说明已经启用 INT8 权重路径。
 
+## Jetson Orin AGX INT4 编译运行
+
+```bash
+make -f Makefile.cuda_lib clean-lib
+make -f Makefile.cuda_lib lib-int4 A=sm_87
+CUDA_VISIBLE_DEVICES=0 python python_infer.py \
+  --model /data/project/deepseek-r1-7b \
+  --lib ./build/libllm_cuda.so \
+  --prompt "你好 deepseek 介绍一下黑格尔的思想" \
+  --max-new-tokens 512 \
+  --max-seq 800
+```
+
+运行时如果日志中出现 `stored=INT4(rowwise)`，说明已经启用 INT4 权重路径。
+
 ## 当前性能
 
 测试模型：
@@ -66,6 +81,12 @@ FP16 baseline ≈ 8.6 tok/s
 INT8 speedup ≈ 1.63x
 ```
 
+Jetson Orin AGX weight-only INT4 版本：
+
+```text
+待测试
+```
+
 ## 主要文件
 
 ```text
@@ -77,4 +98,4 @@ log.txt                              性能记录
 
 ## 后续方向
 
-当前 INT8 版本是 weight-only INT8，激活仍然使用 float。继续提升 Jetson Orin AGX 速度的主要方向是 INT8 activation + DP4A GEMV、INT4 权重量化、decode GEMV / MLP 重写和 CUDA Graph。
+当前 INT8 / INT4 版本是 weight-only 量化，激活仍然使用 float。继续提升 Jetson Orin AGX 速度的主要方向是 INT8 activation + DP4A GEMV、INT4 专用 GEMV、decode GEMV / MLP 重写和 CUDA Graph。

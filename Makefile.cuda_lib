@@ -5,7 +5,7 @@ COMMON_FLAGS = -O3 -std=c++17 -lineinfo
 
 .RECIPEPREFIX := >
 
-.PHONY: lib lib-int8 clean-lib
+.PHONY: lib lib-int8 lib-int4 clean-lib
 
 lib:
 >mkdir -p build
@@ -14,6 +14,10 @@ lib:
 lib-int8:
 >mkdir -p build
 >$(NVCC) $(COMMON_FLAGS) -DUSE_INT8_WEIGHTS=1 -arch=$(A) -Xcompiler -fPIC -shared src/llm_cuda_lib.cu -o build/libllm_cuda.so
+
+lib-int4:
+>mkdir -p build
+>$(NVCC) $(COMMON_FLAGS) -DUSE_INT4_WEIGHTS=1 -arch=$(A) -Xcompiler -fPIC -shared src/llm_cuda_lib.cu -o build/libllm_cuda.so
 
 clean-lib:
 >rm -rf build
