@@ -6,11 +6,14 @@ A ?= sm_80
 COMMON_FLAGS = -O3 -std=c++17 -lineinfo
 MUSA_FLAGS = -O3 -std=c++17 -x musa -mtgpu -DUSE_MUSA=1 -DUSE_WMMA_LINEAR=0 -I$(MUSA_HOME)/include
 MUSA_INT4_FLAGS = $(MUSA_FLAGS) -DUSE_INT4_WEIGHTS=1 -DUSE_INT4_DP4A=1
+MUSA_INT4_O2_FLAGS = $(MUSA_INT4_FLAGS) -DUSE_LINEAR_I4_DP4A2=1 -DUSE_QKV_GATE_I4_DP4A2=1
+MUSA_INT4_O4_FLAGS = $(MUSA_INT4_FLAGS) -DUSE_LINEAR_I4_DP4A4=1 -DUSE_QKV_GATE_I4_DP4A4=1
+MUSA_INT4_PREPACK_FLAGS = $(MUSA_INT4_FLAGS) -DUSE_INT4_DP4A_PREPACK=1
 MUSA_LIBS = -L$(MUSA_HOME)/lib -lmusart
 
 .RECIPEPREFIX := >
 
-.PHONY: lib lib-musa lib-musa-int4 lib-musa-int4-soft clean-lib
+.PHONY: lib lib-musa lib-musa-int4 lib-musa-int4-o2-all lib-musa-int4-o4-all lib-musa-int4-prepack lib-musa-int4-o4-prepack lib-musa-int4-soft clean-lib
 
 lib:
 >mkdir -p build
@@ -23,6 +26,22 @@ lib-musa:
 lib-musa-int4:
 >mkdir -p build
 >$(MCC) $(MUSA_INT4_FLAGS) -fPIC -shared src/llm_cuda_lib.cu -o build/libllm_musa.so $(MUSA_LIBS)
+
+lib-musa-int4-o2-all:
+>mkdir -p build
+>$(MCC) $(MUSA_INT4_O2_FLAGS) -fPIC -shared src/llm_cuda_lib.cu -o build/libllm_musa.so $(MUSA_LIBS)
+
+lib-musa-int4-o4-all:
+>mkdir -p build
+>$(MCC) $(MUSA_INT4_O4_FLAGS) -fPIC -shared src/llm_cuda_lib.cu -o build/libllm_musa.so $(MUSA_LIBS)
+
+lib-musa-int4-prepack:
+>mkdir -p build
+>$(MCC) $(MUSA_INT4_PREPACK_FLAGS) -fPIC -shared src/llm_cuda_lib.cu -o build/libllm_musa.so $(MUSA_LIBS)
+
+lib-musa-int4-o4-prepack:
+>mkdir -p build
+>$(MCC) $(MUSA_INT4_O4_FLAGS) -DUSE_INT4_DP4A_PREPACK=1 -fPIC -shared src/llm_cuda_lib.cu -o build/libllm_musa.so $(MUSA_LIBS)
 
 lib-musa-int4-soft:
 >mkdir -p build

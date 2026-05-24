@@ -1977,6 +1977,28 @@ void* llm_create(const char* model_dir,int max_seq){
         {
             std::ostringstream os;
             os<<"[C++][time] create engine, model="<<model_dir<<", max_seq="<<max_seq;
+            os<<", backend="<<BACKEND_NAME;
+#if USE_INT4_WEIGHTS
+            os<<", weights=INT4";
+#if USE_INT4_DP4A
+            os<<", dp4a=on";
+#endif
+#if USE_SOFT_DP4A
+            os<<", soft_dp4a=on";
+#endif
+#if USE_LINEAR_I4_DP4A4 || USE_QKV_GATE_I4_DP4A4
+            os<<", i4_o4=on";
+#elif USE_LINEAR_I4_DP4A2 || USE_QKV_GATE_I4_DP4A2
+            os<<", i4_o2=on";
+#endif
+#if USE_INT4_DP4A_PREPACK
+            os<<", prepack=on";
+#endif
+#elif USE_INT8_WEIGHTS
+            os<<", weights=INT8";
+#else
+            os<<", weights=FP16";
+#endif
             time_log(os.str());
         }
         e->m=load_model(model_dir,max_seq); e->w=make_work(max_seq);
