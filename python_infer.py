@@ -148,13 +148,13 @@ def main():
     engine.set_repetition_penalty(args.repetition_penalty)
     print(f"[Python] repetition penalty: {args.repetition_penalty}")
 
-    print("\n========== CUDA prefill ==========")
+    print("\n========== backend prefill ==========")
     engine.prefill(input_ids)
 
     stop_ids = eos_set(tokenizer)
     gen_ids: List[int] = []
 
-    print("\n========== CUDA decode ==========")
+    print("\n========== backend decode ==========")
     for i in range(max_decode_tokens):
         tid = engine.decode_one()
         gen_ids.append(tid)

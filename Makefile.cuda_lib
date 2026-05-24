@@ -1,15 +1,23 @@
 NVCC ?= nvcc
+MCC ?= mcc
+MUSA_HOME ?= /usr/local/musa
 A ?= sm_80
 
 COMMON_FLAGS = -O3 -std=c++17 -lineinfo
+MUSA_FLAGS = -O3 -std=c++17 -mtgpu -cuda_wrapper -DUSE_MUSA=1 -DUSE_WMMA_LINEAR=0 -I$(MUSA_HOME)/include
+MUSA_LIBS = -L$(MUSA_HOME)/lib -lcuda2musa
 
 .RECIPEPREFIX := >
 
-.PHONY: lib clean-lib
+.PHONY: lib lib-musa clean-lib
 
 lib:
 >mkdir -p build
 >$(NVCC) $(COMMON_FLAGS) -arch=$(A) -Xcompiler -fPIC -shared src/llm_cuda_lib.cu -o build/libllm_cuda.so
+
+lib-musa:
+>mkdir -p build
+>$(MCC) $(MUSA_FLAGS) -fPIC -shared src/llm_cuda_lib.cu -o build/libllm_musa.so $(MUSA_LIBS)
 
 clean-lib:
 >rm -rf build

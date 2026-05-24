@@ -1,7 +1,13 @@
+#ifndef USE_MUSA
+#define USE_MUSA 0
+#endif
+
 #include <cuda_runtime.h>
-#include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#if !USE_MUSA
+#include <cuda_bf16.h>
 #include <mma.h>
+#endif
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -19,7 +25,13 @@
 #include <unordered_map>
 #include <vector>
 
-#define CK(x) do { cudaError_t _cuda_err=(x); if(_cuda_err!=cudaSuccess) throw std::runtime_error(std::string("CUDA: ")+cudaGetErrorString(_cuda_err)); } while(0)
+#if USE_MUSA
+#define BACKEND_NAME "MUSA"
+#else
+#define BACKEND_NAME "CUDA"
+#endif
+
+#define CK(x) do { cudaError_t _cuda_err=(x); if(_cuda_err!=cudaSuccess) throw std::runtime_error(std::string(BACKEND_NAME ": ")+cudaGetErrorString(_cuda_err)); } while(0)
 
 constexpr int N_LAYERS=28;
 constexpr int HIDDEN=3584;
@@ -373,7 +385,7 @@ __global__ void float_to_half_kernel(const float* x,half* xh,int n){
     if(i<n) xh[i]=__float2half_rn(x[i]);
 }
 __global__ void wmma_linear_kernel(const half* xh,const WeightT* W,const float* b,float* y,int IN,int OUT){
-#if __CUDA_ARCH__ >= 700
+#if !USE_MUSA && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 700)
     using namespace nvcuda;
     __shared__ half a_tile[WMMA_TILE*WMMA_TILE];
     __shared__ half b_tile[WMMA_TILE*WMMA_TILE];
@@ -409,6 +421,13 @@ __global__ void wmma_linear_kernel(const half* xh,const WeightT* W,const float* 
         int o=out0+r;
         if(o<OUT) y[o]=c_tile[r*WMMA_TILE]+(b ? b[o] : 0.0f);
     }
+#else
+    (void)xh;
+    (void)W;
+    (void)b;
+    (void)y;
+    (void)IN;
+    (void)OUT;
 #endif
 }
 __global__ void add_kernel(float* x,const float* y,int n){
