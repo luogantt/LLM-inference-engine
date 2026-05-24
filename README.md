@@ -99,3 +99,27 @@ log.txt                              性能记录
 ## 后续方向
 
 当前 INT8 / INT4 版本是 weight-only 量化，激活仍然使用 float。继续提升 Jetson Orin AGX 速度的主要方向是 INT8 activation + DP4A GEMV、INT4 专用 GEMV、decode GEMV / MLP 重写和 CUDA Graph。
+
+## Model Download
+
+This repository includes `download_model.py` for downloading the HuggingFace safetensors model used by the engine. For China mainland networks, ModelScope is usually the fastest source:
+
+```bash
+pip install -U modelscope
+
+python download_model.py \
+  --source modelscope \
+  --model deepseek-ai/DeepSeek-R1-Distill-Qwen-7B \
+  --local-dir /root/autodl-tmp/deepseek-r1-7b
+```
+
+For HuggingFace Hub instead:
+
+```bash
+pip install -U huggingface_hub
+
+python download_model.py \
+  --source huggingface \
+  --model deepseek-ai/DeepSeek-R1-Distill-Qwen-7B \
+  --local-dir ./deepseek-r1-7b
+```
