@@ -4,8 +4,8 @@ MUSA_HOME ?= /usr/local/musa
 A ?= sm_80
 
 COMMON_FLAGS = -O3 -std=c++17 -lineinfo
-MUSA_FLAGS = -O3 -std=c++17 -mtgpu -cuda_wrapper -DUSE_MUSA=1 -DUSE_WMMA_LINEAR=0 -I$(MUSA_HOME)/include
-MUSA_LIBS = -L$(MUSA_HOME)/lib -lcuda2musa
+MUSA_FLAGS = -O3 -std=c++17 -x musa -mtgpu -DUSE_MUSA=1 -DUSE_WMMA_LINEAR=0 -I$(MUSA_HOME)/include
+MUSA_LIBS = -L$(MUSA_HOME)/lib -lmusart
 
 .RECIPEPREFIX := >
 

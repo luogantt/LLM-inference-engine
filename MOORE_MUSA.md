@@ -12,7 +12,7 @@ MUSA Toolkit: 3.1.0
 mcc: /usr/local/musa/bin/mcc
 ```
 
-This is not a Huawei Ascend environment and it is not NVIDIA CUDA. Moore Threads uses the MUSA runtime and the `mcc` compiler. This project keeps the existing CUDA-style kernel source and builds it through the MUSA CUDA-wrapper compatibility path.
+This is not a Huawei Ascend environment and it is not NVIDIA CUDA. Moore Threads uses the MUSA runtime and the `mcc` compiler. This project keeps the existing CUDA-style kernel source, but the MUSA build now uses native MUSA headers and maps the small set of CUDA runtime calls used by this engine to MUSA runtime calls.
 
 ## Check The Device
 
@@ -51,10 +51,18 @@ build/libllm_musa.so
 The new Makefile target uses:
 
 ```text
-mcc -mtgpu -cuda_wrapper -DUSE_MUSA=1
+mcc -x musa -mtgpu -DUSE_MUSA=1
 ```
 
-and links `libcuda2musa`.
+and links `libmusart`.
+
+The first compatibility attempt used `-cuda_wrapper`, but the AutoDL MTT S4000 image does not provide NVIDIA CUDA headers such as `cuda.h`. In that environment, native MUSA compilation is the cleaner path:
+
+```text
+musa_runtime.h
+musa_fp16.h
+musaMalloc / musaMemcpy / musaMemset / musaDeviceSynchronize
+```
 
 ## Run
 
@@ -97,7 +105,7 @@ VOCAB_SIZE = 152064
 ```
 
 - WMMA is disabled for MUSA builds because the CUDA `nvcuda::wmma` path is NVIDIA-specific.
-- This path still uses the original custom kernels and runtime calls through the MUSA CUDA-wrapper layer.
+- This path still uses the original custom kernels, with the required runtime calls mapped to native MUSA APIs.
 
 For the existing 14B GGUF file, use llama.cpp with its MUSA backend instead:
 
@@ -116,7 +124,7 @@ If `mcc` is not found:
 export PATH=/usr/local/musa/bin:$PATH
 ```
 
-If `libcuda2musa.so` cannot be loaded:
+If `libmusart.so` cannot be loaded:
 
 ```bash
 export LD_LIBRARY_PATH=/usr/local/musa/lib:$LD_LIBRARY_PATH

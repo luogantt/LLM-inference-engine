@@ -2,9 +2,12 @@
 #define USE_MUSA 0
 #endif
 
+#if USE_MUSA
+#include <musa_runtime.h>
+#include <musa_fp16.h>
+#else
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
-#if !USE_MUSA
 #include <cuda_bf16.h>
 #include <mma.h>
 #endif
@@ -27,6 +30,20 @@
 
 #if USE_MUSA
 #define BACKEND_NAME "MUSA"
+using cudaError_t = musaError_t;
+#define cudaSuccess musaSuccess
+#define cudaGetErrorString musaGetErrorString
+#define cudaMemcpyHostToDevice musaMemcpyHostToDevice
+#define cudaMemcpyDeviceToHost musaMemcpyDeviceToHost
+#define cudaMemcpy musaMemcpy
+#define cudaMemset musaMemset
+#define cudaFree musaFree
+#define cudaDeviceSynchronize musaDeviceSynchronize
+template <typename T>
+static inline musaError_t cuda_malloc_compat(T** p,size_t n){
+    return musaMalloc(reinterpret_cast<void**>(p),n);
+}
+#define cudaMalloc cuda_malloc_compat
 #else
 #define BACKEND_NAME "CUDA"
 #endif
