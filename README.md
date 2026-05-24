@@ -61,3 +61,27 @@ log.txt                              性能记录
 ## 说明
 
 这个项目偏研究和实验性质，重点是理解并优化单 batch decode 路径。后续如果继续提高速度，主要方向是 CUDA Graph、decode GEMV / MLP 重写、量化和 speculative decoding。
+
+## Model Download
+
+This repository includes `download_model.py` for downloading the HuggingFace safetensors model used by the engine. For China mainland networks, ModelScope is usually the fastest source:
+
+```bash
+pip install -U modelscope
+
+python download_model.py \
+  --source modelscope \
+  --model deepseek-ai/DeepSeek-R1-Distill-Qwen-7B \
+  --local-dir /root/autodl-tmp/deepseek-r1-7b
+```
+
+For HuggingFace Hub instead:
+
+```bash
+pip install -U huggingface_hub
+
+python download_model.py \
+  --source huggingface \
+  --model deepseek-ai/DeepSeek-R1-Distill-Qwen-7B \
+  --local-dir ./deepseek-r1-7b
+```
