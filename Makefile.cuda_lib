@@ -5,11 +5,12 @@ A ?= sm_80
 
 COMMON_FLAGS = -O3 -std=c++17 -lineinfo
 MUSA_FLAGS = -O3 -std=c++17 -x musa -mtgpu -DUSE_MUSA=1 -DUSE_WMMA_LINEAR=0 -I$(MUSA_HOME)/include
+MUSA_INT4_FLAGS = $(MUSA_FLAGS) -DUSE_INT4_WEIGHTS=1 -DUSE_INT4_DP4A=1
 MUSA_LIBS = -L$(MUSA_HOME)/lib -lmusart
 
 .RECIPEPREFIX := >
 
-.PHONY: lib lib-musa clean-lib
+.PHONY: lib lib-musa lib-musa-int4 lib-musa-int4-soft clean-lib
 
 lib:
 >mkdir -p build
@@ -18,6 +19,14 @@ lib:
 lib-musa:
 >mkdir -p build
 >$(MCC) $(MUSA_FLAGS) -fPIC -shared src/llm_cuda_lib.cu -o build/libllm_musa.so $(MUSA_LIBS)
+
+lib-musa-int4:
+>mkdir -p build
+>$(MCC) $(MUSA_INT4_FLAGS) -fPIC -shared src/llm_cuda_lib.cu -o build/libllm_musa.so $(MUSA_LIBS)
+
+lib-musa-int4-soft:
+>mkdir -p build
+>$(MCC) $(MUSA_INT4_FLAGS) -DUSE_SOFT_DP4A=1 -fPIC -shared src/llm_cuda_lib.cu -o build/libllm_musa.so $(MUSA_LIBS)
 
 clean-lib:
 >rm -rf build

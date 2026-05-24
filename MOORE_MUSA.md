@@ -42,6 +42,22 @@ make -f Makefile.cuda_lib clean-lib
 make -f Makefile.cuda_lib lib-musa
 ```
 
+For the experimental INT4 + INT8 activation + DP4A path:
+
+```bash
+make -f Makefile.cuda_lib clean-lib
+make -f Makefile.cuda_lib lib-musa-int4
+```
+
+If the MUSA compiler rejects `__dp4a`, use the soft fallback only to verify the rest of the port:
+
+```bash
+make -f Makefile.cuda_lib clean-lib
+make -f Makefile.cuda_lib lib-musa-int4-soft
+```
+
+The soft fallback is expected to be slower than the hardware path. It exists so we can separate "MUSA can compile and run this INT4 layout" from "`__dp4a` is accepted and maps to a useful instruction".
+
 The output library is:
 
 ```text
@@ -134,6 +150,18 @@ If the build fails on CUDA-only headers, confirm that the MUSA target is being u
 
 ```bash
 make -f Makefile.cuda_lib lib-musa
+```
+
+For the INT4 experiment, test the hardware path first:
+
+```bash
+make -f Makefile.cuda_lib lib-musa-int4
+```
+
+If that fails with an intrinsic error around `__dp4a`, retry:
+
+```bash
+make -f Makefile.cuda_lib lib-musa-int4-soft
 ```
 
 Do not use the NVIDIA CUDA target on MTT S4000:
