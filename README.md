@@ -176,3 +176,27 @@ CUDA_VISIBLE_DEVICES=4 python python_infer.py \
 
 ```
 #### 这个版本是 不用 mma 和 cublas的 极限了
+
+## Model Download
+
+This repository includes `download_model.py` for downloading the HuggingFace safetensors model used by the engine. For China mainland networks, ModelScope is usually the fastest source:
+
+```bash
+pip install -U modelscope
+
+python download_model.py \
+  --source modelscope \
+  --model deepseek-ai/DeepSeek-R1-Distill-Qwen-7B \
+  --local-dir /root/autodl-tmp/deepseek-r1-7b
+```
+
+For HuggingFace Hub instead:
+
+```bash
+pip install -U huggingface_hub
+
+python download_model.py \
+  --source huggingface \
+  --model deepseek-ai/DeepSeek-R1-Distill-Qwen-7B \
+  --local-dir ./deepseek-r1-7b
+```
