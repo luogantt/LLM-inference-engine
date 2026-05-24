@@ -83,6 +83,15 @@ ls /usr/local/musa
 ```bash
 pip install -U modelscope
 
+python download_model.py \
+  --source modelscope \
+  --model deepseek-ai/DeepSeek-R1-Distill-Qwen-7B \
+  --local-dir /root/autodl-tmp/deepseek-r1-7b
+```
+
+也可以直接使用 ModelScope CLI：
+
+```bash
 modelscope download \
   --model deepseek-ai/DeepSeek-R1-Distill-Qwen-7B \
   --local_dir /root/autodl-tmp/deepseek-r1-7b
@@ -131,6 +140,7 @@ watch -n 1 mthreads-gmi
 ```text
 src/llm_cuda_lib.cu          推理核心，CUDA/MUSA 共用源码
 python_infer.py              Python 调用入口
+download_model.py            模型下载脚本，默认走 ModelScope
 Makefile.cuda_lib            动态库编译入口
 MOORE_MUSA.md                摩尔线程 MUSA 详细说明
 log.txt                      性能日志
