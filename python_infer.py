@@ -88,9 +88,10 @@ class CudaLLM:
 
 
 def normalize_token_ids(ids) -> List[int]:
-    if isinstance(ids, dict):
-        if "input_ids" not in ids:
-            raise ValueError(f"tokenizer output dict has no input_ids: {list(ids.keys())}")
+    if hasattr(ids, "keys"):
+        keys = list(ids.keys())
+        if "input_ids" not in keys:
+            raise ValueError(f"tokenizer output has no input_ids: {keys}")
         ids = ids["input_ids"]
     if hasattr(ids, "tolist"):
         ids = ids.tolist()
