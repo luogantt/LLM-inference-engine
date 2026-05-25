@@ -326,6 +326,7 @@ export ASCEND_LOAD_WEIGHTS=all
 export ASCEND_RUN_EMBED=1
 export ASCEND_DIRECT_DECODE=all_layers_ref
 export ASCEND_REF_CACHE_WEIGHTS=1
+export ASCEND_REF_CACHE_LOG=0
 export ASCEND_REF_KV_CACHE=1
 export ASCEND_REF_LINEAR_THREADS=16
 export ASCEND_LM_HEAD_THREADS=16
@@ -343,6 +344,9 @@ python python_infer.py \
 PyTorch, but it intentionally uses host-side scalar GEMV for correctness. Expect
 it to be much slower than the `torch_npu` path until the layer kernels are moved
 to AscendC/ACL operators.
+
+`ASCEND_REF_CACHE_LOG=0` suppresses the very long per-weight host cache logs in
+`all_layers_ref`. Set it to `1` only when debugging the first-token weight cache.
 
 Next direct-engine milestones:
 

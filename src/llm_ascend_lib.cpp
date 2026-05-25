@@ -341,6 +341,14 @@ struct AscendEngine {
     int full_ref_kv_dim = 0;
     std::vector<float> full_last_hidden;
 
+    bool ref_cache_log_enabled() const {
+        const std::string explicit_flag = env_str_or("ASCEND_REF_CACHE_LOG", "");
+        if (!explicit_flag.empty()) {
+            return explicit_flag != "0" && explicit_flag != "false" && explicit_flag != "False";
+        }
+        return env_str_or("ASCEND_DIRECT_DECODE", "lm_head_ref") != "all_layers_ref";
+    }
+
     AscendEngine(const std::string& dir, int max_seq_)
         : device_id(env_int_or("ASCEND_DEVICE_ID", 0)),
           max_seq(max_seq_),
@@ -928,10 +936,12 @@ struct AscendEngine {
         if (cache_enabled) {
             const size_t bytes = value.size() * sizeof(float);
             h_weight_cache.emplace(name, value);
-            time_log("[Ascend][time] cached host reference weight, name=" + name +
-                     ", elements=" + std::to_string(value.size()) +
-                     ", fp32_bytes=" + std::to_string(bytes) +
-                     ", d2h_convert_ms=" + std::to_string(elapsed_ms(t0, t1)));
+            if (ref_cache_log_enabled()) {
+                time_log("[Ascend][time] cached host reference weight, name=" + name +
+                         ", elements=" + std::to_string(value.size()) +
+                         ", fp32_bytes=" + std::to_string(bytes) +
+                         ", d2h_convert_ms=" + std::to_string(elapsed_ms(t0, t1)));
+            }
             return h_weight_cache.at(name);
         }
         return value;
@@ -946,10 +956,12 @@ struct AscendEngine {
         auto t1 = Clock::now();
         const size_t bytes = value.size() * sizeof(float);
         auto inserted = h_weight_cache.emplace(name, std::move(value));
-        time_log("[Ascend][time] cached host reference weight, name=" + name +
-                 ", elements=" + std::to_string(inserted.first->second.size()) +
-                 ", fp32_bytes=" + std::to_string(bytes) +
-                 ", d2h_convert_ms=" + std::to_string(elapsed_ms(t0, t1)));
+        if (ref_cache_log_enabled()) {
+            time_log("[Ascend][time] cached host reference weight, name=" + name +
+                     ", elements=" + std::to_string(inserted.first->second.size()) +
+                     ", fp32_bytes=" + std::to_string(bytes) +
+                     ", d2h_convert_ms=" + std::to_string(elapsed_ms(t0, t1)));
+        }
         return inserted.first->second;
     }
 
@@ -974,10 +986,12 @@ struct AscendEngine {
                   ("aclrtMemcpy(D2H raw u16 " + name + ")").c_str());
         auto t1 = Clock::now();
         auto inserted = h_weight_u16_cache.emplace(name, std::move(value));
-        time_log("[Ascend][time] cached host raw u16 weight, name=" + name +
-                 ", elements=" + std::to_string(inserted.first->second.size()) +
-                 ", raw_bytes=" + std::to_string(tensor.bytes) +
-                 ", d2h_ms=" + std::to_string(elapsed_ms(t0, t1)));
+        if (ref_cache_log_enabled()) {
+            time_log("[Ascend][time] cached host raw u16 weight, name=" + name +
+                     ", elements=" + std::to_string(inserted.first->second.size()) +
+                     ", raw_bytes=" + std::to_string(tensor.bytes) +
+                     ", d2h_ms=" + std::to_string(elapsed_ms(t0, t1)));
+        }
         return inserted.first->second;
     }
 
@@ -1287,7 +1301,10 @@ struct AscendEngine {
 
         auto t0 = Clock::now();
         const int start = full_ref_cached_len;
+        auto load0 = Clock::now();
         std::vector<float> hidden_rows = load_hidden_rows_float(prompt_len);
+        auto load1 = Clock::now();
+        auto layers0 = Clock::now();
         for (int tok = start; tok < prompt_len; ++tok) {
             std::vector<float> x(
                 hidden_rows.begin() + static_cast<size_t>(tok) * static_cast<size_t>(config.hidden),
@@ -1298,16 +1315,22 @@ struct AscendEngine {
             full_last_hidden = std::move(x);
             full_ref_cached_len = tok + 1;
         }
+        auto layers1 = Clock::now();
         if (full_last_hidden.empty()) {
             throw std::runtime_error("all_layers_ref has no cached hidden state");
         }
+        auto norm0 = Clock::now();
         std::vector<float> final_out = final_norm_vector(full_last_hidden);
+        auto norm1 = Clock::now();
         auto t1 = Clock::now();
         time_log("[Ascend][time] all_layers reference finished, tokens=" +
                  std::to_string(prompt_len) +
                  ", processed_from=" + std::to_string(start) +
                  ", processed_to=" + std::to_string(full_ref_cached_len) +
                  ", layers=" + std::to_string(config.n_layers) +
+                 ", load_hidden_ms=" + std::to_string(elapsed_ms(load0, load1)) +
+                 ", layers_ms=" + std::to_string(elapsed_ms(layers0, layers1)) +
+                 ", final_norm_ms=" + std::to_string(elapsed_ms(norm0, norm1)) +
                  ", elapsed_ms=" + std::to_string(elapsed_ms(t0, t1)));
         return final_out;
     }
