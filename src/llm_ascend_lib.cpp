@@ -349,6 +349,14 @@ struct AscendEngine {
         return env_str_or("ASCEND_DIRECT_DECODE", "lm_head_ref") != "all_layers_ref";
     }
 
+    bool weight_load_log_enabled() const {
+        const std::string explicit_flag = env_str_or("ASCEND_WEIGHT_LOAD_LOG", "");
+        if (!explicit_flag.empty()) {
+            return explicit_flag != "0" && explicit_flag != "false" && explicit_flag != "False";
+        }
+        return env_str_or("ASCEND_LOAD_WEIGHTS", "none") != "all";
+    }
+
     AscendEngine(const std::string& dir, int max_seq_)
         : device_id(env_int_or("ASCEND_DEVICE_ID", 0)),
           max_seq(max_seq_),
@@ -461,11 +469,13 @@ struct AscendEngine {
         }
 
         auto t1 = Clock::now();
-        time_log("[Ascend][time] weight loaded to HBM, name=" + name +
-                 ", dtype=" + meta.dtype +
-                 ", shape=" + shape_string(meta.shape) +
-                 ", bytes=" + std::to_string(dt.bytes) +
-                 ", h2d_ms=" + std::to_string(elapsed_ms(t0, t1)));
+        if (weight_load_log_enabled()) {
+            time_log("[Ascend][time] weight loaded to HBM, name=" + name +
+                     ", dtype=" + meta.dtype +
+                     ", shape=" + shape_string(meta.shape) +
+                     ", bytes=" + std::to_string(dt.bytes) +
+                     ", h2d_ms=" + std::to_string(elapsed_ms(t0, t1)));
+        }
 
         d_weights.emplace(name, dt);
         return true;

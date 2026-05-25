@@ -323,6 +323,7 @@ implementation. It is designed to prove the complete safetensors -> direct ACL
 export ASCEND_VISIBLE_DEVICES=4
 export ASCEND_DEVICE_ID=0
 export ASCEND_LOAD_WEIGHTS=all
+export ASCEND_WEIGHT_LOAD_LOG=0
 export ASCEND_RUN_EMBED=1
 export ASCEND_DIRECT_DECODE=all_layers_ref
 export ASCEND_REF_CACHE_WEIGHTS=1
@@ -347,6 +348,9 @@ to AscendC/ACL operators.
 
 `ASCEND_REF_CACHE_LOG=0` suppresses the very long per-weight host cache logs in
 `all_layers_ref`. Set it to `1` only when debugging the first-token weight cache.
+
+`ASCEND_WEIGHT_LOAD_LOG=0` suppresses per-weight HBM load logs when loading the
+full model. The aggregate `requested weights loaded` line is still printed.
 
 Next direct-engine milestones:
 

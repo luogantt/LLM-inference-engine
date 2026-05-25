@@ -182,6 +182,7 @@ For the complete no-torch `.so` reference path:
 export ASCEND_VISIBLE_DEVICES=4
 export ASCEND_DEVICE_ID=0
 export ASCEND_LOAD_WEIGHTS=all
+export ASCEND_WEIGHT_LOAD_LOG=0
 export ASCEND_RUN_EMBED=1
 export ASCEND_DIRECT_DECODE=all_layers_ref
 export ASCEND_REF_CACHE_WEIGHTS=1
