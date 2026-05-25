@@ -328,6 +328,7 @@ struct AscendEngine {
     size_t v_row_bytes = 0;
     bool acl_ready = false;
     std::unordered_map<std::string, DeviceTensor> d_weights;
+    std::unordered_map<std::string, std::vector<float>> h_weight_cache;
 
     AscendEngine(const std::string& dir, int max_seq_)
         : device_id(env_int_or("ASCEND_DEVICE_ID", 0)),
@@ -895,7 +896,41 @@ struct AscendEngine {
     }
 
     std::vector<float> load_weight_float(const std::string& name) {
-        return device_tensor_to_float_vector(require_device_weight(name), name);
+        const bool cache_enabled = env_str_or("ASCEND_REF_CACHE_WEIGHTS", "1") != "0";
+        if (cache_enabled) {
+            auto cached = h_weight_cache.find(name);
+            if (cached != h_weight_cache.end()) return cached->second;
+        }
+
+        auto t0 = Clock::now();
+        std::vector<float> value = device_tensor_to_float_vector(require_device_weight(name), name);
+        auto t1 = Clock::now();
+        if (cache_enabled) {
+            const size_t bytes = value.size() * sizeof(float);
+            h_weight_cache.emplace(name, value);
+            time_log("[Ascend][time] cached host reference weight, name=" + name +
+                     ", elements=" + std::to_string(value.size()) +
+                     ", fp32_bytes=" + std::to_string(bytes) +
+                     ", d2h_convert_ms=" + std::to_string(elapsed_ms(t0, t1)));
+            return h_weight_cache.at(name);
+        }
+        return value;
+    }
+
+    const std::vector<float>& cached_weight_float_ref(const std::string& name) {
+        auto cached = h_weight_cache.find(name);
+        if (cached != h_weight_cache.end()) return cached->second;
+
+        auto t0 = Clock::now();
+        std::vector<float> value = device_tensor_to_float_vector(require_device_weight(name), name);
+        auto t1 = Clock::now();
+        const size_t bytes = value.size() * sizeof(float);
+        auto inserted = h_weight_cache.emplace(name, std::move(value));
+        time_log("[Ascend][time] cached host reference weight, name=" + name +
+                 ", elements=" + std::to_string(inserted.first->second.size()) +
+                 ", fp32_bytes=" + std::to_string(bytes) +
+                 ", d2h_convert_ms=" + std::to_string(elapsed_ms(t0, t1)));
+        return inserted.first->second;
     }
 
     std::vector<float> load_hidden_rows_float(int len) {
@@ -1193,15 +1228,10 @@ struct AscendEngine {
             throw std::runtime_error("bad lm_head.weight shape=" + shape_string(meta.shape));
         }
 
-        auto t0 = Clock::now();
-        std::vector<unsigned char> h_head(head.bytes);
-        check_acl(aclrtMemcpy(h_head.data(), head.bytes, head.data, head.bytes,
-                              ACL_MEMCPY_DEVICE_TO_HOST),
-                  "aclrtMemcpy(D2H lm_head for decode)");
-
         const size_t vocab = meta.shape[0];
         const size_t hidden = meta.shape[1];
-        const size_t dtype_bytes = dtype_size_bytes(meta);
+        auto t0 = Clock::now();
+        const std::vector<float>& h_head = cached_weight_float_ref("lm_head.weight");
         const size_t vocab_limit_env = static_cast<size_t>(std::max(0, env_int_or("ASCEND_LM_HEAD_REF_VOCAB", 0)));
         const size_t vocab_limit = vocab_limit_env > 0 ? std::min(vocab, vocab_limit_env) : vocab;
         const bool suppress_special = env_str_or("ASCEND_SUPPRESS_SPECIAL", "0") != "0";
@@ -1210,11 +1240,10 @@ struct AscendEngine {
         float best = -std::numeric_limits<float>::infinity();
         for (size_t tok = 0; tok < vocab_limit; ++tok) {
             if (suppress_special && tok >= 151000) continue;
-            const unsigned char* wrow = h_head.data() + tok * hidden * dtype_bytes;
+            const float* wrow = h_head.data() + tok * hidden;
             double acc = 0.0;
             for (size_t j = 0; j < hidden; ++j) {
-                const float w = load_scalar(wrow + j * dtype_bytes, meta.dtype);
-                acc += static_cast<double>(x[j]) * static_cast<double>(w);
+                acc += static_cast<double>(x[j]) * static_cast<double>(wrow[j]);
             }
             float logit = static_cast<float>(acc);
             if (tok < seen_tokens.size() && seen_tokens[tok] && repetition_penalty > 1.0f) {
