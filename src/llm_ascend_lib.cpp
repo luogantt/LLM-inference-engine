@@ -1,6 +1,7 @@
 #include <acl/acl.h>
 
 #include <algorithm>
+#include <condition_variable>
 #include <chrono>
 #include <cctype>
 #include <cmath>
@@ -10,8 +11,10 @@
 #include <dirent.h>
 #include <exception>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <limits>
+#include <mutex>
 #include <regex>
 #include <sstream>
 #include <stdexcept>
@@ -327,6 +330,81 @@ struct RefLayerProfile {
     }
 };
 
+struct RefThreadPool {
+    explicit RefThreadPool(int n_threads_) : n_threads(std::max(1, n_threads_)) {
+        workers.reserve(static_cast<size_t>(n_threads));
+        for (int tid = 0; tid < n_threads; ++tid) {
+            workers.emplace_back([this, tid]() { worker_loop(tid); });
+        }
+    }
+
+    ~RefThreadPool() {
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            stopping = true;
+            generation++;
+        }
+        cv_start.notify_all();
+        for (auto& worker : workers) {
+            if (worker.joinable()) worker.join();
+        }
+    }
+
+    void run(int active_threads, const std::function<void(int)>& fn) {
+        active_threads = std::max(1, std::min(active_threads, n_threads));
+        if (active_threads == 1) {
+            fn(0);
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            active = active_threads;
+            pending = n_threads;
+            job = fn;
+            generation++;
+        }
+        cv_start.notify_all();
+        std::unique_lock<std::mutex> lock(mu);
+        cv_done.wait(lock, [this]() { return pending == 0; });
+        job = nullptr;
+    }
+
+    int n_threads = 1;
+    std::vector<std::thread> workers;
+    std::mutex mu;
+    std::condition_variable cv_start;
+    std::condition_variable cv_done;
+    std::function<void(int)> job;
+    size_t generation = 0;
+    int active = 0;
+    int pending = 0;
+    bool stopping = false;
+
+    void worker_loop(int tid) {
+        size_t seen_generation = 0;
+        while (true) {
+            std::function<void(int)> local_job;
+            int local_active = 0;
+            {
+                std::unique_lock<std::mutex> lock(mu);
+                cv_start.wait(lock, [this, &seen_generation]() {
+                    return stopping || generation != seen_generation;
+                });
+                if (stopping) return;
+                seen_generation = generation;
+                local_job = job;
+                local_active = active;
+            }
+            if (local_job && tid < local_active) local_job(tid);
+            {
+                std::lock_guard<std::mutex> lock(mu);
+                pending--;
+                if (pending == 0) cv_done.notify_one();
+            }
+        }
+    }
+};
+
 struct AscendEngine {
     int device_id = 0;
     int max_seq = 0;
@@ -354,6 +432,8 @@ struct AscendEngine {
     size_t v_bytes = 0;
     size_t v_row_bytes = 0;
     bool acl_ready = false;
+    mutable RefThreadPool* ref_thread_pool = nullptr;
+    mutable int ref_thread_pool_size = 0;
     std::unordered_map<std::string, DeviceTensor> d_weights;
     std::unordered_map<std::string, std::vector<unsigned char>> h_weight_raw_cache;
     std::unordered_map<std::string, std::vector<float>> h_weight_cache;
@@ -442,6 +522,11 @@ struct AscendEngine {
     }
 
     ~AscendEngine() {
+        if (ref_thread_pool) {
+            delete ref_thread_pool;
+            ref_thread_pool = nullptr;
+            ref_thread_pool_size = 0;
+        }
         for (auto& kv : d_weights) {
             if (kv.second.data) {
                 aclrtFree(kv.second.data);
@@ -978,6 +1063,16 @@ struct AscendEngine {
         return it->second;
     }
 
+    RefThreadPool& ref_pool_for(int n_threads) const {
+        n_threads = std::max(1, n_threads);
+        if (!ref_thread_pool || ref_thread_pool_size != n_threads) {
+            if (ref_thread_pool) delete ref_thread_pool;
+            ref_thread_pool = new RefThreadPool(n_threads);
+            ref_thread_pool_size = n_threads;
+        }
+        return *ref_thread_pool;
+    }
+
     std::pair<size_t, size_t> matrix_shape(const std::string& name) const {
         const DeviceTensor& w = require_device_weight(name);
         if (w.meta.shape.size() != 2) {
@@ -1195,10 +1290,7 @@ struct AscendEngine {
         if (n_threads == 1) {
             compute_range(0);
         } else {
-            std::vector<std::thread> workers;
-            workers.reserve(static_cast<size_t>(n_threads));
-            for (int tid = 0; tid < n_threads; ++tid) workers.emplace_back(compute_range, tid);
-            for (auto& worker : workers) worker.join();
+            ref_pool_for(n_threads).run(n_threads, compute_range);
         }
         return y;
     }
@@ -1243,10 +1335,7 @@ struct AscendEngine {
         if (n_threads == 1) {
             compute_range(0);
         } else {
-            std::vector<std::thread> workers;
-            workers.reserve(static_cast<size_t>(n_threads));
-            for (int tid = 0; tid < n_threads; ++tid) workers.emplace_back(compute_range, tid);
-            for (auto& worker : workers) worker.join();
+            ref_pool_for(n_threads).run(n_threads, compute_range);
         }
         return mid;
     }
@@ -1747,8 +1836,6 @@ struct AscendEngine {
             int token = 0;
         };
         std::vector<LocalBest> local(static_cast<size_t>(n_threads));
-        std::vector<std::thread> workers;
-        workers.reserve(static_cast<size_t>(n_threads));
 
         auto scan_range = [&](int tid) {
             const size_t begin = (vocab_limit * static_cast<size_t>(tid)) / static_cast<size_t>(n_threads);
@@ -1777,8 +1864,7 @@ struct AscendEngine {
         if (n_threads == 1) {
             scan_range(0);
         } else {
-            for (int tid = 0; tid < n_threads; ++tid) workers.emplace_back(scan_range, tid);
-            for (auto& worker : workers) worker.join();
+            ref_pool_for(n_threads).run(n_threads, scan_range);
         }
 
         int best_id = 0;
