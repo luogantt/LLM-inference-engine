@@ -239,7 +239,10 @@ struct AscendEngine {
     aclrtContext context = nullptr;
     aclrtStream stream = nullptr;
     void* d_tokens = nullptr;
+    void* d_hidden = nullptr;
     size_t token_bytes = 0;
+    size_t hidden_bytes = 0;
+    size_t hidden_row_bytes = 0;
     bool acl_ready = false;
     std::unordered_map<std::string, DeviceTensor> d_weights;
 
@@ -286,6 +289,10 @@ struct AscendEngine {
             }
         }
         d_weights.clear();
+        if (d_hidden) {
+            aclrtFree(d_hidden);
+            d_hidden = nullptr;
+        }
         if (d_tokens) {
             aclrtFree(d_tokens);
             d_tokens = nullptr;
@@ -409,9 +416,86 @@ struct AscendEngine {
         }
 
         prompt_len = len;
+        if (d_weights.find("model.embed_tokens.weight") != d_weights.end() &&
+            env_str_or("ASCEND_RUN_EMBED", "1") != "0") {
+            embedding_lookup(ids, len);
+        }
         auto t1 = Clock::now();
         time_log("[Ascend][time] prefill copied token_ids to HBM, tokens=" +
                  std::to_string(len) + ", copy_roundtrip_ms=" + std::to_string(elapsed_ms(t0, t1)));
+    }
+
+    static size_t tensor_numel(const std::vector<size_t>& shape) {
+        size_t n = 1;
+        for (size_t x : shape) n *= x;
+        return n;
+    }
+
+    static size_t dtype_size_bytes(const TensorMeta& meta) {
+        const size_t n = tensor_numel(meta.shape);
+        const size_t bytes = static_cast<size_t>(meta.end - meta.begin);
+        if (n == 0 || bytes % n != 0) {
+            throw std::runtime_error("cannot infer dtype size for tensor shape=" + shape_string(meta.shape));
+        }
+        return bytes / n;
+    }
+
+    void ensure_hidden_buffer(const TensorMeta& embed_meta) {
+        if (d_hidden) return;
+        if (embed_meta.shape.size() != 2) {
+            throw std::runtime_error("embedding weight must be 2D, got shape=" + shape_string(embed_meta.shape));
+        }
+        const size_t dtype_bytes = dtype_size_bytes(embed_meta);
+        hidden_row_bytes = embed_meta.shape[1] * dtype_bytes;
+        hidden_bytes = static_cast<size_t>(max_seq) * hidden_row_bytes;
+        check_acl(aclrtMalloc(&d_hidden, hidden_bytes, ACL_MEM_MALLOC_HUGE_FIRST),
+                  "aclrtMalloc(hidden states)");
+        check_acl(aclrtMemset(d_hidden, hidden_bytes, 0, hidden_bytes),
+                  "aclrtMemset(hidden states)");
+        time_log("[Ascend][time] hidden buffer allocated, row_bytes=" +
+                 std::to_string(hidden_row_bytes) +
+                 ", total_bytes=" + std::to_string(hidden_bytes));
+    }
+
+    void embedding_lookup(const int* ids, int len) {
+        auto it = d_weights.find("model.embed_tokens.weight");
+        if (it == d_weights.end()) return;
+        const DeviceTensor& embed = it->second;
+        const TensorMeta& meta = embed.meta;
+        ensure_hidden_buffer(meta);
+
+        const size_t vocab = meta.shape[0];
+        const size_t row_bytes = hidden_row_bytes;
+        auto t0 = Clock::now();
+        for (int i = 0; i < len; ++i) {
+            const int token = ids[i];
+            if (token < 0 || static_cast<size_t>(token) >= vocab) {
+                throw std::runtime_error("token id out of embedding vocab range: " + std::to_string(token));
+            }
+            char* src = static_cast<char*>(embed.data) + static_cast<size_t>(token) * row_bytes;
+            char* dst = static_cast<char*>(d_hidden) + static_cast<size_t>(i) * row_bytes;
+            check_acl(aclrtMemcpy(dst, row_bytes, src, row_bytes, ACL_MEMCPY_DEVICE_TO_DEVICE),
+                      "aclrtMemcpy(D2D embedding row)");
+        }
+
+        const size_t check_n = std::min<size_t>(row_bytes, 64);
+        std::vector<unsigned char> src_check(check_n);
+        std::vector<unsigned char> dst_check(check_n);
+        char* src0 = static_cast<char*>(embed.data) + static_cast<size_t>(ids[0]) * row_bytes;
+        check_acl(aclrtMemcpy(src_check.data(), check_n, src0, check_n, ACL_MEMCPY_DEVICE_TO_HOST),
+                  "aclrtMemcpy(D2H embedding check src)");
+        check_acl(aclrtMemcpy(dst_check.data(), check_n, d_hidden, check_n, ACL_MEMCPY_DEVICE_TO_HOST),
+                  "aclrtMemcpy(D2H embedding check dst)");
+        if (std::memcmp(src_check.data(), dst_check.data(), check_n) != 0) {
+            throw std::runtime_error("embedding D2D lookup verification failed");
+        }
+
+        auto t1 = Clock::now();
+        time_log("[Ascend][time] embedding lookup D2D finished, tokens=" +
+                 std::to_string(len) +
+                 ", row_bytes=" + std::to_string(row_bytes) +
+                 ", total_bytes=" + std::to_string(static_cast<size_t>(len) * row_bytes) +
+                 ", elapsed_ms=" + std::to_string(elapsed_ms(t0, t1)));
     }
 
     int decode_one(int*) {
