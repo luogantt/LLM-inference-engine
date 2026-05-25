@@ -186,11 +186,47 @@ static std::unordered_map<std::string, TensorMeta> scan_safetensors(const std::s
     return m;
 }
 
+static std::vector<unsigned char> read_tensor_bytes(const TensorMeta& t) {
+    std::ifstream f(t.file, std::ios::binary);
+    if (!f) throw std::runtime_error("cannot open tensor file " + t.file);
+    const uint64_t off = t.data_base + t.begin;
+    const uint64_t n = t.end - t.begin;
+    f.seekg(static_cast<std::streamoff>(off), std::ios::beg);
+    std::vector<unsigned char> b(static_cast<size_t>(n));
+    f.read(reinterpret_cast<char*>(b.data()), static_cast<std::streamsize>(n));
+    if (static_cast<uint64_t>(f.gcount()) != n) {
+        throw std::runtime_error("read tensor bytes failed: " + t.file);
+    }
+    return b;
+}
+
+static std::string shape_string(const std::vector<size_t>& shape) {
+    std::ostringstream oss;
+    oss << "[";
+    for (size_t i = 0; i < shape.size(); ++i) {
+        if (i) oss << ",";
+        oss << shape[i];
+    }
+    oss << "]";
+    return oss.str();
+}
+
 static int env_int_or(const char* name, int fallback) {
     const char* s = std::getenv(name);
     if (!s || !*s) return fallback;
     return std::atoi(s);
 }
+
+static std::string env_str_or(const char* name, const std::string& fallback) {
+    const char* s = std::getenv(name);
+    return (s && *s) ? std::string(s) : fallback;
+}
+
+struct DeviceTensor {
+    TensorMeta meta;
+    void* data = nullptr;
+    size_t bytes = 0;
+};
 
 struct AscendEngine {
     int device_id = 0;
@@ -205,6 +241,7 @@ struct AscendEngine {
     void* d_tokens = nullptr;
     size_t token_bytes = 0;
     bool acl_ready = false;
+    std::unordered_map<std::string, DeviceTensor> d_weights;
 
     AscendEngine(const std::string& dir, int max_seq_)
         : device_id(env_int_or("ASCEND_DEVICE_ID", 0)),
@@ -230,16 +267,25 @@ struct AscendEngine {
         check_acl(aclrtMalloc(&d_tokens, token_bytes, ACL_MEM_MALLOC_HUGE_FIRST), "aclrtMalloc(tokens)");
         check_acl(aclrtMemset(d_tokens, token_bytes, 0, token_bytes), "aclrtMemset(tokens)");
         check_acl(aclrtSynchronizeStream(stream), "aclrtSynchronizeStream(init)");
+        load_requested_weights();
 
         auto t1 = Clock::now();
         time_log("[Ascend][time] create engine, model=" + model_dir +
                  ", device=" + std::to_string(device_id) +
                  ", max_seq=" + std::to_string(max_seq) +
                  ", tensors=" + std::to_string(metas.size()) +
+                 ", device_weights=" + std::to_string(d_weights.size()) +
                  ", init_ms=" + std::to_string(elapsed_ms(t0, t1)));
     }
 
     ~AscendEngine() {
+        for (auto& kv : d_weights) {
+            if (kv.second.data) {
+                aclrtFree(kv.second.data);
+                kv.second.data = nullptr;
+            }
+        }
+        d_weights.clear();
         if (d_tokens) {
             aclrtFree(d_tokens);
             d_tokens = nullptr;
@@ -257,6 +303,92 @@ struct AscendEngine {
             aclFinalize();
             acl_ready = false;
         }
+    }
+
+    bool load_weight_to_device(const std::string& name, bool required) {
+        if (d_weights.find(name) != d_weights.end()) return true;
+        auto it = metas.find(name);
+        if (it == metas.end()) {
+            if (required) throw std::runtime_error("missing tensor for Ascend HBM load: " + name);
+            std::cout << "[Ascend] optional tensor not found, skip: " << name << "\n";
+            return false;
+        }
+
+        const TensorMeta& meta = it->second;
+        auto raw = read_tensor_bytes(meta);
+        if (raw.empty()) throw std::runtime_error("empty tensor bytes: " + name);
+
+        DeviceTensor dt;
+        dt.meta = meta;
+        dt.bytes = raw.size();
+
+        auto t0 = Clock::now();
+        check_acl(aclrtMalloc(&dt.data, dt.bytes, ACL_MEM_MALLOC_HUGE_FIRST),
+                  ("aclrtMalloc(weight " + name + ")").c_str());
+        check_acl(aclrtMemcpy(dt.data, dt.bytes, raw.data(), dt.bytes, ACL_MEMCPY_HOST_TO_DEVICE),
+                  ("aclrtMemcpy(H2D weight " + name + ")").c_str());
+
+        const size_t check_n = std::min<size_t>(dt.bytes, 64);
+        std::vector<unsigned char> check(check_n);
+        check_acl(aclrtMemcpy(check.data(), check_n, dt.data, check_n, ACL_MEMCPY_DEVICE_TO_HOST),
+                  ("aclrtMemcpy(D2H check weight " + name + ")").c_str());
+        if (std::memcmp(check.data(), raw.data(), check_n) != 0) {
+            aclrtFree(dt.data);
+            throw std::runtime_error("Ascend weight H2D/D2H roundtrip failed: " + name);
+        }
+
+        auto t1 = Clock::now();
+        time_log("[Ascend][time] weight loaded to HBM, name=" + name +
+                 ", dtype=" + meta.dtype +
+                 ", shape=" + shape_string(meta.shape) +
+                 ", bytes=" + std::to_string(dt.bytes) +
+                 ", h2d_ms=" + std::to_string(elapsed_ms(t0, t1)));
+
+        d_weights.emplace(name, dt);
+        return true;
+    }
+
+    void load_requested_weights() {
+        const std::string mode = env_str_or("ASCEND_LOAD_WEIGHTS", "none");
+        if (mode == "none" || mode == "0" || mode == "false") {
+            std::cout << "[Ascend] ASCEND_LOAD_WEIGHTS=none, skip weight HBM load\n";
+            return;
+        }
+
+        auto t0 = Clock::now();
+        if (mode == "minimal") {
+            load_weight_to_device("model.embed_tokens.weight", true);
+            load_weight_to_device("model.norm.weight", true);
+            load_weight_to_device("lm_head.weight", false);
+        } else if (mode == "layer0") {
+            load_weight_to_device("model.embed_tokens.weight", true);
+            load_weight_to_device("model.layers.0.input_layernorm.weight", true);
+            load_weight_to_device("model.layers.0.self_attn.q_proj.weight", true);
+            load_weight_to_device("model.layers.0.self_attn.k_proj.weight", true);
+            load_weight_to_device("model.layers.0.self_attn.v_proj.weight", true);
+            load_weight_to_device("model.layers.0.self_attn.o_proj.weight", true);
+            load_weight_to_device("model.layers.0.post_attention_layernorm.weight", true);
+            load_weight_to_device("model.layers.0.mlp.gate_proj.weight", true);
+            load_weight_to_device("model.layers.0.mlp.up_proj.weight", true);
+            load_weight_to_device("model.layers.0.mlp.down_proj.weight", true);
+            load_weight_to_device("model.norm.weight", true);
+            load_weight_to_device("lm_head.weight", false);
+        } else if (mode == "all") {
+            std::vector<std::string> names;
+            names.reserve(metas.size());
+            for (const auto& kv : metas) names.push_back(kv.first);
+            std::sort(names.begin(), names.end());
+            for (const auto& name : names) load_weight_to_device(name, true);
+        } else {
+            throw std::runtime_error(
+                "unsupported ASCEND_LOAD_WEIGHTS=" + mode +
+                ", use one of: none, minimal, layer0, all");
+        }
+
+        auto t1 = Clock::now();
+        time_log("[Ascend][time] requested weights loaded, mode=" + mode +
+                 ", count=" + std::to_string(d_weights.size()) +
+                 ", total_ms=" + std::to_string(elapsed_ms(t0, t1)));
     }
 
     void prefill(const int* ids, int len) {

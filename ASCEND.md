@@ -129,9 +129,43 @@ Expected log shape:
 
 The `tokenizers` backend is intentional here. It avoids importing `transformers` and `torch_npu` in the same process as the direct AscendCL shared library, which keeps the direct runtime smoke test isolated.
 
+## Load Weights Into Ascend HBM
+
+The direct engine can now copy safetensors weights into Ascend HBM. This is controlled by `ASCEND_LOAD_WEIGHTS`:
+
+```text
+none     default, only initializes runtime and token buffer
+minimal  embedding + final norm + optional lm_head
+layer0   embedding + layer 0 attention/mlp/norm weights + final norm + optional lm_head
+all      all safetensors tensors
+```
+
+Start with `minimal`:
+
+```bash
+export ASCEND_VISIBLE_DEVICES=4
+export ASCEND_DEVICE_ID=0
+export ASCEND_LOAD_WEIGHTS=minimal
+
+python python_infer.py \
+  --model ./deepseek-r1-7b \
+  --lib ./build/libllm_ascend.so \
+  --prompt "你好 deepseek 介绍一下黑格尔的思想" \
+  --max-new-tokens 1 \
+  --max-seq 800 \
+  --tokenizer-backend tokenizers \
+  --prefill-only
+```
+
+Expected extra logs:
+
+```text
+[Ascend][time] weight loaded to HBM, name=model.embed_tokens.weight ...
+[Ascend][time] requested weights loaded, mode=minimal ...
+```
+
 Next direct-engine milestones:
 
-1. Load selected safetensors weights into Ascend HBM.
-2. Implement RMSNorm and RoPE with AscendC / ACL custom kernels.
-3. Implement decode GEMV / Linear and KV Cache layout.
-4. Implement GQA Attention, SwiGLU MLP, LM Head, and sampling.
+1. Implement RMSNorm and RoPE with AscendC / ACL custom kernels.
+2. Implement decode GEMV / Linear and KV Cache layout.
+3. Implement GQA Attention, SwiGLU MLP, LM Head, and sampling.
