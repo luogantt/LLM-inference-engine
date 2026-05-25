@@ -311,11 +311,17 @@ struct AscendEngine {
     void* d_tokens = nullptr;
     void* d_hidden = nullptr;
     void* d_q = nullptr;
+    void* d_k = nullptr;
+    void* d_v = nullptr;
     size_t token_bytes = 0;
     size_t hidden_bytes = 0;
     size_t hidden_row_bytes = 0;
     size_t q_bytes = 0;
     size_t q_row_bytes = 0;
+    size_t k_bytes = 0;
+    size_t k_row_bytes = 0;
+    size_t v_bytes = 0;
+    size_t v_row_bytes = 0;
     bool acl_ready = false;
     std::unordered_map<std::string, DeviceTensor> d_weights;
 
@@ -369,6 +375,14 @@ struct AscendEngine {
         if (d_q) {
             aclrtFree(d_q);
             d_q = nullptr;
+        }
+        if (d_k) {
+            aclrtFree(d_k);
+            d_k = nullptr;
+        }
+        if (d_v) {
+            aclrtFree(d_v);
+            d_v = nullptr;
         }
         if (d_tokens) {
             aclrtFree(d_tokens);
@@ -502,6 +516,9 @@ struct AscendEngine {
         }
         if (d_hidden && env_str_or("ASCEND_RUN_QPROJ", "0") != "0") {
             q_proj_reference(len);
+        }
+        if (d_hidden && env_str_or("ASCEND_RUN_KVPROJ", "0") != "0") {
+            kv_proj_reference(len);
         }
         auto t1 = Clock::now();
         time_log("[Ascend][time] prefill copied token_ids to HBM, tokens=" +
@@ -697,94 +714,138 @@ struct AscendEngine {
     }
 
     void ensure_q_buffer(const TensorMeta& q_meta) {
-        if (d_q) return;
-        if (q_meta.shape.size() != 2) {
-            throw std::runtime_error("q_proj weight must be 2D, got shape=" + shape_string(q_meta.shape));
-        }
-        if (q_meta.shape[1] != static_cast<size_t>(config.hidden)) {
-            throw std::runtime_error("q_proj in_features mismatch, shape=" + shape_string(q_meta.shape));
-        }
-        const size_t dtype_bytes = dtype_size_bytes(q_meta);
-        q_row_bytes = q_meta.shape[0] * dtype_bytes;
-        q_bytes = static_cast<size_t>(max_seq) * q_row_bytes;
-        check_acl(aclrtMalloc(&d_q, q_bytes, ACL_MEM_MALLOC_HUGE_FIRST), "aclrtMalloc(q buffer)");
-        check_acl(aclrtMemset(d_q, q_bytes, 0, q_bytes), "aclrtMemset(q buffer)");
-        time_log("[Ascend][time] q buffer allocated, row_bytes=" +
-                 std::to_string(q_row_bytes) +
-                 ", total_bytes=" + std::to_string(q_bytes));
+        ensure_projection_buffer(d_q, q_bytes, q_row_bytes, q_meta, "q");
     }
 
-    void q_proj_reference(int len) {
-        auto it = d_weights.find("model.layers.0.self_attn.q_proj.weight");
+    void ensure_projection_buffer(
+        void*& buffer,
+        size_t& total_bytes,
+        size_t& row_bytes,
+        const TensorMeta& weight_meta,
+        const std::string& label) {
+        if (buffer) return;
+        if (weight_meta.shape.size() != 2) {
+            throw std::runtime_error(label + "_proj weight must be 2D, got shape=" + shape_string(weight_meta.shape));
+        }
+        if (weight_meta.shape[1] != static_cast<size_t>(config.hidden)) {
+            throw std::runtime_error(label + "_proj in_features mismatch, shape=" + shape_string(weight_meta.shape));
+        }
+        const size_t dtype_bytes = dtype_size_bytes(weight_meta);
+        row_bytes = weight_meta.shape[0] * dtype_bytes;
+        total_bytes = static_cast<size_t>(max_seq) * row_bytes;
+        check_acl(aclrtMalloc(&buffer, total_bytes, ACL_MEM_MALLOC_HUGE_FIRST),
+                  ("aclrtMalloc(" + label + " buffer)").c_str());
+        check_acl(aclrtMemset(buffer, total_bytes, 0, total_bytes),
+                  ("aclrtMemset(" + label + " buffer)").c_str());
+        time_log("[Ascend][time] " + label + " buffer allocated, row_bytes=" +
+                 std::to_string(row_bytes) +
+                 ", total_bytes=" + std::to_string(total_bytes));
+    }
+
+    void linear_projection_reference(
+        const std::string& weight_name,
+        void*& out_buffer,
+        size_t& out_total_bytes,
+        size_t& out_row_bytes,
+        const std::string& label,
+        int len) {
+        auto it = d_weights.find(weight_name);
         if (it == d_weights.end()) {
             throw std::runtime_error(
-                "ASCEND_RUN_QPROJ=1 requires ASCEND_LOAD_WEIGHTS=layer0 or all");
+                "projection " + weight_name + " requires ASCEND_LOAD_WEIGHTS=layer0 or all");
         }
         if (!d_hidden || hidden_row_bytes == 0) {
-            throw std::runtime_error("q_proj requires hidden buffer");
+            throw std::runtime_error(label + "_proj requires hidden buffer");
         }
 
-        const DeviceTensor& q_weight = it->second;
-        const TensorMeta& q_meta = q_weight.meta;
-        ensure_q_buffer(q_meta);
+        const DeviceTensor& weight = it->second;
+        const TensorMeta& weight_meta = weight.meta;
+        ensure_projection_buffer(out_buffer, out_total_bytes, out_row_bytes, weight_meta, label);
 
-        const size_t out_dim = q_meta.shape[0];
-        const size_t in_dim = q_meta.shape[1];
+        const size_t out_dim = weight_meta.shape[0];
+        const size_t in_dim = weight_meta.shape[1];
         const TensorMeta& hidden_meta = d_weights.at("model.embed_tokens.weight").meta;
         const size_t hidden_dtype_bytes = dtype_size_bytes(hidden_meta);
-        const size_t q_dtype_bytes = dtype_size_bytes(q_meta);
+        const size_t weight_dtype_bytes = dtype_size_bytes(weight_meta);
         if (in_dim != static_cast<size_t>(config.hidden)) {
-            throw std::runtime_error("q_proj in_dim mismatch");
+            throw std::runtime_error(label + "_proj in_dim mismatch");
         }
 
         auto t0 = Clock::now();
         const size_t active_hidden_bytes = static_cast<size_t>(len) * hidden_row_bytes;
         std::vector<unsigned char> h_hidden(active_hidden_bytes);
-        std::vector<unsigned char> h_q_weight(q_weight.bytes);
-        std::vector<unsigned char> h_q(static_cast<size_t>(len) * q_row_bytes);
+        std::vector<unsigned char> h_weight(weight.bytes);
+        std::vector<unsigned char> h_out(static_cast<size_t>(len) * out_row_bytes);
 
         check_acl(aclrtMemcpy(h_hidden.data(), active_hidden_bytes, d_hidden, active_hidden_bytes,
                               ACL_MEMCPY_DEVICE_TO_HOST),
-                  "aclrtMemcpy(D2H hidden for q_proj)");
-        check_acl(aclrtMemcpy(h_q_weight.data(), q_weight.bytes, q_weight.data, q_weight.bytes,
+                  ("aclrtMemcpy(D2H hidden for " + label + "_proj)").c_str());
+        check_acl(aclrtMemcpy(h_weight.data(), weight.bytes, weight.data, weight.bytes,
                               ACL_MEMCPY_DEVICE_TO_HOST),
-                  "aclrtMemcpy(D2H q_proj weight)");
+                  ("aclrtMemcpy(D2H " + label + "_proj weight)").c_str());
 
-        const int max_tokens = env_int_or("ASCEND_QPROJ_REF_TOKENS", 1);
+        const int max_tokens = env_int_or("ASCEND_PROJ_REF_TOKENS", env_int_or("ASCEND_QPROJ_REF_TOKENS", 1));
         const int compute_tokens = std::max(0, std::min(len, max_tokens));
-        float first_q = 0.0f;
+        float first_value = 0.0f;
         for (int tok = 0; tok < compute_tokens; ++tok) {
             const unsigned char* xrow = h_hidden.data() + static_cast<size_t>(tok) * hidden_row_bytes;
-            unsigned char* qrow = h_q.data() + static_cast<size_t>(tok) * q_row_bytes;
+            unsigned char* outrow = h_out.data() + static_cast<size_t>(tok) * out_row_bytes;
             for (size_t out = 0; out < out_dim; ++out) {
-                const unsigned char* wrow = h_q_weight.data() + out * in_dim * q_dtype_bytes;
+                const unsigned char* wrow = h_weight.data() + out * in_dim * weight_dtype_bytes;
                 double acc = 0.0;
                 for (size_t in = 0; in < in_dim; ++in) {
                     const float x = load_scalar(xrow + in * hidden_dtype_bytes, hidden_meta.dtype);
-                    const float w = load_scalar(wrow + in * q_dtype_bytes, q_meta.dtype);
+                    const float w = load_scalar(wrow + in * weight_dtype_bytes, weight_meta.dtype);
                     acc += static_cast<double>(x) * static_cast<double>(w);
                 }
                 const float y = static_cast<float>(acc);
-                if (tok == 0 && out == 0) first_q = y;
-                store_scalar(qrow + out * q_dtype_bytes, q_meta.dtype, y);
+                if (tok == 0 && out == 0) first_value = y;
+                store_scalar(outrow + out * weight_dtype_bytes, weight_meta.dtype, y);
             }
         }
 
         if (compute_tokens > 0) {
-            const size_t active_q_bytes = static_cast<size_t>(compute_tokens) * q_row_bytes;
-            check_acl(aclrtMemcpy(d_q, q_bytes, h_q.data(), active_q_bytes, ACL_MEMCPY_HOST_TO_DEVICE),
-                      "aclrtMemcpy(H2D q_proj output)");
+            const size_t active_out_bytes = static_cast<size_t>(compute_tokens) * out_row_bytes;
+            check_acl(aclrtMemcpy(out_buffer, out_total_bytes, h_out.data(), active_out_bytes, ACL_MEMCPY_HOST_TO_DEVICE),
+                      ("aclrtMemcpy(H2D " + label + "_proj output)").c_str());
         }
 
         auto t1 = Clock::now();
-        time_log("[Ascend][time] q_proj reference finished, tokens_requested=" +
+        time_log("[Ascend][time] " + label + "_proj reference finished, tokens_requested=" +
                  std::to_string(len) +
                  ", tokens_computed=" + std::to_string(compute_tokens) +
                  ", in_dim=" + std::to_string(in_dim) +
                  ", out_dim=" + std::to_string(out_dim) +
-                 ", weight_dtype=" + q_meta.dtype +
-                 ", first_q=" + std::to_string(first_q) +
+                 ", weight_dtype=" + weight_meta.dtype +
+                 ", first_value=" + std::to_string(first_value) +
                  ", elapsed_ms=" + std::to_string(elapsed_ms(t0, t1)));
+    }
+
+    void q_proj_reference(int len) {
+        linear_projection_reference(
+            "model.layers.0.self_attn.q_proj.weight",
+            d_q,
+            q_bytes,
+            q_row_bytes,
+            "q",
+            len);
+    }
+
+    void kv_proj_reference(int len) {
+        linear_projection_reference(
+            "model.layers.0.self_attn.k_proj.weight",
+            d_k,
+            k_bytes,
+            k_row_bytes,
+            "k",
+            len);
+        linear_projection_reference(
+            "model.layers.0.self_attn.v_proj.weight",
+            d_v,
+            v_bytes,
+            v_row_bytes,
+            "v",
+            len);
     }
 
     int decode_one(int*) {
