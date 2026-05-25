@@ -485,6 +485,10 @@ struct AscendEngine {
         return flag != "0" && flag != "false" && flag != "False";
     }
 
+    int ref_layer_profile_token_limit() const {
+        return env_int_or("ASCEND_REF_PROFILE_TOKEN_LIMIT", 0);
+    }
+
     AscendEngine(const std::string& dir, int max_seq_)
         : device_id(env_int_or("ASCEND_DEVICE_ID", 0)),
           max_seq(max_seq_),
@@ -1559,8 +1563,12 @@ struct AscendEngine {
         auto load1 = Clock::now();
         auto layers0 = Clock::now();
         const bool profile_layers = ref_layer_profile_enabled();
+        const int profile_token_limit = ref_layer_profile_token_limit();
+        int profiled_tokens = 0;
         RefLayerProfile profile_total;
         for (int tok = start; tok < prompt_len; ++tok) {
+            const bool profile_this_token =
+                profile_layers && (profile_token_limit <= 0 || tok < profile_token_limit);
             std::vector<float> x(
                 hidden_rows.begin() + static_cast<size_t>(tok) * static_cast<size_t>(config.hidden),
                 hidden_rows.begin() + static_cast<size_t>(tok + 1) * static_cast<size_t>(config.hidden));
@@ -1570,9 +1578,10 @@ struct AscendEngine {
                     std::move(x),
                     layer,
                     tok,
-                    profile_layers ? &token_profile : nullptr);
+                    profile_this_token ? &token_profile : nullptr);
             }
-            if (profile_layers) {
+            if (profile_this_token) {
+                profiled_tokens++;
                 profile_total.add(token_profile);
                 time_log("[Ascend][profile] all_layers token=" + std::to_string(tok) +
                          ", norm1_ms=" + std::to_string(token_profile.norm1_ms) +
@@ -1590,9 +1599,9 @@ struct AscendEngine {
             full_ref_cached_len = tok + 1;
         }
         auto layers1 = Clock::now();
-        if (profile_layers && full_ref_cached_len > start) {
+        if (profile_layers && profiled_tokens > 0) {
             time_log("[Ascend][profile] all_layers aggregate, tokens_profiled=" +
-                     std::to_string(full_ref_cached_len - start) +
+                     std::to_string(profiled_tokens) +
                      ", norm1_ms=" + std::to_string(profile_total.norm1_ms) +
                      ", q_ms=" + std::to_string(profile_total.q_ms) +
                      ", kv_ms=" + std::to_string(profile_total.kv_ms) +

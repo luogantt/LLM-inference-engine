@@ -338,6 +338,7 @@ export ASCEND_REF_DOWN_THREADS=32
 export ASCEND_LM_HEAD_THREADS=16
 # Optional: set to 1 for one short run to profile q/kv/o/mlp/down bottlenecks.
 export ASCEND_REF_PROFILE_LAYERS=0
+export ASCEND_REF_PROFILE_TOKEN_LIMIT=16
 
 python python_infer.py \
   --model ./deepseek-r1-7b \
@@ -373,6 +374,10 @@ the 28-layer path. Use it with a very small `--max-new-tokens` value because it
 adds extra logs. The important fields are `q_ms`, `kv_ms`, `o_ms`,
 `gate_up_ms`, and `down_ms`; the largest fields should be moved to Ascend-side
 kernels first.
+
+`ASCEND_REF_PROFILE_TOKEN_LIMIT=16` limits profile output to early token
+positions. This keeps long generations readable while preserving enough timing
+data to identify hot operators.
 
 `ASCEND_REF_MLP_THREADS` and `ASCEND_REF_DOWN_THREADS` let the CPU reference
 path use more worker threads for the MLP hot path without also increasing every
