@@ -124,3 +124,50 @@ python python_infer.py \
   --tokenizer-backend tokenizers \
   --prefill-only
 ```
+
+## Ascend Direct Decode Reference
+
+The `Ascend` branch includes a CUDA-like direct AscendCL shared library path.
+The fastest direct smoke test is `lm_head_ref`:
+
+```bash
+make -f Makefile.cuda_lib lib-ascend ASCEND_HOME=/usr/local/Ascend/cann-8.5.1
+
+export ASCEND_VISIBLE_DEVICES=4
+export ASCEND_DEVICE_ID=0
+export ASCEND_LOAD_WEIGHTS=minimal
+export ASCEND_RUN_EMBED=1
+export ASCEND_RUN_RMSNORM=0
+export ASCEND_RUN_QPROJ=0
+export ASCEND_RUN_KVPROJ=0
+export ASCEND_DIRECT_DECODE=lm_head_ref
+
+python python_infer.py \
+  --model ./deepseek-r1-7b \
+  --lib ./build/libllm_ascend.so \
+  --prompt "hello deepseek" \
+  --max-new-tokens 1 \
+  --max-seq 800 \
+  --tokenizer-backend tokenizers
+```
+
+For the deeper one-layer reference path:
+
+```bash
+export ASCEND_VISIBLE_DEVICES=4
+export ASCEND_DEVICE_ID=0
+export ASCEND_LOAD_WEIGHTS=layer0
+export ASCEND_RUN_EMBED=1
+export ASCEND_RUN_RMSNORM=0
+export ASCEND_RUN_QPROJ=0
+export ASCEND_RUN_KVPROJ=0
+export ASCEND_DIRECT_DECODE=layer0_ref
+
+python python_infer.py \
+  --model ./deepseek-r1-7b \
+  --lib ./build/libllm_ascend.so \
+  --prompt "hello deepseek" \
+  --max-new-tokens 1 \
+  --max-seq 800 \
+  --tokenizer-backend tokenizers
+```

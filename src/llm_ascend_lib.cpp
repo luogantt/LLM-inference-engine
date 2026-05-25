@@ -17,6 +17,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 static thread_local std::string g_err;
@@ -862,6 +863,272 @@ struct AscendEngine {
         repetition_penalty = penalty > 0.0f ? penalty : 1.0f;
     }
 
+    const DeviceTensor& require_device_weight(const std::string& name) const {
+        auto it = d_weights.find(name);
+        if (it == d_weights.end()) {
+            throw std::runtime_error("missing loaded weight " + name + "; use ASCEND_LOAD_WEIGHTS=layer0 or all");
+        }
+        return it->second;
+    }
+
+    std::pair<size_t, size_t> matrix_shape(const std::string& name) const {
+        const DeviceTensor& w = require_device_weight(name);
+        if (w.meta.shape.size() != 2) {
+            throw std::runtime_error("weight must be 2D: " + name + " shape=" + shape_string(w.meta.shape));
+        }
+        return {w.meta.shape[0], w.meta.shape[1]};
+    }
+
+    std::vector<float> device_tensor_to_float_vector(const DeviceTensor& tensor, const std::string& label) {
+        const size_t n = tensor_numel(tensor.meta.shape);
+        const size_t dtype_bytes = dtype_size_bytes(tensor.meta);
+        std::vector<unsigned char> raw(tensor.bytes);
+        check_acl(aclrtMemcpy(raw.data(), tensor.bytes, tensor.data, tensor.bytes,
+                              ACL_MEMCPY_DEVICE_TO_HOST),
+                  ("aclrtMemcpy(D2H " + label + ")").c_str());
+
+        std::vector<float> out(n);
+        for (size_t i = 0; i < n; ++i) {
+            out[i] = load_scalar(raw.data() + i * dtype_bytes, tensor.meta.dtype);
+        }
+        return out;
+    }
+
+    std::vector<float> load_weight_float(const std::string& name) {
+        return device_tensor_to_float_vector(require_device_weight(name), name);
+    }
+
+    std::vector<float> load_hidden_rows_float(int len) {
+        if (!d_hidden || hidden_row_bytes == 0) {
+            throw std::runtime_error("hidden rows require embedding prefill first");
+        }
+        const TensorMeta& hidden_meta = require_device_weight("model.embed_tokens.weight").meta;
+        const size_t hidden_dtype_bytes = dtype_size_bytes(hidden_meta);
+        const size_t hidden = static_cast<size_t>(config.hidden);
+        const size_t active_bytes = static_cast<size_t>(len) * hidden_row_bytes;
+        std::vector<unsigned char> raw(active_bytes);
+        check_acl(aclrtMemcpy(raw.data(), active_bytes, d_hidden, active_bytes,
+                              ACL_MEMCPY_DEVICE_TO_HOST),
+                  "aclrtMemcpy(D2H hidden rows)");
+
+        std::vector<float> rows(static_cast<size_t>(len) * hidden);
+        for (int tok = 0; tok < len; ++tok) {
+            const unsigned char* row = raw.data() + static_cast<size_t>(tok) * hidden_row_bytes;
+            for (size_t j = 0; j < hidden; ++j) {
+                rows[static_cast<size_t>(tok) * hidden + j] =
+                    load_scalar(row + j * hidden_dtype_bytes, hidden_meta.dtype);
+            }
+        }
+        return rows;
+    }
+
+    void store_hidden_row_float(int row_idx, const std::vector<float>& x) {
+        if (row_idx < 0 || row_idx >= max_seq) throw std::runtime_error("hidden row index out of range");
+        if (x.size() != static_cast<size_t>(config.hidden)) {
+            throw std::runtime_error("store hidden row size mismatch");
+        }
+        const TensorMeta& hidden_meta = require_device_weight("model.embed_tokens.weight").meta;
+        const size_t hidden_dtype_bytes = dtype_size_bytes(hidden_meta);
+        std::vector<unsigned char> row(hidden_row_bytes);
+        for (size_t j = 0; j < x.size(); ++j) {
+            store_scalar(row.data() + j * hidden_dtype_bytes, hidden_meta.dtype, x[j]);
+        }
+        char* dst = static_cast<char*>(d_hidden) + static_cast<size_t>(row_idx) * hidden_row_bytes;
+        check_acl(aclrtMemcpy(dst, hidden_row_bytes, row.data(), hidden_row_bytes,
+                              ACL_MEMCPY_HOST_TO_DEVICE),
+                  "aclrtMemcpy(H2D hidden row)");
+    }
+
+    void rms_norm_inplace(std::vector<float>& x, const std::vector<float>& weight) const {
+        if (x.size() != weight.size()) throw std::runtime_error("RMSNorm vector size mismatch");
+        double sum_sq = 0.0;
+        for (float v : x) sum_sq += static_cast<double>(v) * static_cast<double>(v);
+        const float scale = 1.0f / std::sqrt(static_cast<float>(sum_sq / x.size()) + config.rms_norm_eps);
+        for (size_t i = 0; i < x.size(); ++i) x[i] = x[i] * scale * weight[i];
+    }
+
+    std::vector<float> linear_with_weight(
+        const std::vector<float>& x,
+        const std::vector<float>& weight,
+        size_t out_dim,
+        size_t in_dim,
+        const std::string& label) const {
+        if (x.size() != in_dim) {
+            throw std::runtime_error(label + " input dim mismatch");
+        }
+        if (weight.size() != out_dim * in_dim) {
+            throw std::runtime_error(label + " weight size mismatch");
+        }
+        std::vector<float> y(out_dim);
+        for (size_t out = 0; out < out_dim; ++out) {
+            const float* wrow = weight.data() + out * in_dim;
+            double acc = 0.0;
+            for (size_t in = 0; in < in_dim; ++in) {
+                acc += static_cast<double>(x[in]) * static_cast<double>(wrow[in]);
+            }
+            y[out] = static_cast<float>(acc);
+        }
+        return y;
+    }
+
+    void apply_rope(std::vector<float>& x, int heads, int pos) const {
+        const int head_dim = config.hidden / config.n_heads;
+        if (head_dim <= 0 || head_dim % 2 != 0) throw std::runtime_error("bad RoPE head_dim");
+        if (x.size() != static_cast<size_t>(heads * head_dim)) {
+            throw std::runtime_error("RoPE vector size mismatch");
+        }
+        const int half = head_dim / 2;
+        for (int h = 0; h < heads; ++h) {
+            const int base = h * head_dim;
+            for (int p = 0; p < half; ++p) {
+                const float inv = std::pow(config.rope_theta, -static_cast<float>(2 * p) / head_dim);
+                const float angle = static_cast<float>(pos) * inv;
+                const float c = std::cos(angle);
+                const float s = std::sin(angle);
+                const int d0 = base + p;
+                const int d1 = base + p + half;
+                const float v0 = x[d0];
+                const float v1 = x[d1];
+                x[d0] = v0 * c - v1 * s;
+                x[d1] = v0 * s + v1 * c;
+            }
+        }
+    }
+
+    std::vector<float> final_norm_vector(std::vector<float> x) {
+        std::vector<float> norm = load_weight_float("model.norm.weight");
+        rms_norm_inplace(x, norm);
+        return x;
+    }
+
+    std::vector<float> layer0_last_token_reference() {
+        if (prompt_len <= 0) throw std::runtime_error("layer0_ref requires prefill first");
+        const size_t hidden = static_cast<size_t>(config.hidden);
+        const int head_dim = config.hidden / config.n_heads;
+        const int kv_dim = config.n_kv_heads * head_dim;
+        const int group = config.n_heads / config.n_kv_heads;
+        if (head_dim <= 0 || group <= 0 || config.n_heads % config.n_kv_heads != 0) {
+            throw std::runtime_error("bad attention head config for layer0_ref");
+        }
+
+        auto t0 = Clock::now();
+        const int len = prompt_len;
+        std::vector<float> hidden_rows = load_hidden_rows_float(len);
+        const size_t last_off = static_cast<size_t>(len - 1) * hidden;
+        std::vector<float> residual(hidden_rows.begin() + last_off, hidden_rows.begin() + last_off + hidden);
+
+        std::vector<float> ln1 = load_weight_float("model.layers.0.input_layernorm.weight");
+        std::vector<float> wq = load_weight_float("model.layers.0.self_attn.q_proj.weight");
+        std::vector<float> wk = load_weight_float("model.layers.0.self_attn.k_proj.weight");
+        std::vector<float> wv = load_weight_float("model.layers.0.self_attn.v_proj.weight");
+        std::vector<float> wo = load_weight_float("model.layers.0.self_attn.o_proj.weight");
+
+        const auto q_shape = matrix_shape("model.layers.0.self_attn.q_proj.weight");
+        const auto k_shape = matrix_shape("model.layers.0.self_attn.k_proj.weight");
+        const auto v_shape = matrix_shape("model.layers.0.self_attn.v_proj.weight");
+        const auto o_shape = matrix_shape("model.layers.0.self_attn.o_proj.weight");
+        if (q_shape.first != hidden || q_shape.second != hidden ||
+            k_shape.first != static_cast<size_t>(kv_dim) || k_shape.second != hidden ||
+            v_shape.first != static_cast<size_t>(kv_dim) || v_shape.second != hidden ||
+            o_shape.first != hidden || o_shape.second != hidden) {
+            throw std::runtime_error("layer0 attention projection shape mismatch");
+        }
+
+        std::vector<float> q_in = residual;
+        rms_norm_inplace(q_in, ln1);
+        std::vector<float> q = linear_with_weight(q_in, wq, hidden, hidden, "layer0 q_proj");
+        apply_rope(q, config.n_heads, len - 1);
+
+        std::vector<float> k_cache(static_cast<size_t>(len) * kv_dim);
+        std::vector<float> v_cache(static_cast<size_t>(len) * kv_dim);
+        for (int tok = 0; tok < len; ++tok) {
+            std::vector<float> x(hidden_rows.begin() + static_cast<size_t>(tok) * hidden,
+                                 hidden_rows.begin() + static_cast<size_t>(tok + 1) * hidden);
+            rms_norm_inplace(x, ln1);
+            std::vector<float> k = linear_with_weight(x, wk, static_cast<size_t>(kv_dim), hidden, "layer0 k_proj");
+            std::vector<float> v = linear_with_weight(x, wv, static_cast<size_t>(kv_dim), hidden, "layer0 v_proj");
+            apply_rope(k, config.n_kv_heads, tok);
+            std::copy(k.begin(), k.end(), k_cache.begin() + static_cast<size_t>(tok) * kv_dim);
+            std::copy(v.begin(), v.end(), v_cache.begin() + static_cast<size_t>(tok) * kv_dim);
+        }
+
+        std::vector<float> ctx(hidden, 0.0f);
+        const float attn_scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+        std::vector<float> scores(len);
+        for (int h = 0; h < config.n_heads; ++h) {
+            const int kh = h / group;
+            const float* qh = q.data() + static_cast<size_t>(h) * head_dim;
+            float max_score = -std::numeric_limits<float>::infinity();
+            for (int tok = 0; tok < len; ++tok) {
+                const float* kk = k_cache.data() + static_cast<size_t>(tok) * kv_dim + static_cast<size_t>(kh) * head_dim;
+                double dot = 0.0;
+                for (int d = 0; d < head_dim; ++d) {
+                    dot += static_cast<double>(qh[d]) * static_cast<double>(kk[d]);
+                }
+                scores[tok] = static_cast<float>(dot) * attn_scale;
+                max_score = std::max(max_score, scores[tok]);
+            }
+
+            double denom = 0.0;
+            for (int tok = 0; tok < len; ++tok) {
+                scores[tok] = std::exp(scores[tok] - max_score);
+                denom += scores[tok];
+            }
+            const float inv_denom = denom > 0.0 ? static_cast<float>(1.0 / denom) : 0.0f;
+            for (int d = 0; d < head_dim; ++d) {
+                double acc = 0.0;
+                for (int tok = 0; tok < len; ++tok) {
+                    const float prob = scores[tok] * inv_denom;
+                    const float* vv = v_cache.data() + static_cast<size_t>(tok) * kv_dim + static_cast<size_t>(kh) * head_dim;
+                    acc += static_cast<double>(prob) * static_cast<double>(vv[d]);
+                }
+                ctx[static_cast<size_t>(h) * head_dim + d] = static_cast<float>(acc);
+            }
+        }
+
+        std::vector<float> attn_out = linear_with_weight(ctx, wo, hidden, hidden, "layer0 o_proj");
+        std::vector<float> after_attn(hidden);
+        for (size_t i = 0; i < hidden; ++i) after_attn[i] = residual[i] + attn_out[i];
+
+        std::vector<float> ln2 = load_weight_float("model.layers.0.post_attention_layernorm.weight");
+        std::vector<float> mlp_in = after_attn;
+        rms_norm_inplace(mlp_in, ln2);
+
+        std::vector<float> wgate = load_weight_float("model.layers.0.mlp.gate_proj.weight");
+        std::vector<float> wup = load_weight_float("model.layers.0.mlp.up_proj.weight");
+        std::vector<float> wdown = load_weight_float("model.layers.0.mlp.down_proj.weight");
+        const auto gate_shape = matrix_shape("model.layers.0.mlp.gate_proj.weight");
+        const auto up_shape = matrix_shape("model.layers.0.mlp.up_proj.weight");
+        const auto down_shape = matrix_shape("model.layers.0.mlp.down_proj.weight");
+        if (gate_shape.first != static_cast<size_t>(config.intermediate) || gate_shape.second != hidden ||
+            up_shape.first != static_cast<size_t>(config.intermediate) || up_shape.second != hidden ||
+            down_shape.first != hidden || down_shape.second != static_cast<size_t>(config.intermediate)) {
+            throw std::runtime_error("layer0 MLP projection shape mismatch");
+        }
+
+        std::vector<float> gate = linear_with_weight(mlp_in, wgate, static_cast<size_t>(config.intermediate), hidden, "layer0 gate_proj");
+        std::vector<float> up = linear_with_weight(mlp_in, wup, static_cast<size_t>(config.intermediate), hidden, "layer0 up_proj");
+        std::vector<float> mid(static_cast<size_t>(config.intermediate));
+        for (int i = 0; i < config.intermediate; ++i) {
+            const float g = gate[static_cast<size_t>(i)];
+            mid[static_cast<size_t>(i)] = (g / (1.0f + std::exp(-g))) * up[static_cast<size_t>(i)];
+        }
+
+        std::vector<float> mlp_out = linear_with_weight(mid, wdown, hidden, static_cast<size_t>(config.intermediate), "layer0 down_proj");
+        std::vector<float> out(hidden);
+        for (size_t i = 0; i < hidden; ++i) out[i] = after_attn[i] + mlp_out[i];
+        store_hidden_row_float(len - 1, out);
+
+        auto t1 = Clock::now();
+        time_log("[Ascend][time] layer0 reference finished, tokens=" +
+                 std::to_string(len) +
+                 ", hidden=" + std::to_string(hidden) +
+                 ", head_dim=" + std::to_string(head_dim) +
+                 ", kv_dim=" + std::to_string(kv_dim) +
+                 ", elapsed_ms=" + std::to_string(elapsed_ms(t0, t1)));
+        return final_norm_vector(out);
+    }
+
     std::vector<float> load_last_hidden_with_final_norm() {
         if (prompt_len <= 0) throw std::runtime_error("decode requires prefill first");
         if (!d_hidden || hidden_row_bytes == 0) {
@@ -1001,19 +1268,21 @@ struct AscendEngine {
     int decode_one(int* out_token) {
         if (!out_token) throw std::runtime_error("decode output pointer is null");
         const std::string mode = env_str_or("ASCEND_DIRECT_DECODE", "lm_head_ref");
-        if (mode != "lm_head_ref") {
+        if (mode != "lm_head_ref" && mode != "layer0_ref") {
             throw std::runtime_error(
                 "unsupported ASCEND_DIRECT_DECODE=" + mode +
-                ", only lm_head_ref is implemented");
+                ", use one of: lm_head_ref, layer0_ref");
         }
 
         auto t0 = Clock::now();
-        std::vector<float> x = load_last_hidden_with_final_norm();
+        std::vector<float> x = mode == "layer0_ref"
+                                   ? layer0_last_token_reference()
+                                   : load_last_hidden_with_final_norm();
         const int token = lm_head_argmax_reference(x);
         append_generated_token(token);
         *out_token = token;
         auto t1 = Clock::now();
-        time_log("[Ascend][time] decode lm_head_ref finished, token=" +
+        time_log("[Ascend][time] decode " + mode + " finished, token=" +
                  std::to_string(token) +
                  ", pos=" + std::to_string(prompt_len) +
                  ", elapsed_ms=" + std::to_string(elapsed_ms(t0, t1)));

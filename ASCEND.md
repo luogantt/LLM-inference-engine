@@ -236,8 +236,70 @@ Expected extra log:
 [Ascend][time] q_proj reference finished ...
 ```
 
+## Output Text From Direct ACL
+
+The first direct decode milestone is `lm_head_ref`. It uses real HBM-loaded
+embedding, final RMSNorm, and `lm_head.weight` to return a token through the C
+ABI. This proves the direct ACL path can output text, but it does not run the
+Transformer layers yet:
+
+```bash
+export ASCEND_VISIBLE_DEVICES=4
+export ASCEND_DEVICE_ID=0
+export ASCEND_LOAD_WEIGHTS=minimal
+export ASCEND_RUN_EMBED=1
+export ASCEND_RUN_RMSNORM=0
+export ASCEND_RUN_QPROJ=0
+export ASCEND_RUN_KVPROJ=0
+export ASCEND_DIRECT_DECODE=lm_head_ref
+
+python python_infer.py \
+  --model ./deepseek-r1-7b \
+  --lib ./build/libllm_ascend.so \
+  --prompt "hello deepseek" \
+  --max-new-tokens 1 \
+  --max-seq 800 \
+  --tokenizer-backend tokenizers
+```
+
+The next reference milestone is `layer0_ref`. It runs one real Transformer
+block on the last prompt token: input RMSNorm, Q/K/V projections, RoPE, GQA
+attention, O projection, residual, post-attention RMSNorm, SwiGLU MLP, final
+RMSNorm, and lm_head argmax.
+
+```bash
+export ASCEND_VISIBLE_DEVICES=4
+export ASCEND_DEVICE_ID=0
+export ASCEND_LOAD_WEIGHTS=layer0
+export ASCEND_RUN_EMBED=1
+export ASCEND_RUN_RMSNORM=0
+export ASCEND_RUN_QPROJ=0
+export ASCEND_RUN_KVPROJ=0
+export ASCEND_DIRECT_DECODE=layer0_ref
+
+python python_infer.py \
+  --model ./deepseek-r1-7b \
+  --lib ./build/libllm_ascend.so \
+  --prompt "hello deepseek" \
+  --max-new-tokens 1 \
+  --max-seq 800 \
+  --tokenizer-backend tokenizers
+```
+
+Expected logs:
+
+```text
+[Ascend][time] layer0 reference finished ...
+[Ascend][time] lm_head argmax reference finished ...
+[0] token=...
+```
+
+`layer0_ref` is intentionally a correctness/reference path. It copies weights
+back to host and performs scalar GEMV, so it is slow. The performance path is to
+replace these reference blocks with AscendC / ACL kernels.
+
 Next direct-engine milestones:
 
-1. Replace RMSNorm reference with an AscendC kernel.
-2. Replace q_proj reference with an AscendC/GEMV kernel and add k/v/o projections.
-3. Implement RoPE, KV Cache layout, GQA Attention, SwiGLU MLP, LM Head, and sampling.
+1. Extend the reference path from layer 0 to all 28 layers for correctness.
+2. Replace RMSNorm / QKV / Attention / MLP reference math with AscendC kernels.
+3. Add KV Cache reuse for decode and move lm_head argmax onto device.
