@@ -11,6 +11,7 @@
 #include <exception>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <regex>
 #include <sstream>
 #include <stdexcept>
@@ -302,9 +303,11 @@ struct AscendEngine {
     int device_id = 0;
     int max_seq = 0;
     int prompt_len = 0;
+    float repetition_penalty = 1.1f;
     std::string model_dir;
     ModelConfig config;
     std::unordered_map<std::string, TensorMeta> metas;
+    std::vector<unsigned char> seen_tokens;
 
     aclrtContext context = nullptr;
     aclrtStream stream = nullptr;
@@ -349,6 +352,7 @@ struct AscendEngine {
         check_acl(aclrtMalloc(&d_tokens, token_bytes, ACL_MEM_MALLOC_HUGE_FIRST), "aclrtMalloc(tokens)");
         check_acl(aclrtMemset(d_tokens, token_bytes, 0, token_bytes), "aclrtMemset(tokens)");
         check_acl(aclrtSynchronizeStream(stream), "aclrtSynchronizeStream(init)");
+        seen_tokens.assign(static_cast<size_t>(config.vocab_size), 0);
         load_requested_weights();
 
         auto t1 = Clock::now();
@@ -507,6 +511,12 @@ struct AscendEngine {
         }
 
         prompt_len = len;
+        std::fill(seen_tokens.begin(), seen_tokens.end(), 0);
+        for (int i = 0; i < len; ++i) {
+            if (ids[i] >= 0 && static_cast<size_t>(ids[i]) < seen_tokens.size()) {
+                seen_tokens[static_cast<size_t>(ids[i])] = 1;
+            }
+        }
         if (d_weights.find("model.embed_tokens.weight") != d_weights.end() &&
             env_str_or("ASCEND_RUN_EMBED", "1") != "0") {
             embedding_lookup(ids, len);
@@ -848,11 +858,166 @@ struct AscendEngine {
             len);
     }
 
-    int decode_one(int*) {
-        throw std::runtime_error(
-            "Ascend direct decode kernels are not implemented yet. "
-            "Runtime, HBM allocation, safetensors scan, and prefill token copy are ready; "
-            "next step is ACL/AscendC kernels for RMSNorm/RoPE/Attention/MLP/LMHead.");
+    void set_repetition_penalty(float penalty) {
+        repetition_penalty = penalty > 0.0f ? penalty : 1.0f;
+    }
+
+    std::vector<float> load_last_hidden_with_final_norm() {
+        if (prompt_len <= 0) throw std::runtime_error("decode requires prefill first");
+        if (!d_hidden || hidden_row_bytes == 0) {
+            throw std::runtime_error("decode requires hidden buffer; load embedding and keep ASCEND_RUN_EMBED=1");
+        }
+
+        auto norm_it = d_weights.find("model.norm.weight");
+        if (norm_it == d_weights.end()) {
+            throw std::runtime_error("decode requires model.norm.weight; use ASCEND_LOAD_WEIGHTS=minimal/layer0/all");
+        }
+        const DeviceTensor& norm = norm_it->second;
+        if (norm.meta.shape.size() != 1 || norm.meta.shape[0] != static_cast<size_t>(config.hidden)) {
+            throw std::runtime_error("bad final RMSNorm weight shape=" + shape_string(norm.meta.shape));
+        }
+
+        const TensorMeta& hidden_meta = d_weights.at("model.embed_tokens.weight").meta;
+        const size_t hidden_dtype_bytes = dtype_size_bytes(hidden_meta);
+        const size_t norm_dtype_bytes = dtype_size_bytes(norm.meta);
+        const size_t hidden = static_cast<size_t>(config.hidden);
+        if (hidden_row_bytes != hidden * hidden_dtype_bytes) {
+            throw std::runtime_error("hidden row bytes mismatch before decode");
+        }
+
+        std::vector<unsigned char> h_hidden(hidden_row_bytes);
+        std::vector<unsigned char> h_norm(norm.bytes);
+        const size_t row_index = static_cast<size_t>(prompt_len - 1);
+        char* row_ptr = static_cast<char*>(d_hidden) + row_index * hidden_row_bytes;
+        check_acl(aclrtMemcpy(h_hidden.data(), hidden_row_bytes, row_ptr, hidden_row_bytes,
+                              ACL_MEMCPY_DEVICE_TO_HOST),
+                  "aclrtMemcpy(D2H last hidden for decode)");
+        check_acl(aclrtMemcpy(h_norm.data(), norm.bytes, norm.data, norm.bytes,
+                              ACL_MEMCPY_DEVICE_TO_HOST),
+                  "aclrtMemcpy(D2H final norm for decode)");
+
+        std::vector<float> x(hidden);
+        double sum_sq = 0.0;
+        for (size_t j = 0; j < hidden; ++j) {
+            const float v = load_scalar(h_hidden.data() + j * hidden_dtype_bytes, hidden_meta.dtype);
+            x[j] = v;
+            sum_sq += static_cast<double>(v) * static_cast<double>(v);
+        }
+
+        const float scale = 1.0f / std::sqrt(static_cast<float>(sum_sq / hidden) + config.rms_norm_eps);
+        for (size_t j = 0; j < hidden; ++j) {
+            const float w = load_scalar(h_norm.data() + j * norm_dtype_bytes, norm.meta.dtype);
+            x[j] = x[j] * scale * w;
+        }
+        return x;
+    }
+
+    int lm_head_argmax_reference(const std::vector<float>& x) {
+        auto head_it = d_weights.find("lm_head.weight");
+        if (head_it == d_weights.end()) {
+            throw std::runtime_error("decode requires lm_head.weight; use ASCEND_LOAD_WEIGHTS=minimal/layer0/all");
+        }
+
+        const DeviceTensor& head = head_it->second;
+        const TensorMeta& meta = head.meta;
+        if (meta.shape.size() != 2 ||
+            meta.shape[0] != static_cast<size_t>(config.vocab_size) ||
+            meta.shape[1] != static_cast<size_t>(config.hidden)) {
+            throw std::runtime_error("bad lm_head.weight shape=" + shape_string(meta.shape));
+        }
+
+        auto t0 = Clock::now();
+        std::vector<unsigned char> h_head(head.bytes);
+        check_acl(aclrtMemcpy(h_head.data(), head.bytes, head.data, head.bytes,
+                              ACL_MEMCPY_DEVICE_TO_HOST),
+                  "aclrtMemcpy(D2H lm_head for decode)");
+
+        const size_t vocab = meta.shape[0];
+        const size_t hidden = meta.shape[1];
+        const size_t dtype_bytes = dtype_size_bytes(meta);
+        const size_t vocab_limit_env = static_cast<size_t>(std::max(0, env_int_or("ASCEND_LM_HEAD_REF_VOCAB", 0)));
+        const size_t vocab_limit = vocab_limit_env > 0 ? std::min(vocab, vocab_limit_env) : vocab;
+        const bool suppress_special = env_str_or("ASCEND_SUPPRESS_SPECIAL", "0") != "0";
+
+        int best_id = 0;
+        float best = -std::numeric_limits<float>::infinity();
+        for (size_t tok = 0; tok < vocab_limit; ++tok) {
+            if (suppress_special && tok >= 151000) continue;
+            const unsigned char* wrow = h_head.data() + tok * hidden * dtype_bytes;
+            double acc = 0.0;
+            for (size_t j = 0; j < hidden; ++j) {
+                const float w = load_scalar(wrow + j * dtype_bytes, meta.dtype);
+                acc += static_cast<double>(x[j]) * static_cast<double>(w);
+            }
+            float logit = static_cast<float>(acc);
+            if (tok < seen_tokens.size() && seen_tokens[tok] && repetition_penalty > 1.0f) {
+                logit = logit >= 0.0f ? logit / repetition_penalty : logit * repetition_penalty;
+            }
+            if (logit > best) {
+                best = logit;
+                best_id = static_cast<int>(tok);
+            }
+        }
+
+        auto t1 = Clock::now();
+        time_log("[Ascend][time] lm_head argmax reference finished, vocab_scanned=" +
+                 std::to_string(vocab_limit) +
+                 ", hidden=" + std::to_string(hidden) +
+                 ", weight_dtype=" + meta.dtype +
+                 ", token=" + std::to_string(best_id) +
+                 ", logit=" + std::to_string(best) +
+                 ", elapsed_ms=" + std::to_string(elapsed_ms(t0, t1)));
+        return best_id;
+    }
+
+    void append_generated_token(int token) {
+        if (prompt_len >= max_seq) throw std::runtime_error("decode exceeds max_seq");
+        const size_t token_offset = static_cast<size_t>(prompt_len) * sizeof(int);
+        check_acl(aclrtMemcpy(static_cast<char*>(d_tokens) + token_offset,
+                              token_bytes - token_offset,
+                              &token,
+                              sizeof(int),
+                              ACL_MEMCPY_HOST_TO_DEVICE),
+                  "aclrtMemcpy(H2D generated token)");
+
+        auto embed_it = d_weights.find("model.embed_tokens.weight");
+        if (embed_it != d_weights.end() && d_hidden && hidden_row_bytes > 0) {
+            const DeviceTensor& embed = embed_it->second;
+            if (token < 0 || static_cast<size_t>(token) >= embed.meta.shape[0]) {
+                throw std::runtime_error("generated token out of embedding vocab range: " + std::to_string(token));
+            }
+            char* src = static_cast<char*>(embed.data) + static_cast<size_t>(token) * hidden_row_bytes;
+            char* dst = static_cast<char*>(d_hidden) + static_cast<size_t>(prompt_len) * hidden_row_bytes;
+            check_acl(aclrtMemcpy(dst, hidden_row_bytes, src, hidden_row_bytes, ACL_MEMCPY_DEVICE_TO_DEVICE),
+                      "aclrtMemcpy(D2D generated token embedding)");
+        }
+
+        if (token >= 0 && static_cast<size_t>(token) < seen_tokens.size()) {
+            seen_tokens[static_cast<size_t>(token)] = 1;
+        }
+        prompt_len++;
+    }
+
+    int decode_one(int* out_token) {
+        if (!out_token) throw std::runtime_error("decode output pointer is null");
+        const std::string mode = env_str_or("ASCEND_DIRECT_DECODE", "lm_head_ref");
+        if (mode != "lm_head_ref") {
+            throw std::runtime_error(
+                "unsupported ASCEND_DIRECT_DECODE=" + mode +
+                ", only lm_head_ref is implemented");
+        }
+
+        auto t0 = Clock::now();
+        std::vector<float> x = load_last_hidden_with_final_norm();
+        const int token = lm_head_argmax_reference(x);
+        append_generated_token(token);
+        *out_token = token;
+        auto t1 = Clock::now();
+        time_log("[Ascend][time] decode lm_head_ref finished, token=" +
+                 std::to_string(token) +
+                 ", pos=" + std::to_string(prompt_len) +
+                 ", elapsed_ms=" + std::to_string(elapsed_ms(t0, t1)));
+        return 0;
     }
 };
 
@@ -901,8 +1066,15 @@ int llm_decode_one(void* handle, int* out_token) {
     }
 }
 
-int llm_set_repetition_penalty(void*, float) {
-    return 0;
+int llm_set_repetition_penalty(void* handle, float penalty) {
+    try {
+        if (!handle) throw std::runtime_error("engine handle is null");
+        auto* e = reinterpret_cast<AscendEngine*>(handle);
+        e->set_repetition_penalty(penalty);
+        return 0;
+    } catch (const std::exception& e) {
+        return fail(e);
+    }
 }
 
 const char* llm_last_error() {
