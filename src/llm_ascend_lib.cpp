@@ -329,6 +329,7 @@ struct AscendEngine {
     size_t v_row_bytes = 0;
     bool acl_ready = false;
     std::unordered_map<std::string, DeviceTensor> d_weights;
+    std::unordered_map<std::string, std::vector<unsigned char>> h_weight_raw_cache;
     std::unordered_map<std::string, std::vector<float>> h_weight_cache;
     std::unordered_map<std::string, std::vector<uint16_t>> h_weight_u16_cache;
     std::vector<float> layer0_k_cache;
@@ -355,6 +356,14 @@ struct AscendEngine {
             return explicit_flag != "0" && explicit_flag != "false" && explicit_flag != "False";
         }
         return env_str_or("ASCEND_LOAD_WEIGHTS", "none") != "all";
+    }
+
+    bool host_raw_cache_enabled() const {
+        const std::string explicit_flag = env_str_or("ASCEND_HOST_RAW_CACHE", "");
+        if (!explicit_flag.empty()) {
+            return explicit_flag != "0" && explicit_flag != "false" && explicit_flag != "False";
+        }
+        return env_str_or("ASCEND_DIRECT_DECODE", "lm_head_ref") == "all_layers_ref";
     }
 
     AscendEngine(const std::string& dir, int max_seq_)
@@ -477,6 +486,9 @@ struct AscendEngine {
                      ", h2d_ms=" + std::to_string(elapsed_ms(t0, t1)));
         }
 
+        if (host_raw_cache_enabled()) {
+            h_weight_raw_cache.emplace(name, std::move(raw));
+        }
         d_weights.emplace(name, dt);
         return true;
     }
@@ -606,6 +618,23 @@ struct AscendEngine {
             return f;
         }
         throw std::runtime_error("unsupported tensor dtype for scalar load: " + dtype);
+    }
+
+    static std::vector<float> raw_tensor_to_float_vector(
+        const TensorMeta& meta,
+        const unsigned char* raw,
+        size_t raw_bytes,
+        const std::string& label) {
+        const size_t n = tensor_numel(meta.shape);
+        const size_t dtype_bytes = dtype_size_bytes(meta);
+        if (raw_bytes != n * dtype_bytes) {
+            throw std::runtime_error("raw tensor bytes mismatch for " + label);
+        }
+        std::vector<float> out(n);
+        for (size_t i = 0; i < n; ++i) {
+            out[i] = load_scalar(raw + i * dtype_bytes, meta.dtype);
+        }
+        return out;
     }
 
     static void store_scalar(unsigned char* p, const std::string& dtype, float value) {
@@ -933,6 +962,18 @@ struct AscendEngine {
         return out;
     }
 
+    std::vector<float> weight_to_float_vector(const std::string& name) {
+        auto raw_it = h_weight_raw_cache.find(name);
+        if (raw_it != h_weight_raw_cache.end()) {
+            return raw_tensor_to_float_vector(
+                require_device_weight(name).meta,
+                raw_it->second.data(),
+                raw_it->second.size(),
+                name);
+        }
+        return device_tensor_to_float_vector(require_device_weight(name), name);
+    }
+
     std::vector<float> load_weight_float(const std::string& name) {
         const bool cache_enabled = env_str_or("ASCEND_REF_CACHE_WEIGHTS", "1") != "0";
         if (cache_enabled) {
@@ -941,7 +982,7 @@ struct AscendEngine {
         }
 
         auto t0 = Clock::now();
-        std::vector<float> value = device_tensor_to_float_vector(require_device_weight(name), name);
+        std::vector<float> value = weight_to_float_vector(name);
         auto t1 = Clock::now();
         if (cache_enabled) {
             const size_t bytes = value.size() * sizeof(float);
@@ -950,7 +991,7 @@ struct AscendEngine {
                 time_log("[Ascend][time] cached host reference weight, name=" + name +
                          ", elements=" + std::to_string(value.size()) +
                          ", fp32_bytes=" + std::to_string(bytes) +
-                         ", d2h_convert_ms=" + std::to_string(elapsed_ms(t0, t1)));
+                         ", load_convert_ms=" + std::to_string(elapsed_ms(t0, t1)));
             }
             return h_weight_cache.at(name);
         }
@@ -962,7 +1003,7 @@ struct AscendEngine {
         if (cached != h_weight_cache.end()) return cached->second;
 
         auto t0 = Clock::now();
-        std::vector<float> value = device_tensor_to_float_vector(require_device_weight(name), name);
+        std::vector<float> value = weight_to_float_vector(name);
         auto t1 = Clock::now();
         const size_t bytes = value.size() * sizeof(float);
         auto inserted = h_weight_cache.emplace(name, std::move(value));
@@ -970,7 +1011,7 @@ struct AscendEngine {
             time_log("[Ascend][time] cached host reference weight, name=" + name +
                      ", elements=" + std::to_string(inserted.first->second.size()) +
                      ", fp32_bytes=" + std::to_string(bytes) +
-                     ", d2h_convert_ms=" + std::to_string(elapsed_ms(t0, t1)));
+                     ", load_convert_ms=" + std::to_string(elapsed_ms(t0, t1)));
         }
         return inserted.first->second;
     }
@@ -991,16 +1032,21 @@ struct AscendEngine {
 
         auto t0 = Clock::now();
         std::vector<uint16_t> value(n);
-        check_acl(aclrtMemcpy(value.data(), tensor.bytes, tensor.data, tensor.bytes,
-                              ACL_MEMCPY_DEVICE_TO_HOST),
-                  ("aclrtMemcpy(D2H raw u16 " + name + ")").c_str());
+        auto raw_it = h_weight_raw_cache.find(name);
+        if (raw_it != h_weight_raw_cache.end()) {
+            std::memcpy(value.data(), raw_it->second.data(), tensor.bytes);
+        } else {
+            check_acl(aclrtMemcpy(value.data(), tensor.bytes, tensor.data, tensor.bytes,
+                                  ACL_MEMCPY_DEVICE_TO_HOST),
+                      ("aclrtMemcpy(D2H raw u16 " + name + ")").c_str());
+        }
         auto t1 = Clock::now();
         auto inserted = h_weight_u16_cache.emplace(name, std::move(value));
         if (ref_cache_log_enabled()) {
             time_log("[Ascend][time] cached host raw u16 weight, name=" + name +
                      ", elements=" + std::to_string(inserted.first->second.size()) +
                      ", raw_bytes=" + std::to_string(tensor.bytes) +
-                     ", d2h_ms=" + std::to_string(elapsed_ms(t0, t1)));
+                     ", load_ms=" + std::to_string(elapsed_ms(t0, t1)));
         }
         return inserted.first->second;
     }

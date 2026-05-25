@@ -324,6 +324,7 @@ export ASCEND_VISIBLE_DEVICES=4
 export ASCEND_DEVICE_ID=0
 export ASCEND_LOAD_WEIGHTS=all
 export ASCEND_WEIGHT_LOAD_LOG=0
+export ASCEND_HOST_RAW_CACHE=1
 export ASCEND_RUN_EMBED=1
 export ASCEND_DIRECT_DECODE=all_layers_ref
 export ASCEND_REF_CACHE_WEIGHTS=1
@@ -351,6 +352,11 @@ to AscendC/ACL operators.
 
 `ASCEND_WEIGHT_LOAD_LOG=0` suppresses per-weight HBM load logs when loading the
 full model. The aggregate `requested weights loaded` line is still printed.
+
+`ASCEND_HOST_RAW_CACHE=1` keeps the raw BF16/F16 safetensors bytes on host after
+HBM upload. The reference path then builds FP32 host weights from this host copy
+instead of copying weights back from HBM on the first decode step. Disable it
+with `ASCEND_HOST_RAW_CACHE=0` if host memory is tight.
 
 Next direct-engine milestones:
 
