@@ -335,6 +335,11 @@ struct AscendEngine {
     std::vector<float> layer0_v_cache;
     int layer0_kv_cached_len = 0;
     int layer0_kv_dim = 0;
+    std::vector<std::vector<float>> full_k_cache;
+    std::vector<std::vector<float>> full_v_cache;
+    int full_ref_cached_len = 0;
+    int full_ref_kv_dim = 0;
+    std::vector<float> full_last_hidden;
 
     AscendEngine(const std::string& dir, int max_seq_)
         : device_id(env_int_or("ASCEND_DEVICE_ID", 0)),
@@ -523,6 +528,11 @@ struct AscendEngine {
         layer0_v_cache.clear();
         layer0_kv_cached_len = 0;
         layer0_kv_dim = 0;
+        full_k_cache.clear();
+        full_v_cache.clear();
+        full_ref_cached_len = 0;
+        full_ref_kv_dim = 0;
+        full_last_hidden.clear();
         std::fill(seen_tokens.begin(), seen_tokens.end(), 0);
         for (int i = 0; i < len; ++i) {
             if (ids[i] >= 0 && static_cast<size_t>(ids[i]) < seen_tokens.size()) {
@@ -971,6 +981,15 @@ struct AscendEngine {
         return inserted.first->second;
     }
 
+    const std::vector<float>* optional_cached_weight_float_ref(const std::string& name) {
+        if (d_weights.find(name) == d_weights.end()) return nullptr;
+        return &cached_weight_float_ref(name);
+    }
+
+    static std::string layer_weight_name(int layer, const std::string& suffix) {
+        return "model.layers." + std::to_string(layer) + "." + suffix;
+    }
+
     std::vector<float> load_hidden_rows_float(int len) {
         if (!d_hidden || hidden_row_bytes == 0) {
             throw std::runtime_error("hidden rows require embedding prefill first");
@@ -1025,12 +1044,16 @@ struct AscendEngine {
         const std::vector<float>& weight,
         size_t out_dim,
         size_t in_dim,
-        const std::string& label) const {
+        const std::string& label,
+        const std::vector<float>* bias = nullptr) const {
         if (x.size() != in_dim) {
             throw std::runtime_error(label + " input dim mismatch");
         }
         if (weight.size() != out_dim * in_dim) {
             throw std::runtime_error(label + " weight size mismatch");
+        }
+        if (bias && bias->size() != out_dim) {
+            throw std::runtime_error(label + " bias size mismatch");
         }
         std::vector<float> y(out_dim);
 
@@ -1045,7 +1068,7 @@ struct AscendEngine {
             const size_t end = (out_dim * static_cast<size_t>(tid + 1)) / static_cast<size_t>(n_threads);
             for (size_t out = begin; out < end; ++out) {
                 const float* wrow = weight.data() + out * in_dim;
-                float acc = 0.0f;
+                float acc = bias ? (*bias)[out] : 0.0f;
                 for (size_t in = 0; in < in_dim; ++in) {
                     acc = std::fma(x[in], wrow[in], acc);
                 }
@@ -1140,6 +1163,153 @@ struct AscendEngine {
         const std::vector<float>& norm = cached_weight_float_ref("model.norm.weight");
         rms_norm_inplace(x, norm);
         return x;
+    }
+
+    void ensure_full_ref_cache(int kv_dim) {
+        if (kv_dim <= 0) throw std::runtime_error("bad kv_dim for all_layers_ref");
+        if (full_ref_kv_dim != kv_dim ||
+            full_k_cache.size() != static_cast<size_t>(config.n_layers) ||
+            full_v_cache.size() != static_cast<size_t>(config.n_layers)) {
+            full_k_cache.assign(static_cast<size_t>(config.n_layers), {});
+            full_v_cache.assign(static_cast<size_t>(config.n_layers), {});
+            full_ref_cached_len = 0;
+            full_ref_kv_dim = kv_dim;
+            full_last_hidden.clear();
+        }
+        const size_t cache_elems = static_cast<size_t>(max_seq) * static_cast<size_t>(kv_dim);
+        for (int layer = 0; layer < config.n_layers; ++layer) {
+            if (full_k_cache[static_cast<size_t>(layer)].size() < cache_elems) {
+                full_k_cache[static_cast<size_t>(layer)].assign(cache_elems, 0.0f);
+                full_v_cache[static_cast<size_t>(layer)].assign(cache_elems, 0.0f);
+            }
+        }
+    }
+
+    std::vector<float> layer_forward_reference(std::vector<float> x, int layer, int pos) {
+        const size_t hidden = static_cast<size_t>(config.hidden);
+        const int head_dim = config.hidden / config.n_heads;
+        const int kv_dim = config.n_kv_heads * head_dim;
+        const int group = config.n_heads / config.n_kv_heads;
+        if (x.size() != hidden) throw std::runtime_error("layer input size mismatch");
+        if (head_dim <= 0 || group <= 0 || config.n_heads % config.n_kv_heads != 0) {
+            throw std::runtime_error("bad attention head config for all_layers_ref");
+        }
+        ensure_full_ref_cache(kv_dim);
+
+        const std::string prefix = "layer" + std::to_string(layer);
+        const std::vector<float>& ln1 = cached_weight_float_ref(layer_weight_name(layer, "input_layernorm.weight"));
+        const std::vector<float>& wq = cached_weight_float_ref(layer_weight_name(layer, "self_attn.q_proj.weight"));
+        const std::vector<float>& wk = cached_weight_float_ref(layer_weight_name(layer, "self_attn.k_proj.weight"));
+        const std::vector<float>& wv = cached_weight_float_ref(layer_weight_name(layer, "self_attn.v_proj.weight"));
+        const std::vector<float>& wo = cached_weight_float_ref(layer_weight_name(layer, "self_attn.o_proj.weight"));
+        const std::vector<float>* bq = optional_cached_weight_float_ref(layer_weight_name(layer, "self_attn.q_proj.bias"));
+        const std::vector<float>* bk = optional_cached_weight_float_ref(layer_weight_name(layer, "self_attn.k_proj.bias"));
+        const std::vector<float>* bv = optional_cached_weight_float_ref(layer_weight_name(layer, "self_attn.v_proj.bias"));
+
+        std::vector<float> residual = x;
+        std::vector<float> qkv_in = x;
+        rms_norm_inplace(qkv_in, ln1);
+        std::vector<float> q = linear_with_weight(qkv_in, wq, hidden, hidden, prefix + " q_proj", bq);
+        std::vector<float> k = linear_with_weight(qkv_in, wk, static_cast<size_t>(kv_dim), hidden, prefix + " k_proj", bk);
+        std::vector<float> v = linear_with_weight(qkv_in, wv, static_cast<size_t>(kv_dim), hidden, prefix + " v_proj", bv);
+        apply_rope(q, config.n_heads, pos);
+        apply_rope(k, config.n_kv_heads, pos);
+
+        std::vector<float>& k_cache = full_k_cache[static_cast<size_t>(layer)];
+        std::vector<float>& v_cache = full_v_cache[static_cast<size_t>(layer)];
+        std::copy(k.begin(), k.end(), k_cache.begin() + static_cast<size_t>(pos) * kv_dim);
+        std::copy(v.begin(), v.end(), v_cache.begin() + static_cast<size_t>(pos) * kv_dim);
+
+        std::vector<float> ctx(hidden, 0.0f);
+        const float attn_scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+        std::vector<float> scores(static_cast<size_t>(pos + 1));
+        for (int h = 0; h < config.n_heads; ++h) {
+            const int kh = h / group;
+            const float* qh = q.data() + static_cast<size_t>(h) * head_dim;
+            float max_score = -std::numeric_limits<float>::infinity();
+            for (int tok = 0; tok <= pos; ++tok) {
+                const float* kk = k_cache.data() + static_cast<size_t>(tok) * kv_dim + static_cast<size_t>(kh) * head_dim;
+                float dot = 0.0f;
+                for (int d = 0; d < head_dim; ++d) dot = std::fma(qh[d], kk[d], dot);
+                scores[static_cast<size_t>(tok)] = dot * attn_scale;
+                max_score = std::max(max_score, scores[static_cast<size_t>(tok)]);
+            }
+
+            double denom = 0.0;
+            for (int tok = 0; tok <= pos; ++tok) {
+                float& s = scores[static_cast<size_t>(tok)];
+                s = std::exp(s - max_score);
+                denom += s;
+            }
+            const float inv_denom = denom > 0.0 ? static_cast<float>(1.0 / denom) : 0.0f;
+            for (int d = 0; d < head_dim; ++d) {
+                float acc = 0.0f;
+                for (int tok = 0; tok <= pos; ++tok) {
+                    const float prob = scores[static_cast<size_t>(tok)] * inv_denom;
+                    const float* vv = v_cache.data() + static_cast<size_t>(tok) * kv_dim + static_cast<size_t>(kh) * head_dim;
+                    acc = std::fma(prob, vv[d], acc);
+                }
+                ctx[static_cast<size_t>(h) * head_dim + d] = acc;
+            }
+        }
+
+        std::vector<float> attn_out = linear_with_weight(ctx, wo, hidden, hidden, prefix + " o_proj");
+        std::vector<float> after_attn(hidden);
+        for (size_t i = 0; i < hidden; ++i) after_attn[i] = residual[i] + attn_out[i];
+
+        const std::vector<float>& ln2 = cached_weight_float_ref(layer_weight_name(layer, "post_attention_layernorm.weight"));
+        std::vector<float> mlp_in = after_attn;
+        rms_norm_inplace(mlp_in, ln2);
+        const std::vector<float>& wgate = cached_weight_float_ref(layer_weight_name(layer, "mlp.gate_proj.weight"));
+        const std::vector<float>& wup = cached_weight_float_ref(layer_weight_name(layer, "mlp.up_proj.weight"));
+        const std::vector<float>& wdown = cached_weight_float_ref(layer_weight_name(layer, "mlp.down_proj.weight"));
+        std::vector<float> mid = gate_up_silu_reference(
+            mlp_in,
+            wgate,
+            wup,
+            static_cast<size_t>(config.intermediate),
+            hidden,
+            prefix + " gate_up_silu");
+        std::vector<float> mlp_out = linear_with_weight(mid, wdown, hidden, static_cast<size_t>(config.intermediate), prefix + " down_proj");
+        for (size_t i = 0; i < hidden; ++i) after_attn[i] += mlp_out[i];
+        return after_attn;
+    }
+
+    std::vector<float> all_layers_last_token_reference() {
+        if (prompt_len <= 0) throw std::runtime_error("all_layers_ref requires prefill first");
+        const int head_dim = config.hidden / config.n_heads;
+        const int kv_dim = config.n_kv_heads * head_dim;
+        ensure_full_ref_cache(kv_dim);
+        if (full_ref_cached_len > prompt_len) {
+            full_ref_cached_len = 0;
+            full_last_hidden.clear();
+        }
+
+        auto t0 = Clock::now();
+        const int start = full_ref_cached_len;
+        std::vector<float> hidden_rows = load_hidden_rows_float(prompt_len);
+        for (int tok = start; tok < prompt_len; ++tok) {
+            std::vector<float> x(
+                hidden_rows.begin() + static_cast<size_t>(tok) * static_cast<size_t>(config.hidden),
+                hidden_rows.begin() + static_cast<size_t>(tok + 1) * static_cast<size_t>(config.hidden));
+            for (int layer = 0; layer < config.n_layers; ++layer) {
+                x = layer_forward_reference(std::move(x), layer, tok);
+            }
+            full_last_hidden = std::move(x);
+            full_ref_cached_len = tok + 1;
+        }
+        if (full_last_hidden.empty()) {
+            throw std::runtime_error("all_layers_ref has no cached hidden state");
+        }
+        std::vector<float> final_out = final_norm_vector(full_last_hidden);
+        auto t1 = Clock::now();
+        time_log("[Ascend][time] all_layers reference finished, tokens=" +
+                 std::to_string(prompt_len) +
+                 ", processed_from=" + std::to_string(start) +
+                 ", processed_to=" + std::to_string(full_ref_cached_len) +
+                 ", layers=" + std::to_string(config.n_layers) +
+                 ", elapsed_ms=" + std::to_string(elapsed_ms(t0, t1)));
+        return final_out;
     }
 
     std::vector<float> layer0_last_token_reference() {
@@ -1467,16 +1637,21 @@ struct AscendEngine {
     int decode_one(int* out_token) {
         if (!out_token) throw std::runtime_error("decode output pointer is null");
         const std::string mode = env_str_or("ASCEND_DIRECT_DECODE", "lm_head_ref");
-        if (mode != "lm_head_ref" && mode != "layer0_ref") {
+        if (mode != "lm_head_ref" && mode != "layer0_ref" && mode != "all_layers_ref") {
             throw std::runtime_error(
                 "unsupported ASCEND_DIRECT_DECODE=" + mode +
-                ", use one of: lm_head_ref, layer0_ref");
+                ", use one of: lm_head_ref, layer0_ref, all_layers_ref");
         }
 
         auto t0 = Clock::now();
-        std::vector<float> x = mode == "layer0_ref"
-                                   ? layer0_last_token_reference()
-                                   : load_last_hidden_with_final_norm();
+        std::vector<float> x;
+        if (mode == "all_layers_ref") {
+            x = all_layers_last_token_reference();
+        } else if (mode == "layer0_ref") {
+            x = layer0_last_token_reference();
+        } else {
+            x = load_last_hidden_with_final_norm();
+        }
         const int token = lm_head_argmax_reference(x);
         append_generated_token(token);
         *out_token = token;

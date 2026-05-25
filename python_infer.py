@@ -2,6 +2,7 @@ import argparse
 import ctypes
 import json
 import os
+import re
 from typing import List
 
 
@@ -126,13 +127,40 @@ class TokenizersWrapper:
             "<｜end▁of▁sentence｜>",
         ])
         self.chat_template = None
+        self.bos_token = ""
+        self.user_prefix = ""
+        self.assistant_prefix = ""
         config_path = os.path.join(model_dir, "tokenizer_config.json")
         try:
             with open(config_path, "r", encoding="utf-8") as f:
                 cfg = json.load(f)
             self.chat_template = cfg.get("chat_template")
+            self.bos_token = self._added_token_content(cfg.get("bos_token"))
+            self._init_simple_chat_template()
         except Exception:
             self.chat_template = None
+
+    @staticmethod
+    def _added_token_content(value):
+        if isinstance(value, dict):
+            content = value.get("content")
+            return content if isinstance(content, str) else ""
+        return value if isinstance(value, str) else ""
+
+    def _init_simple_chat_template(self):
+        if not self.chat_template:
+            return
+        user_match = re.search(
+            r"\{\{'([^']+)'\s*\+\s*message\['content'\]\}\}",
+            self.chat_template,
+        )
+        self.user_prefix = user_match.group(1) if user_match else ""
+        for literal in re.findall(r"\{\{'([^']+)'\}\}", self.chat_template):
+            if "<think>" in literal:
+                self.assistant_prefix = literal.replace("\\n", "\n")
+                break
+        if self.user_prefix and self.assistant_prefix:
+            print("[Python] tokenizers simple chat template: enabled")
 
     def _find_token_id(self, tokens):
         for token in tokens:
@@ -143,6 +171,24 @@ class TokenizersWrapper:
 
     def encode(self, text: str, add_special_tokens: bool = True):
         return self.tokenizer.encode(text, add_special_tokens=add_special_tokens).ids
+
+    def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=True):
+        if not self.user_prefix or not self.assistant_prefix:
+            rendered = "\n".join((message.get("content") or "") for message in messages)
+            return self.encode(rendered, add_special_tokens=True) if tokenize else rendered
+        rendered = self.bos_token
+        for message in messages:
+            role = message.get("role")
+            content = message.get("content") or ""
+            if role == "user":
+                rendered += self.user_prefix + content
+            elif role == "assistant":
+                rendered += self.assistant_prefix + content
+        if add_generation_prompt:
+            rendered += self.assistant_prefix
+        if not tokenize:
+            return rendered
+        return self.encode(rendered, add_special_tokens=False)
 
     def decode(self, ids, skip_special_tokens: bool = True, errors: str = "replace"):
         del errors

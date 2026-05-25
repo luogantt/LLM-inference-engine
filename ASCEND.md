@@ -314,8 +314,38 @@ machines.
 `ASCEND_REF_KV_CACHE=1` reuses layer0 K/V between decode steps so only new
 tokens need K/V projection.
 
+For a full-model no-torch smoke test, use `all_layers_ref`. This path runs all
+28 Transformer layers inside `libllm_ascend.so` as a C++ reference
+implementation. It is designed to prove the complete safetensors -> direct ACL
+-> `.so` inference loop before the math is replaced with AscendC kernels.
+
+```bash
+export ASCEND_VISIBLE_DEVICES=4
+export ASCEND_DEVICE_ID=0
+export ASCEND_LOAD_WEIGHTS=all
+export ASCEND_RUN_EMBED=1
+export ASCEND_DIRECT_DECODE=all_layers_ref
+export ASCEND_REF_CACHE_WEIGHTS=1
+export ASCEND_REF_KV_CACHE=1
+export ASCEND_REF_LINEAR_THREADS=16
+export ASCEND_LM_HEAD_THREADS=16
+
+python python_infer.py \
+  --model ./deepseek-r1-7b \
+  --lib ./build/libllm_ascend.so \
+  --prompt "请直接给出最终答案，用一段完整中文介绍黑格尔的哲学思想。" \
+  --max-new-tokens 8 \
+  --max-seq 800 \
+  --tokenizer-backend tokenizers
+```
+
+`all_layers_ref` is still a reference path: it keeps the runtime independent of
+PyTorch, but it intentionally uses host-side scalar GEMV for correctness. Expect
+it to be much slower than the `torch_npu` path until the layer kernels are moved
+to AscendC/ACL operators.
+
 Next direct-engine milestones:
 
-1. Extend the reference path from layer 0 to all 28 layers for correctness.
-2. Replace RMSNorm / QKV / Attention / MLP reference math with AscendC kernels.
+1. Replace RMSNorm / QKV / Attention / MLP reference math with AscendC kernels.
+2. Move lm_head argmax from host reference code to an Ascend-side kernel.
 3. Add KV Cache reuse for decode and move lm_head argmax onto device.
