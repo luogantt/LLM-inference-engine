@@ -310,9 +310,12 @@ struct AscendEngine {
     aclrtStream stream = nullptr;
     void* d_tokens = nullptr;
     void* d_hidden = nullptr;
+    void* d_q = nullptr;
     size_t token_bytes = 0;
     size_t hidden_bytes = 0;
     size_t hidden_row_bytes = 0;
+    size_t q_bytes = 0;
+    size_t q_row_bytes = 0;
     bool acl_ready = false;
     std::unordered_map<std::string, DeviceTensor> d_weights;
 
@@ -362,6 +365,10 @@ struct AscendEngine {
         if (d_hidden) {
             aclrtFree(d_hidden);
             d_hidden = nullptr;
+        }
+        if (d_q) {
+            aclrtFree(d_q);
+            d_q = nullptr;
         }
         if (d_tokens) {
             aclrtFree(d_tokens);
@@ -492,6 +499,9 @@ struct AscendEngine {
         }
         if (d_hidden && env_str_or("ASCEND_RUN_RMSNORM", "0") != "0") {
             rms_norm_reference(len);
+        }
+        if (d_hidden && env_str_or("ASCEND_RUN_QPROJ", "0") != "0") {
+            q_proj_reference(len);
         }
         auto t1 = Clock::now();
         time_log("[Ascend][time] prefill copied token_ids to HBM, tokens=" +
@@ -683,6 +693,97 @@ struct AscendEngine {
                  ", hidden_dtype=" + hidden_meta.dtype +
                  ", first_before=" + std::to_string(first_before) +
                  ", first_after=" + std::to_string(first_after) +
+                 ", elapsed_ms=" + std::to_string(elapsed_ms(t0, t1)));
+    }
+
+    void ensure_q_buffer(const TensorMeta& q_meta) {
+        if (d_q) return;
+        if (q_meta.shape.size() != 2) {
+            throw std::runtime_error("q_proj weight must be 2D, got shape=" + shape_string(q_meta.shape));
+        }
+        if (q_meta.shape[1] != static_cast<size_t>(config.hidden)) {
+            throw std::runtime_error("q_proj in_features mismatch, shape=" + shape_string(q_meta.shape));
+        }
+        const size_t dtype_bytes = dtype_size_bytes(q_meta);
+        q_row_bytes = q_meta.shape[0] * dtype_bytes;
+        q_bytes = static_cast<size_t>(max_seq) * q_row_bytes;
+        check_acl(aclrtMalloc(&d_q, q_bytes, ACL_MEM_MALLOC_HUGE_FIRST), "aclrtMalloc(q buffer)");
+        check_acl(aclrtMemset(d_q, q_bytes, 0, q_bytes), "aclrtMemset(q buffer)");
+        time_log("[Ascend][time] q buffer allocated, row_bytes=" +
+                 std::to_string(q_row_bytes) +
+                 ", total_bytes=" + std::to_string(q_bytes));
+    }
+
+    void q_proj_reference(int len) {
+        auto it = d_weights.find("model.layers.0.self_attn.q_proj.weight");
+        if (it == d_weights.end()) {
+            throw std::runtime_error(
+                "ASCEND_RUN_QPROJ=1 requires ASCEND_LOAD_WEIGHTS=layer0 or all");
+        }
+        if (!d_hidden || hidden_row_bytes == 0) {
+            throw std::runtime_error("q_proj requires hidden buffer");
+        }
+
+        const DeviceTensor& q_weight = it->second;
+        const TensorMeta& q_meta = q_weight.meta;
+        ensure_q_buffer(q_meta);
+
+        const size_t out_dim = q_meta.shape[0];
+        const size_t in_dim = q_meta.shape[1];
+        const TensorMeta& hidden_meta = d_weights.at("model.embed_tokens.weight").meta;
+        const size_t hidden_dtype_bytes = dtype_size_bytes(hidden_meta);
+        const size_t q_dtype_bytes = dtype_size_bytes(q_meta);
+        if (in_dim != static_cast<size_t>(config.hidden)) {
+            throw std::runtime_error("q_proj in_dim mismatch");
+        }
+
+        auto t0 = Clock::now();
+        const size_t active_hidden_bytes = static_cast<size_t>(len) * hidden_row_bytes;
+        std::vector<unsigned char> h_hidden(active_hidden_bytes);
+        std::vector<unsigned char> h_q_weight(q_weight.bytes);
+        std::vector<unsigned char> h_q(static_cast<size_t>(len) * q_row_bytes);
+
+        check_acl(aclrtMemcpy(h_hidden.data(), active_hidden_bytes, d_hidden, active_hidden_bytes,
+                              ACL_MEMCPY_DEVICE_TO_HOST),
+                  "aclrtMemcpy(D2H hidden for q_proj)");
+        check_acl(aclrtMemcpy(h_q_weight.data(), q_weight.bytes, q_weight.data, q_weight.bytes,
+                              ACL_MEMCPY_DEVICE_TO_HOST),
+                  "aclrtMemcpy(D2H q_proj weight)");
+
+        const int max_tokens = env_int_or("ASCEND_QPROJ_REF_TOKENS", 1);
+        const int compute_tokens = std::max(0, std::min(len, max_tokens));
+        float first_q = 0.0f;
+        for (int tok = 0; tok < compute_tokens; ++tok) {
+            const unsigned char* xrow = h_hidden.data() + static_cast<size_t>(tok) * hidden_row_bytes;
+            unsigned char* qrow = h_q.data() + static_cast<size_t>(tok) * q_row_bytes;
+            for (size_t out = 0; out < out_dim; ++out) {
+                const unsigned char* wrow = h_q_weight.data() + out * in_dim * q_dtype_bytes;
+                double acc = 0.0;
+                for (size_t in = 0; in < in_dim; ++in) {
+                    const float x = load_scalar(xrow + in * hidden_dtype_bytes, hidden_meta.dtype);
+                    const float w = load_scalar(wrow + in * q_dtype_bytes, q_meta.dtype);
+                    acc += static_cast<double>(x) * static_cast<double>(w);
+                }
+                const float y = static_cast<float>(acc);
+                if (tok == 0 && out == 0) first_q = y;
+                store_scalar(qrow + out * q_dtype_bytes, q_meta.dtype, y);
+            }
+        }
+
+        if (compute_tokens > 0) {
+            const size_t active_q_bytes = static_cast<size_t>(compute_tokens) * q_row_bytes;
+            check_acl(aclrtMemcpy(d_q, q_bytes, h_q.data(), active_q_bytes, ACL_MEMCPY_HOST_TO_DEVICE),
+                      "aclrtMemcpy(H2D q_proj output)");
+        }
+
+        auto t1 = Clock::now();
+        time_log("[Ascend][time] q_proj reference finished, tokens_requested=" +
+                 std::to_string(len) +
+                 ", tokens_computed=" + std::to_string(compute_tokens) +
+                 ", in_dim=" + std::to_string(in_dim) +
+                 ", out_dim=" + std::to_string(out_dim) +
+                 ", weight_dtype=" + q_meta.dtype +
+                 ", first_q=" + std::to_string(first_q) +
                  ", elapsed_ms=" + std::to_string(elapsed_ms(t0, t1)));
     }
 
