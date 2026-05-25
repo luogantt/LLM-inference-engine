@@ -16,6 +16,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -1235,23 +1236,59 @@ struct AscendEngine {
         const size_t vocab_limit_env = static_cast<size_t>(std::max(0, env_int_or("ASCEND_LM_HEAD_REF_VOCAB", 0)));
         const size_t vocab_limit = vocab_limit_env > 0 ? std::min(vocab, vocab_limit_env) : vocab;
         const bool suppress_special = env_str_or("ASCEND_SUPPRESS_SPECIAL", "0") != "0";
+        const int requested_threads = env_int_or("ASCEND_LM_HEAD_THREADS", 0);
+        const unsigned hw_threads = std::max(1u, std::thread::hardware_concurrency());
+        const int n_threads = std::max(
+            1,
+            std::min<int>(
+                requested_threads > 0 ? requested_threads : static_cast<int>(hw_threads),
+                static_cast<int>(std::max<size_t>(1, vocab_limit))));
+
+        struct LocalBest {
+            float value = -std::numeric_limits<float>::infinity();
+            int token = 0;
+        };
+        std::vector<LocalBest> local(static_cast<size_t>(n_threads));
+        std::vector<std::thread> workers;
+        workers.reserve(static_cast<size_t>(n_threads));
+
+        auto scan_range = [&](int tid) {
+            const size_t begin = (vocab_limit * static_cast<size_t>(tid)) / static_cast<size_t>(n_threads);
+            const size_t end = (vocab_limit * static_cast<size_t>(tid + 1)) / static_cast<size_t>(n_threads);
+            float best = -std::numeric_limits<float>::infinity();
+            int best_id = static_cast<int>(begin);
+            for (size_t tok = begin; tok < end; ++tok) {
+                if (suppress_special && tok >= 151000) continue;
+                const float* wrow = h_head.data() + tok * hidden;
+                double acc = 0.0;
+                for (size_t j = 0; j < hidden; ++j) {
+                    acc += static_cast<double>(x[j]) * static_cast<double>(wrow[j]);
+                }
+                float logit = static_cast<float>(acc);
+                if (tok < seen_tokens.size() && seen_tokens[tok] && repetition_penalty > 1.0f) {
+                    logit = logit >= 0.0f ? logit / repetition_penalty : logit * repetition_penalty;
+                }
+                if (logit > best || (logit == best && static_cast<int>(tok) < best_id)) {
+                    best = logit;
+                    best_id = static_cast<int>(tok);
+                }
+            }
+            local[static_cast<size_t>(tid)] = {best, best_id};
+        };
+
+        if (n_threads == 1) {
+            scan_range(0);
+        } else {
+            for (int tid = 0; tid < n_threads; ++tid) workers.emplace_back(scan_range, tid);
+            for (auto& worker : workers) worker.join();
+        }
 
         int best_id = 0;
         float best = -std::numeric_limits<float>::infinity();
-        for (size_t tok = 0; tok < vocab_limit; ++tok) {
-            if (suppress_special && tok >= 151000) continue;
-            const float* wrow = h_head.data() + tok * hidden;
-            double acc = 0.0;
-            for (size_t j = 0; j < hidden; ++j) {
-                acc += static_cast<double>(x[j]) * static_cast<double>(wrow[j]);
-            }
-            float logit = static_cast<float>(acc);
-            if (tok < seen_tokens.size() && seen_tokens[tok] && repetition_penalty > 1.0f) {
-                logit = logit >= 0.0f ? logit / repetition_penalty : logit * repetition_penalty;
-            }
-            if (logit > best) {
-                best = logit;
-                best_id = static_cast<int>(tok);
+        for (const auto& item : local) {
+            if (item.value > best || (item.value == best && item.token < best_id)) {
+                best = item.value;
+                best_id = item.token;
             }
         }
 
@@ -1260,6 +1297,7 @@ struct AscendEngine {
                  std::to_string(vocab_limit) +
                  ", hidden=" + std::to_string(hidden) +
                  ", weight_dtype=" + meta.dtype +
+                 ", threads=" + std::to_string(n_threads) +
                  ", token=" + std::to_string(best_id) +
                  ", logit=" + std::to_string(best) +
                  ", elapsed_ms=" + std::to_string(elapsed_ms(t0, t1)));

@@ -163,6 +163,7 @@ export ASCEND_RUN_QPROJ=0
 export ASCEND_RUN_KVPROJ=0
 export ASCEND_DIRECT_DECODE=layer0_ref
 export ASCEND_REF_CACHE_WEIGHTS=1
+export ASCEND_LM_HEAD_THREADS=16
 
 python python_infer.py \
   --model ./deepseek-r1-7b \

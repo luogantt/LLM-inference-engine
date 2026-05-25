@@ -277,6 +277,7 @@ export ASCEND_RUN_QPROJ=0
 export ASCEND_RUN_KVPROJ=0
 export ASCEND_DIRECT_DECODE=layer0_ref
 export ASCEND_REF_CACHE_WEIGHTS=1
+export ASCEND_LM_HEAD_THREADS=16
 
 python python_infer.py \
   --model ./deepseek-r1-7b \
@@ -302,6 +303,10 @@ replace these reference blocks with AscendC / ACL kernels.
 `ASCEND_REF_CACHE_WEIGHTS=1` keeps decoded FP32 reference weights in host memory
 after the first use. This avoids repeatedly copying `lm_head` and layer weights
 back from HBM when `--max-new-tokens` is greater than 1.
+
+`ASCEND_LM_HEAD_THREADS` controls the host reference lm_head argmax parallelism.
+Leave it unset to use hardware concurrency, or set it explicitly on shared
+machines.
 
 Next direct-engine milestones:
 
