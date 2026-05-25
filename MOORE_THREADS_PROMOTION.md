@@ -282,6 +282,10 @@ Forward latency: about 51-54 ms/token
 
 ## 当前项目状态
 
+项目地址：
+
+[https://github.com/luogantt/LLM-inference-engine](https://github.com/luogantt/LLM-inference-engine)
+
 当前 `moore` 分支包含：
 
 - MUSA 编译目标：`make -f Makefile.cuda_lib lib-musa`
@@ -293,7 +297,8 @@ Forward latency: about 51-54 ms/token
 如果你也想复现，可以直接按下面流程：
 
 ```bash
-git checkout moore
+git clone -b moore https://github.com/luogantt/LLM-inference-engine.git
+cd LLM-inference-engine
 
 pip install -U modelscope
 python download_model.py --local-dir /root/autodl-tmp/deepseek-r1-7b
@@ -323,4 +328,3 @@ MUSA_VISIBLE_DEVICES=0 python python_infer.py \
 对我来说，这就是最值得兴奋的地方。
 
 不是因为它已经完美，而是因为它终于可以被认真优化了。
-
