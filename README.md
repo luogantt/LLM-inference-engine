@@ -84,3 +84,21 @@ python download_model.py \
   --model deepseek-ai/DeepSeek-R1-Distill-Qwen-7B \
   --local-dir ./deepseek-r1-7b
 ```
+
+## Ascend 910
+
+For Ascend 910 machines, use the `torch_npu` inference entry first:
+
+```bash
+export ASCEND_VISIBLE_DEVICES=4
+
+python python_infer_ascend.py \
+  --model /root/autodl-tmp/deepseek-r1-7b \
+  --prompt "你好 deepseek 介绍一下黑格尔的思想" \
+  --max-new-tokens 128 \
+  --max-seq 800 \
+  --device npu:0 \
+  --dtype float16
+```
+
+See `ASCEND.md` for full setup and troubleshooting notes.
