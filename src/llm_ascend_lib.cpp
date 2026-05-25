@@ -1016,11 +1016,11 @@ struct AscendEngine {
             const size_t end = (out_dim * static_cast<size_t>(tid + 1)) / static_cast<size_t>(n_threads);
             for (size_t out = begin; out < end; ++out) {
                 const float* wrow = weight.data() + out * in_dim;
-                double acc = 0.0;
+                float acc = 0.0f;
                 for (size_t in = 0; in < in_dim; ++in) {
-                    acc += static_cast<double>(x[in]) * static_cast<double>(wrow[in]);
+                    acc = std::fma(x[in], wrow[in], acc);
                 }
-                y[out] = static_cast<float>(acc);
+                y[out] = acc;
             }
         };
 
@@ -1301,11 +1301,11 @@ struct AscendEngine {
             for (size_t tok = begin; tok < end; ++tok) {
                 if (suppress_special && tok >= 151000) continue;
                 const float* wrow = h_head.data() + tok * hidden;
-                double acc = 0.0;
+                float acc = 0.0f;
                 for (size_t j = 0; j < hidden; ++j) {
-                    acc += static_cast<double>(x[j]) * static_cast<double>(wrow[j]);
+                    acc = std::fma(x[j], wrow[j], acc);
                 }
-                float logit = static_cast<float>(acc);
+                float logit = acc;
                 if (tok < seen_tokens.size() && seen_tokens[tok] && repetition_penalty > 1.0f) {
                     logit = logit >= 0.0f ? logit / repetition_penalty : logit * repetition_penalty;
                 }
