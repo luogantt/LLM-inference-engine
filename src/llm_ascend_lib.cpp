@@ -1035,6 +1035,54 @@ struct AscendEngine {
         return y;
     }
 
+    std::vector<float> gate_up_silu_reference(
+        const std::vector<float>& x,
+        const std::vector<float>& gate_weight,
+        const std::vector<float>& up_weight,
+        size_t out_dim,
+        size_t in_dim,
+        const std::string& label) const {
+        if (x.size() != in_dim) {
+            throw std::runtime_error(label + " input dim mismatch");
+        }
+        if (gate_weight.size() != out_dim * in_dim || up_weight.size() != out_dim * in_dim) {
+            throw std::runtime_error(label + " weight size mismatch");
+        }
+        std::vector<float> mid(out_dim);
+
+        const int requested_threads = env_int_or("ASCEND_REF_LINEAR_THREADS", 0);
+        const unsigned hw_threads = std::max(1u, std::thread::hardware_concurrency());
+        int n_threads = requested_threads > 0 ? requested_threads : static_cast<int>(hw_threads);
+        n_threads = std::max(1, std::min<int>(n_threads, static_cast<int>(std::max<size_t>(1, out_dim))));
+
+        auto compute_range = [&](int tid) {
+            const size_t begin = (out_dim * static_cast<size_t>(tid)) / static_cast<size_t>(n_threads);
+            const size_t end = (out_dim * static_cast<size_t>(tid + 1)) / static_cast<size_t>(n_threads);
+            for (size_t out = begin; out < end; ++out) {
+                const float* grow = gate_weight.data() + out * in_dim;
+                const float* urow = up_weight.data() + out * in_dim;
+                float gacc = 0.0f;
+                float uacc = 0.0f;
+                for (size_t in = 0; in < in_dim; ++in) {
+                    const float xv = x[in];
+                    gacc = std::fma(xv, grow[in], gacc);
+                    uacc = std::fma(xv, urow[in], uacc);
+                }
+                mid[out] = (gacc / (1.0f + std::exp(-gacc))) * uacc;
+            }
+        };
+
+        if (n_threads == 1) {
+            compute_range(0);
+        } else {
+            std::vector<std::thread> workers;
+            workers.reserve(static_cast<size_t>(n_threads));
+            for (int tid = 0; tid < n_threads; ++tid) workers.emplace_back(compute_range, tid);
+            for (auto& worker : workers) worker.join();
+        }
+        return mid;
+    }
+
     void apply_rope(std::vector<float>& x, int heads, int pos) const {
         const int head_dim = config.hidden / config.n_heads;
         if (head_dim <= 0 || head_dim % 2 != 0) throw std::runtime_error("bad RoPE head_dim");
@@ -1182,13 +1230,13 @@ struct AscendEngine {
             throw std::runtime_error("layer0 MLP projection shape mismatch");
         }
 
-        std::vector<float> gate = linear_with_weight(mlp_in, wgate, static_cast<size_t>(config.intermediate), hidden, "layer0 gate_proj");
-        std::vector<float> up = linear_with_weight(mlp_in, wup, static_cast<size_t>(config.intermediate), hidden, "layer0 up_proj");
-        std::vector<float> mid(static_cast<size_t>(config.intermediate));
-        for (int i = 0; i < config.intermediate; ++i) {
-            const float g = gate[static_cast<size_t>(i)];
-            mid[static_cast<size_t>(i)] = (g / (1.0f + std::exp(-g))) * up[static_cast<size_t>(i)];
-        }
+        std::vector<float> mid = gate_up_silu_reference(
+            mlp_in,
+            wgate,
+            wup,
+            static_cast<size_t>(config.intermediate),
+            hidden,
+            "layer0 gate_up_silu");
 
         std::vector<float> mlp_out = linear_with_weight(mid, wdown, hidden, static_cast<size_t>(config.intermediate), "layer0 down_proj");
         std::vector<float> out(hidden);
