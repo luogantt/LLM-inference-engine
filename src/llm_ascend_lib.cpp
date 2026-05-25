@@ -330,6 +330,7 @@ struct AscendEngine {
     bool acl_ready = false;
     std::unordered_map<std::string, DeviceTensor> d_weights;
     std::unordered_map<std::string, std::vector<float>> h_weight_cache;
+    std::unordered_map<std::string, std::vector<uint16_t>> h_weight_u16_cache;
     std::vector<float> layer0_k_cache;
     std::vector<float> layer0_v_cache;
     int layer0_kv_cached_len = 0;
@@ -939,6 +940,34 @@ struct AscendEngine {
                  ", elements=" + std::to_string(inserted.first->second.size()) +
                  ", fp32_bytes=" + std::to_string(bytes) +
                  ", d2h_convert_ms=" + std::to_string(elapsed_ms(t0, t1)));
+        return inserted.first->second;
+    }
+
+    const std::vector<uint16_t>& cached_weight_u16_ref(const std::string& name) {
+        auto cached = h_weight_u16_cache.find(name);
+        if (cached != h_weight_u16_cache.end()) return cached->second;
+
+        const DeviceTensor& tensor = require_device_weight(name);
+        if (tensor.meta.dtype != "BF16" && tensor.meta.dtype != "F16") {
+            throw std::runtime_error("raw u16 weight cache requires BF16/F16 tensor: " + name +
+                                     " dtype=" + tensor.meta.dtype);
+        }
+        const size_t n = tensor_numel(tensor.meta.shape);
+        if (tensor.bytes != n * sizeof(uint16_t)) {
+            throw std::runtime_error("raw u16 weight bytes mismatch for " + name);
+        }
+
+        auto t0 = Clock::now();
+        std::vector<uint16_t> value(n);
+        check_acl(aclrtMemcpy(value.data(), tensor.bytes, tensor.data, tensor.bytes,
+                              ACL_MEMCPY_DEVICE_TO_HOST),
+                  ("aclrtMemcpy(D2H raw u16 " + name + ")").c_str());
+        auto t1 = Clock::now();
+        auto inserted = h_weight_u16_cache.emplace(name, std::move(value));
+        time_log("[Ascend][time] cached host raw u16 weight, name=" + name +
+                 ", elements=" + std::to_string(inserted.first->second.size()) +
+                 ", raw_bytes=" + std::to_string(tensor.bytes) +
+                 ", d2h_ms=" + std::to_string(elapsed_ms(t0, t1)));
         return inserted.first->second;
     }
 
