@@ -114,6 +114,7 @@ python python_infer.py \
   --prompt "你好 deepseek 介绍一下黑格尔的思想" \
   --max-new-tokens 1 \
   --max-seq 800 \
+  --tokenizer-backend tokenizers \
   --prefill-only
 ```
 
@@ -125,6 +126,8 @@ Expected log shape:
 [Ascend][time] prefill copied token_ids to HBM ...
 [Python] prefill-only finished
 ```
+
+The `tokenizers` backend is intentional here. It avoids importing `transformers` and `torch_npu` in the same process as the direct AscendCL shared library, which keeps the direct runtime smoke test isolated.
 
 Next direct-engine milestones:
 

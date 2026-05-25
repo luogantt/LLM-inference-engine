@@ -117,5 +117,6 @@ python python_infer.py \
   --prompt "你好 deepseek 介绍一下黑格尔的思想" \
   --max-new-tokens 1 \
   --max-seq 800 \
+  --tokenizer-backend tokenizers \
   --prefill-only
 ```

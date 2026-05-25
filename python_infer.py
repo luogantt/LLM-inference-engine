@@ -1,9 +1,8 @@
 import argparse
 import ctypes
+import json
 import os
 from typing import List
-
-from transformers import AutoTokenizer
 
 
 def parse_args():
@@ -16,6 +15,12 @@ def parse_args():
     p.add_argument("--repetition-penalty", type=float, default=1.1)
     p.add_argument("--no-chat-template", action="store_true")
     p.add_argument("--prefill-only", action="store_true")
+    p.add_argument(
+        "--tokenizer-backend",
+        choices=["auto", "transformers", "tokenizers"],
+        default="auto",
+        help="use tokenizers for direct AscendCL smoke tests to avoid importing torch_npu",
+    )
     return p.parse_args()
 
 
@@ -103,15 +108,76 @@ class CudaLLM:
             self.handle = None
 
 
+class TokenizersWrapper:
+    def __init__(self, model_dir: str):
+        try:
+            from tokenizers import Tokenizer
+        except ImportError as exc:
+            raise RuntimeError(
+                "tokenizers is required for --tokenizer-backend tokenizers. "
+                "Install it with: pip install -U tokenizers"
+            ) from exc
+
+        tokenizer_path = os.path.join(model_dir, "tokenizer.json")
+        self.tokenizer = Tokenizer.from_file(tokenizer_path)
+        self.eos_token_id = self._find_token_id([
+            "<|endoftext|>",
+            "<|im_end|>",
+            "<｜end▁of▁sentence｜>",
+        ])
+        self.chat_template = None
+        config_path = os.path.join(model_dir, "tokenizer_config.json")
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            self.chat_template = cfg.get("chat_template")
+        except Exception:
+            self.chat_template = None
+
+    def _find_token_id(self, tokens):
+        for token in tokens:
+            tid = self.tokenizer.token_to_id(token)
+            if isinstance(tid, int) and tid >= 0:
+                return tid
+        return None
+
+    def encode(self, text: str, add_special_tokens: bool = True):
+        return self.tokenizer.encode(text, add_special_tokens=add_special_tokens).ids
+
+    def decode(self, ids, skip_special_tokens: bool = True, errors: str = "replace"):
+        del errors
+        return self.tokenizer.decode([int(x) for x in ids], skip_special_tokens=skip_special_tokens)
+
+    def convert_tokens_to_ids(self, token: str):
+        tid = self.tokenizer.token_to_id(token)
+        return tid if tid is not None else -1
+
+
+def load_tokenizer(model_dir: str, backend: str, lib_path: str):
+    if backend == "auto":
+        lib_name = os.path.basename(lib_path).lower()
+        backend = "tokenizers" if "ascend" in lib_name else "transformers"
+
+    if backend == "tokenizers":
+        print("[Python] tokenizer backend: tokenizers")
+        return TokenizersWrapper(model_dir)
+
+    print("[Python] tokenizer backend: transformers")
+    from transformers import AutoTokenizer
+    return AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
+
+
 def encode_prompt(tokenizer, prompt: str, use_chat_template: bool) -> List[int]:
     if use_chat_template and getattr(tokenizer, "chat_template", None):
         messages = [{"role": "user", "content": prompt}]
-        ids = tokenizer.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=True,
-        )
-        return [int(x) for x in ids]
+        if hasattr(tokenizer, "apply_chat_template"):
+            ids = tokenizer.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+            )
+            return [int(x) for x in ids]
+        print("[Python] chat template skipped: tokenizers backend does not render templates")
 
     return [int(x) for x in tokenizer.encode(prompt, add_special_tokens=True)]
 
@@ -134,7 +200,7 @@ def main():
     args = parse_args()
 
     print("[Python] loading tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    tokenizer = load_tokenizer(args.model, args.tokenizer_backend, args.lib)
 
     input_ids = encode_prompt(
         tokenizer,

@@ -215,13 +215,18 @@ struct AscendEngine {
         if (max_seq <= 0) throw std::runtime_error("max_seq must be positive");
 
         auto t0 = Clock::now();
+        std::cerr << "[Ascend] aclInit\n";
         check_acl(aclInit(nullptr), "aclInit");
         acl_ready = true;
+        std::cerr << "[Ascend] aclrtSetDevice device=" << device_id << "\n";
         check_acl(aclrtSetDevice(device_id), "aclrtSetDevice");
+        std::cerr << "[Ascend] aclrtCreateContext\n";
         check_acl(aclrtCreateContext(&context, device_id), "aclrtCreateContext");
+        std::cerr << "[Ascend] aclrtCreateStream\n";
         check_acl(aclrtCreateStream(&stream), "aclrtCreateStream");
 
         token_bytes = static_cast<size_t>(max_seq) * sizeof(int);
+        std::cerr << "[Ascend] aclrtMalloc tokens bytes=" << token_bytes << "\n";
         check_acl(aclrtMalloc(&d_tokens, token_bytes, ACL_MEM_MALLOC_HUGE_FIRST), "aclrtMalloc(tokens)");
         check_acl(aclrtMemset(d_tokens, token_bytes, 0, token_bytes), "aclrtMemset(tokens)");
         check_acl(aclrtSynchronizeStream(stream), "aclrtSynchronizeStream(init)");
