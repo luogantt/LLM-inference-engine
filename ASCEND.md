@@ -325,6 +325,7 @@ export ASCEND_DEVICE_ID=0
 export ASCEND_LOAD_WEIGHTS=all
 export ASCEND_WEIGHT_LOAD_LOG=0
 export ASCEND_HOST_RAW_CACHE=1
+export ASCEND_HOST_RAW_DROP_AFTER_CONVERT=1
 export ASCEND_RUN_EMBED=1
 export ASCEND_DIRECT_DECODE=all_layers_ref
 export ASCEND_REF_CACHE_WEIGHTS=1
@@ -357,6 +358,10 @@ full model. The aggregate `requested weights loaded` line is still printed.
 HBM upload. The reference path then builds FP32 host weights from this host copy
 instead of copying weights back from HBM on the first decode step. Disable it
 with `ASCEND_HOST_RAW_CACHE=0` if host memory is tight.
+
+`ASCEND_HOST_RAW_DROP_AFTER_CONVERT=1` releases each raw host tensor immediately
+after it has been converted into the FP32 reference cache, reducing peak memory
+and avoiding the Linux OOM killer on smaller pods.
 
 Next direct-engine milestones:
 

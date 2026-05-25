@@ -366,6 +366,14 @@ struct AscendEngine {
         return env_str_or("ASCEND_DIRECT_DECODE", "lm_head_ref") == "all_layers_ref";
     }
 
+    bool host_raw_drop_after_convert_enabled() const {
+        const std::string explicit_flag = env_str_or("ASCEND_HOST_RAW_DROP_AFTER_CONVERT", "");
+        if (!explicit_flag.empty()) {
+            return explicit_flag != "0" && explicit_flag != "false" && explicit_flag != "False";
+        }
+        return true;
+    }
+
     AscendEngine(const std::string& dir, int max_seq_)
         : device_id(env_int_or("ASCEND_DEVICE_ID", 0)),
           max_seq(max_seq_),
@@ -965,11 +973,15 @@ struct AscendEngine {
     std::vector<float> weight_to_float_vector(const std::string& name) {
         auto raw_it = h_weight_raw_cache.find(name);
         if (raw_it != h_weight_raw_cache.end()) {
-            return raw_tensor_to_float_vector(
+            std::vector<float> value = raw_tensor_to_float_vector(
                 require_device_weight(name).meta,
                 raw_it->second.data(),
                 raw_it->second.size(),
                 name);
+            if (host_raw_drop_after_convert_enabled()) {
+                h_weight_raw_cache.erase(raw_it);
+            }
+            return value;
         }
         return device_tensor_to_float_vector(require_device_weight(name), name);
     }
@@ -1035,6 +1047,9 @@ struct AscendEngine {
         auto raw_it = h_weight_raw_cache.find(name);
         if (raw_it != h_weight_raw_cache.end()) {
             std::memcpy(value.data(), raw_it->second.data(), tensor.bytes);
+            if (host_raw_drop_after_convert_enabled()) {
+                h_weight_raw_cache.erase(raw_it);
+            }
         } else {
             check_acl(aclrtMemcpy(value.data(), tensor.bytes, tensor.data, tensor.bytes,
                                   ACL_MEMCPY_DEVICE_TO_HOST),
