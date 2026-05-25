@@ -301,6 +301,32 @@ struct DeviceTensor {
     size_t bytes = 0;
 };
 
+struct RefLayerProfile {
+    double norm1_ms = 0.0;
+    double q_ms = 0.0;
+    double kv_ms = 0.0;
+    double rope_ms = 0.0;
+    double attn_ms = 0.0;
+    double o_ms = 0.0;
+    double norm2_ms = 0.0;
+    double gate_up_ms = 0.0;
+    double down_ms = 0.0;
+    double total_ms = 0.0;
+
+    void add(const RefLayerProfile& other) {
+        norm1_ms += other.norm1_ms;
+        q_ms += other.q_ms;
+        kv_ms += other.kv_ms;
+        rope_ms += other.rope_ms;
+        attn_ms += other.attn_ms;
+        o_ms += other.o_ms;
+        norm2_ms += other.norm2_ms;
+        gate_up_ms += other.gate_up_ms;
+        down_ms += other.down_ms;
+        total_ms += other.total_ms;
+    }
+};
+
 struct AscendEngine {
     int device_id = 0;
     int max_seq = 0;
@@ -372,6 +398,11 @@ struct AscendEngine {
             return explicit_flag != "0" && explicit_flag != "false" && explicit_flag != "False";
         }
         return true;
+    }
+
+    bool ref_layer_profile_enabled() const {
+        const std::string flag = env_str_or("ASCEND_REF_PROFILE_LAYERS", "0");
+        return flag != "0" && flag != "false" && flag != "False";
     }
 
     AscendEngine(const std::string& dir, int max_seq_)
@@ -1270,7 +1301,12 @@ struct AscendEngine {
         }
     }
 
-    std::vector<float> layer_forward_reference(std::vector<float> x, int layer, int pos) {
+    std::vector<float> layer_forward_reference(
+        std::vector<float> x,
+        int layer,
+        int pos,
+        RefLayerProfile* profile = nullptr) {
+        auto layer0 = Clock::now();
         const size_t hidden = static_cast<size_t>(config.hidden);
         const int head_dim = config.hidden / config.n_heads;
         const int kv_dim = config.n_kv_heads * head_dim;
@@ -1293,12 +1329,20 @@ struct AscendEngine {
 
         std::vector<float> residual = x;
         std::vector<float> qkv_in = x;
+        auto norm1_0 = Clock::now();
         rms_norm_inplace(qkv_in, ln1);
+        auto norm1_1 = Clock::now();
+        auto q0 = Clock::now();
         std::vector<float> q = linear_with_weight(qkv_in, wq, hidden, hidden, prefix + " q_proj", bq);
+        auto q1 = Clock::now();
+        auto kv0 = Clock::now();
         std::vector<float> k = linear_with_weight(qkv_in, wk, static_cast<size_t>(kv_dim), hidden, prefix + " k_proj", bk);
         std::vector<float> v = linear_with_weight(qkv_in, wv, static_cast<size_t>(kv_dim), hidden, prefix + " v_proj", bv);
+        auto kv1 = Clock::now();
+        auto rope0 = Clock::now();
         apply_rope(q, config.n_heads, pos);
         apply_rope(k, config.n_kv_heads, pos);
+        auto rope1 = Clock::now();
 
         std::vector<float>& k_cache = full_k_cache[static_cast<size_t>(layer)];
         std::vector<float>& v_cache = full_v_cache[static_cast<size_t>(layer)];
@@ -1308,6 +1352,7 @@ struct AscendEngine {
         std::vector<float> ctx(hidden, 0.0f);
         const float attn_scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
         std::vector<float> scores(static_cast<size_t>(pos + 1));
+        auto attn0 = Clock::now();
         for (int h = 0; h < config.n_heads; ++h) {
             const int kh = h / group;
             const float* qh = q.data() + static_cast<size_t>(h) * head_dim;
@@ -1337,17 +1382,23 @@ struct AscendEngine {
                 ctx[static_cast<size_t>(h) * head_dim + d] = acc;
             }
         }
+        auto attn1 = Clock::now();
 
+        auto o0 = Clock::now();
         std::vector<float> attn_out = linear_with_weight(ctx, wo, hidden, hidden, prefix + " o_proj");
+        auto o1 = Clock::now();
         std::vector<float> after_attn(hidden);
         for (size_t i = 0; i < hidden; ++i) after_attn[i] = residual[i] + attn_out[i];
 
         const std::vector<float>& ln2 = cached_weight_float_ref(layer_weight_name(layer, "post_attention_layernorm.weight"));
         std::vector<float> mlp_in = after_attn;
+        auto norm2_0 = Clock::now();
         rms_norm_inplace(mlp_in, ln2);
+        auto norm2_1 = Clock::now();
         const std::vector<float>& wgate = cached_weight_float_ref(layer_weight_name(layer, "mlp.gate_proj.weight"));
         const std::vector<float>& wup = cached_weight_float_ref(layer_weight_name(layer, "mlp.up_proj.weight"));
         const std::vector<float>& wdown = cached_weight_float_ref(layer_weight_name(layer, "mlp.down_proj.weight"));
+        auto gate0 = Clock::now();
         std::vector<float> mid = gate_up_silu_reference(
             mlp_in,
             wgate,
@@ -1355,8 +1406,24 @@ struct AscendEngine {
             static_cast<size_t>(config.intermediate),
             hidden,
             prefix + " gate_up_silu");
+        auto gate1 = Clock::now();
+        auto down0 = Clock::now();
         std::vector<float> mlp_out = linear_with_weight(mid, wdown, hidden, static_cast<size_t>(config.intermediate), prefix + " down_proj");
+        auto down1 = Clock::now();
         for (size_t i = 0; i < hidden; ++i) after_attn[i] += mlp_out[i];
+        auto layer1 = Clock::now();
+        if (profile) {
+            profile->norm1_ms += elapsed_ms(norm1_0, norm1_1);
+            profile->q_ms += elapsed_ms(q0, q1);
+            profile->kv_ms += elapsed_ms(kv0, kv1);
+            profile->rope_ms += elapsed_ms(rope0, rope1);
+            profile->attn_ms += elapsed_ms(attn0, attn1);
+            profile->o_ms += elapsed_ms(o0, o1);
+            profile->norm2_ms += elapsed_ms(norm2_0, norm2_1);
+            profile->gate_up_ms += elapsed_ms(gate0, gate1);
+            profile->down_ms += elapsed_ms(down0, down1);
+            profile->total_ms += elapsed_ms(layer0, layer1);
+        }
         return after_attn;
     }
 
@@ -1376,17 +1443,52 @@ struct AscendEngine {
         std::vector<float> hidden_rows = load_hidden_rows_float(prompt_len);
         auto load1 = Clock::now();
         auto layers0 = Clock::now();
+        const bool profile_layers = ref_layer_profile_enabled();
+        RefLayerProfile profile_total;
         for (int tok = start; tok < prompt_len; ++tok) {
             std::vector<float> x(
                 hidden_rows.begin() + static_cast<size_t>(tok) * static_cast<size_t>(config.hidden),
                 hidden_rows.begin() + static_cast<size_t>(tok + 1) * static_cast<size_t>(config.hidden));
+            RefLayerProfile token_profile;
             for (int layer = 0; layer < config.n_layers; ++layer) {
-                x = layer_forward_reference(std::move(x), layer, tok);
+                x = layer_forward_reference(
+                    std::move(x),
+                    layer,
+                    tok,
+                    profile_layers ? &token_profile : nullptr);
+            }
+            if (profile_layers) {
+                profile_total.add(token_profile);
+                time_log("[Ascend][profile] all_layers token=" + std::to_string(tok) +
+                         ", norm1_ms=" + std::to_string(token_profile.norm1_ms) +
+                         ", q_ms=" + std::to_string(token_profile.q_ms) +
+                         ", kv_ms=" + std::to_string(token_profile.kv_ms) +
+                         ", rope_ms=" + std::to_string(token_profile.rope_ms) +
+                         ", attn_ms=" + std::to_string(token_profile.attn_ms) +
+                         ", o_ms=" + std::to_string(token_profile.o_ms) +
+                         ", norm2_ms=" + std::to_string(token_profile.norm2_ms) +
+                         ", gate_up_ms=" + std::to_string(token_profile.gate_up_ms) +
+                         ", down_ms=" + std::to_string(token_profile.down_ms) +
+                         ", total_ms=" + std::to_string(token_profile.total_ms));
             }
             full_last_hidden = std::move(x);
             full_ref_cached_len = tok + 1;
         }
         auto layers1 = Clock::now();
+        if (profile_layers && full_ref_cached_len > start) {
+            time_log("[Ascend][profile] all_layers aggregate, tokens_profiled=" +
+                     std::to_string(full_ref_cached_len - start) +
+                     ", norm1_ms=" + std::to_string(profile_total.norm1_ms) +
+                     ", q_ms=" + std::to_string(profile_total.q_ms) +
+                     ", kv_ms=" + std::to_string(profile_total.kv_ms) +
+                     ", rope_ms=" + std::to_string(profile_total.rope_ms) +
+                     ", attn_ms=" + std::to_string(profile_total.attn_ms) +
+                     ", o_ms=" + std::to_string(profile_total.o_ms) +
+                     ", norm2_ms=" + std::to_string(profile_total.norm2_ms) +
+                     ", gate_up_ms=" + std::to_string(profile_total.gate_up_ms) +
+                     ", down_ms=" + std::to_string(profile_total.down_ms) +
+                     ", total_ms=" + std::to_string(profile_total.total_ms));
+        }
         if (full_last_hidden.empty()) {
             throw std::runtime_error("all_layers_ref has no cached hidden state");
         }

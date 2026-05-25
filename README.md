@@ -192,6 +192,7 @@ export ASCEND_REF_CACHE_LOG=0
 export ASCEND_REF_KV_CACHE=1
 export ASCEND_REF_LINEAR_THREADS=16
 export ASCEND_LM_HEAD_THREADS=16
+export ASCEND_REF_PROFILE_LAYERS=0
 
 python python_infer.py \
   --model ./deepseek-r1-7b \

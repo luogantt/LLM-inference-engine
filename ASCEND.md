@@ -333,6 +333,8 @@ export ASCEND_REF_CACHE_LOG=0
 export ASCEND_REF_KV_CACHE=1
 export ASCEND_REF_LINEAR_THREADS=16
 export ASCEND_LM_HEAD_THREADS=16
+# Optional: set to 1 for one short run to profile q/kv/o/mlp/down bottlenecks.
+export ASCEND_REF_PROFILE_LAYERS=0
 
 python python_infer.py \
   --model ./deepseek-r1-7b \
@@ -362,6 +364,12 @@ with `ASCEND_HOST_RAW_CACHE=0` if host memory is tight.
 `ASCEND_HOST_RAW_DROP_AFTER_CONVERT=1` releases each raw host tensor immediately
 after it has been converted into the FP32 reference cache, reducing peak memory
 and avoiding the Linux OOM killer on smaller pods.
+
+`ASCEND_REF_PROFILE_LAYERS=1` prints per-token reference timing breakdowns for
+the 28-layer path. Use it with a very small `--max-new-tokens` value because it
+adds extra logs. The important fields are `q_ms`, `kv_ms`, `o_ms`,
+`gate_up_ms`, and `down_ms`; the largest fields should be moved to Ascend-side
+kernels first.
 
 Next direct-engine milestones:
 
