@@ -330,6 +330,10 @@ struct AscendEngine {
     bool acl_ready = false;
     std::unordered_map<std::string, DeviceTensor> d_weights;
     std::unordered_map<std::string, std::vector<float>> h_weight_cache;
+    std::vector<float> layer0_k_cache;
+    std::vector<float> layer0_v_cache;
+    int layer0_kv_cached_len = 0;
+    int layer0_kv_dim = 0;
 
     AscendEngine(const std::string& dir, int max_seq_)
         : device_id(env_int_or("ASCEND_DEVICE_ID", 0)),
@@ -514,6 +518,10 @@ struct AscendEngine {
         }
 
         prompt_len = len;
+        layer0_k_cache.clear();
+        layer0_v_cache.clear();
+        layer0_kv_cached_len = 0;
+        layer0_kv_dim = 0;
         std::fill(seen_tokens.begin(), seen_tokens.end(), 0);
         for (int i = 0; i < len; ++i) {
             if (ids[i] >= 0 && static_cast<size_t>(ids[i]) < seen_tokens.size()) {
@@ -996,13 +1004,33 @@ struct AscendEngine {
             throw std::runtime_error(label + " weight size mismatch");
         }
         std::vector<float> y(out_dim);
-        for (size_t out = 0; out < out_dim; ++out) {
-            const float* wrow = weight.data() + out * in_dim;
-            double acc = 0.0;
-            for (size_t in = 0; in < in_dim; ++in) {
-                acc += static_cast<double>(x[in]) * static_cast<double>(wrow[in]);
+
+        const int requested_threads = env_int_or("ASCEND_REF_LINEAR_THREADS", 0);
+        const unsigned hw_threads = std::max(1u, std::thread::hardware_concurrency());
+        int n_threads = requested_threads > 0 ? requested_threads : static_cast<int>(hw_threads);
+        n_threads = std::max(1, std::min<int>(n_threads, static_cast<int>(std::max<size_t>(1, out_dim))));
+        if (out_dim < 1024 && requested_threads <= 0) n_threads = 1;
+
+        auto compute_range = [&](int tid) {
+            const size_t begin = (out_dim * static_cast<size_t>(tid)) / static_cast<size_t>(n_threads);
+            const size_t end = (out_dim * static_cast<size_t>(tid + 1)) / static_cast<size_t>(n_threads);
+            for (size_t out = begin; out < end; ++out) {
+                const float* wrow = weight.data() + out * in_dim;
+                double acc = 0.0;
+                for (size_t in = 0; in < in_dim; ++in) {
+                    acc += static_cast<double>(x[in]) * static_cast<double>(wrow[in]);
+                }
+                y[out] = static_cast<float>(acc);
             }
-            y[out] = static_cast<float>(acc);
+        };
+
+        if (n_threads == 1) {
+            compute_range(0);
+        } else {
+            std::vector<std::thread> workers;
+            workers.reserve(static_cast<size_t>(n_threads));
+            for (int tid = 0; tid < n_threads; ++tid) workers.emplace_back(compute_range, tid);
+            for (auto& worker : workers) worker.join();
         }
         return y;
     }
@@ -1075,18 +1103,30 @@ struct AscendEngine {
         std::vector<float> q = linear_with_weight(q_in, wq, hidden, hidden, "layer0 q_proj");
         apply_rope(q, config.n_heads, len - 1);
 
-        std::vector<float> k_cache(static_cast<size_t>(len) * kv_dim);
-        std::vector<float> v_cache(static_cast<size_t>(len) * kv_dim);
-        for (int tok = 0; tok < len; ++tok) {
+        const bool kv_cache_enabled = env_str_or("ASCEND_REF_KV_CACHE", "1") != "0";
+        if (!kv_cache_enabled || layer0_kv_dim != kv_dim || layer0_kv_cached_len > len) {
+            layer0_k_cache.clear();
+            layer0_v_cache.clear();
+            layer0_kv_cached_len = 0;
+            layer0_kv_dim = kv_dim;
+        }
+        if (layer0_k_cache.size() < static_cast<size_t>(len) * kv_dim) {
+            layer0_k_cache.resize(static_cast<size_t>(len) * kv_dim);
+            layer0_v_cache.resize(static_cast<size_t>(len) * kv_dim);
+        }
+
+        const int cached_before = layer0_kv_cached_len;
+        for (int tok = layer0_kv_cached_len; tok < len; ++tok) {
             std::vector<float> x(hidden_rows.begin() + static_cast<size_t>(tok) * hidden,
                                  hidden_rows.begin() + static_cast<size_t>(tok + 1) * hidden);
             rms_norm_inplace(x, ln1);
             std::vector<float> k = linear_with_weight(x, wk, static_cast<size_t>(kv_dim), hidden, "layer0 k_proj");
             std::vector<float> v = linear_with_weight(x, wv, static_cast<size_t>(kv_dim), hidden, "layer0 v_proj");
             apply_rope(k, config.n_kv_heads, tok);
-            std::copy(k.begin(), k.end(), k_cache.begin() + static_cast<size_t>(tok) * kv_dim);
-            std::copy(v.begin(), v.end(), v_cache.begin() + static_cast<size_t>(tok) * kv_dim);
+            std::copy(k.begin(), k.end(), layer0_k_cache.begin() + static_cast<size_t>(tok) * kv_dim);
+            std::copy(v.begin(), v.end(), layer0_v_cache.begin() + static_cast<size_t>(tok) * kv_dim);
         }
+        layer0_kv_cached_len = len;
 
         std::vector<float> ctx(hidden, 0.0f);
         const float attn_scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
@@ -1096,7 +1136,7 @@ struct AscendEngine {
             const float* qh = q.data() + static_cast<size_t>(h) * head_dim;
             float max_score = -std::numeric_limits<float>::infinity();
             for (int tok = 0; tok < len; ++tok) {
-                const float* kk = k_cache.data() + static_cast<size_t>(tok) * kv_dim + static_cast<size_t>(kh) * head_dim;
+                const float* kk = layer0_k_cache.data() + static_cast<size_t>(tok) * kv_dim + static_cast<size_t>(kh) * head_dim;
                 double dot = 0.0;
                 for (int d = 0; d < head_dim; ++d) {
                     dot += static_cast<double>(qh[d]) * static_cast<double>(kk[d]);
@@ -1115,7 +1155,7 @@ struct AscendEngine {
                 double acc = 0.0;
                 for (int tok = 0; tok < len; ++tok) {
                     const float prob = scores[tok] * inv_denom;
-                    const float* vv = v_cache.data() + static_cast<size_t>(tok) * kv_dim + static_cast<size_t>(kh) * head_dim;
+                    const float* vv = layer0_v_cache.data() + static_cast<size_t>(tok) * kv_dim + static_cast<size_t>(kh) * head_dim;
                     acc += static_cast<double>(prob) * static_cast<double>(vv[d]);
                 }
                 ctx[static_cast<size_t>(h) * head_dim + d] = static_cast<float>(acc);
@@ -1153,11 +1193,12 @@ struct AscendEngine {
         std::vector<float> mlp_out = linear_with_weight(mid, wdown, hidden, static_cast<size_t>(config.intermediate), "layer0 down_proj");
         std::vector<float> out(hidden);
         for (size_t i = 0; i < hidden; ++i) out[i] = after_attn[i] + mlp_out[i];
-        store_hidden_row_float(len - 1, out);
 
         auto t1 = Clock::now();
         time_log("[Ascend][time] layer0 reference finished, tokens=" +
                  std::to_string(len) +
+                 ", kv_cached_before=" + std::to_string(cached_before) +
+                 ", kv_cached_after=" + std::to_string(layer0_kv_cached_len) +
                  ", hidden=" + std::to_string(hidden) +
                  ", head_dim=" + std::to_string(head_dim) +
                  ", kv_dim=" + std::to_string(kv_dim) +

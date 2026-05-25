@@ -4,7 +4,7 @@ ASCEND_CXX ?= g++
 ASCEND_HOME ?= /usr/local/Ascend/ascend-toolkit/latest
 
 COMMON_FLAGS = -O3 -std=c++17 -lineinfo
-ASCEND_FLAGS = -O3 -std=c++17 -fPIC
+ASCEND_FLAGS = -O3 -std=c++17 -fPIC -pthread
 
 .RECIPEPREFIX := >
 

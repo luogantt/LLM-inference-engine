@@ -277,6 +277,8 @@ export ASCEND_RUN_QPROJ=0
 export ASCEND_RUN_KVPROJ=0
 export ASCEND_DIRECT_DECODE=layer0_ref
 export ASCEND_REF_CACHE_WEIGHTS=1
+export ASCEND_REF_KV_CACHE=1
+export ASCEND_REF_LINEAR_THREADS=16
 export ASCEND_LM_HEAD_THREADS=16
 
 python python_infer.py \
@@ -307,6 +309,10 @@ back from HBM when `--max-new-tokens` is greater than 1.
 `ASCEND_LM_HEAD_THREADS` controls the host reference lm_head argmax parallelism.
 Leave it unset to use hardware concurrency, or set it explicitly on shared
 machines.
+
+`ASCEND_REF_LINEAR_THREADS` parallelizes host reference GEMV over output rows.
+`ASCEND_REF_KV_CACHE=1` reuses layer0 K/V between decode steps so only new
+tokens need K/V projection.
 
 Next direct-engine milestones:
 
