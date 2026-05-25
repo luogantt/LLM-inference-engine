@@ -1108,7 +1108,7 @@ struct AscendEngine {
     }
 
     std::vector<float> final_norm_vector(std::vector<float> x) {
-        std::vector<float> norm = load_weight_float("model.norm.weight");
+        const std::vector<float>& norm = cached_weight_float_ref("model.norm.weight");
         rms_norm_inplace(x, norm);
         return x;
     }
@@ -1129,11 +1129,11 @@ struct AscendEngine {
         const size_t last_off = static_cast<size_t>(len - 1) * hidden;
         std::vector<float> residual(hidden_rows.begin() + last_off, hidden_rows.begin() + last_off + hidden);
 
-        std::vector<float> ln1 = load_weight_float("model.layers.0.input_layernorm.weight");
-        std::vector<float> wq = load_weight_float("model.layers.0.self_attn.q_proj.weight");
-        std::vector<float> wk = load_weight_float("model.layers.0.self_attn.k_proj.weight");
-        std::vector<float> wv = load_weight_float("model.layers.0.self_attn.v_proj.weight");
-        std::vector<float> wo = load_weight_float("model.layers.0.self_attn.o_proj.weight");
+        const std::vector<float>& ln1 = cached_weight_float_ref("model.layers.0.input_layernorm.weight");
+        const std::vector<float>& wq = cached_weight_float_ref("model.layers.0.self_attn.q_proj.weight");
+        const std::vector<float>& wk = cached_weight_float_ref("model.layers.0.self_attn.k_proj.weight");
+        const std::vector<float>& wv = cached_weight_float_ref("model.layers.0.self_attn.v_proj.weight");
+        const std::vector<float>& wo = cached_weight_float_ref("model.layers.0.self_attn.o_proj.weight");
 
         const auto q_shape = matrix_shape("model.layers.0.self_attn.q_proj.weight");
         const auto k_shape = matrix_shape("model.layers.0.self_attn.k_proj.weight");
@@ -1146,10 +1146,12 @@ struct AscendEngine {
             throw std::runtime_error("layer0 attention projection shape mismatch");
         }
 
+        auto t_load = Clock::now();
         std::vector<float> q_in = residual;
         rms_norm_inplace(q_in, ln1);
         std::vector<float> q = linear_with_weight(q_in, wq, hidden, hidden, "layer0 q_proj");
         apply_rope(q, config.n_heads, len - 1);
+        auto t_q = Clock::now();
 
         const bool kv_cache_enabled = env_str_or("ASCEND_REF_KV_CACHE", "1") != "0";
         if (!kv_cache_enabled || layer0_kv_dim != kv_dim || layer0_kv_cached_len > len) {
@@ -1175,6 +1177,7 @@ struct AscendEngine {
             std::copy(v.begin(), v.end(), layer0_v_cache.begin() + static_cast<size_t>(tok) * kv_dim);
         }
         layer0_kv_cached_len = len;
+        auto t_kv = Clock::now();
 
         std::vector<float> ctx(hidden, 0.0f);
         const float attn_scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
@@ -1185,11 +1188,11 @@ struct AscendEngine {
             float max_score = -std::numeric_limits<float>::infinity();
             for (int tok = 0; tok < len; ++tok) {
                 const float* kk = layer0_k_cache.data() + static_cast<size_t>(tok) * kv_dim + static_cast<size_t>(kh) * head_dim;
-                double dot = 0.0;
+                float dot = 0.0f;
                 for (int d = 0; d < head_dim; ++d) {
-                    dot += static_cast<double>(qh[d]) * static_cast<double>(kk[d]);
+                    dot = std::fma(qh[d], kk[d], dot);
                 }
-                scores[tok] = static_cast<float>(dot) * attn_scale;
+                scores[tok] = dot * attn_scale;
                 max_score = std::max(max_score, scores[tok]);
             }
 
@@ -1200,27 +1203,29 @@ struct AscendEngine {
             }
             const float inv_denom = denom > 0.0 ? static_cast<float>(1.0 / denom) : 0.0f;
             for (int d = 0; d < head_dim; ++d) {
-                double acc = 0.0;
+                float acc = 0.0f;
                 for (int tok = 0; tok < len; ++tok) {
                     const float prob = scores[tok] * inv_denom;
                     const float* vv = layer0_v_cache.data() + static_cast<size_t>(tok) * kv_dim + static_cast<size_t>(kh) * head_dim;
-                    acc += static_cast<double>(prob) * static_cast<double>(vv[d]);
+                    acc = std::fma(prob, vv[d], acc);
                 }
-                ctx[static_cast<size_t>(h) * head_dim + d] = static_cast<float>(acc);
+                ctx[static_cast<size_t>(h) * head_dim + d] = acc;
             }
         }
+        auto t_attn = Clock::now();
 
         std::vector<float> attn_out = linear_with_weight(ctx, wo, hidden, hidden, "layer0 o_proj");
         std::vector<float> after_attn(hidden);
         for (size_t i = 0; i < hidden; ++i) after_attn[i] = residual[i] + attn_out[i];
+        auto t_o = Clock::now();
 
-        std::vector<float> ln2 = load_weight_float("model.layers.0.post_attention_layernorm.weight");
+        const std::vector<float>& ln2 = cached_weight_float_ref("model.layers.0.post_attention_layernorm.weight");
         std::vector<float> mlp_in = after_attn;
         rms_norm_inplace(mlp_in, ln2);
 
-        std::vector<float> wgate = load_weight_float("model.layers.0.mlp.gate_proj.weight");
-        std::vector<float> wup = load_weight_float("model.layers.0.mlp.up_proj.weight");
-        std::vector<float> wdown = load_weight_float("model.layers.0.mlp.down_proj.weight");
+        const std::vector<float>& wgate = cached_weight_float_ref("model.layers.0.mlp.gate_proj.weight");
+        const std::vector<float>& wup = cached_weight_float_ref("model.layers.0.mlp.up_proj.weight");
+        const std::vector<float>& wdown = cached_weight_float_ref("model.layers.0.mlp.down_proj.weight");
         const auto gate_shape = matrix_shape("model.layers.0.mlp.gate_proj.weight");
         const auto up_shape = matrix_shape("model.layers.0.mlp.up_proj.weight");
         const auto down_shape = matrix_shape("model.layers.0.mlp.down_proj.weight");
@@ -1242,6 +1247,8 @@ struct AscendEngine {
         std::vector<float> out(hidden);
         for (size_t i = 0; i < hidden; ++i) out[i] = after_attn[i] + mlp_out[i];
 
+        auto t_mlp = Clock::now();
+        std::vector<float> final_out = final_norm_vector(out);
         auto t1 = Clock::now();
         time_log("[Ascend][time] layer0 reference finished, tokens=" +
                  std::to_string(len) +
@@ -1250,8 +1257,15 @@ struct AscendEngine {
                  ", hidden=" + std::to_string(hidden) +
                  ", head_dim=" + std::to_string(head_dim) +
                  ", kv_dim=" + std::to_string(kv_dim) +
+                 ", load_ms=" + std::to_string(elapsed_ms(t0, t_load)) +
+                 ", q_ms=" + std::to_string(elapsed_ms(t_load, t_q)) +
+                 ", kv_ms=" + std::to_string(elapsed_ms(t_q, t_kv)) +
+                 ", attn_ms=" + std::to_string(elapsed_ms(t_kv, t_attn)) +
+                 ", o_ms=" + std::to_string(elapsed_ms(t_attn, t_o)) +
+                 ", mlp_ms=" + std::to_string(elapsed_ms(t_o, t_mlp)) +
+                 ", final_norm_ms=" + std::to_string(elapsed_ms(t_mlp, t1)) +
                  ", elapsed_ms=" + std::to_string(elapsed_ms(t0, t1)));
-        return final_norm_vector(out);
+        return final_out;
     }
 
     std::vector<float> load_last_hidden_with_final_norm() {
