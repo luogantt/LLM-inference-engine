@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cctype>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -209,6 +210,75 @@ static std::string shape_string(const std::vector<size_t>& shape) {
     }
     oss << "]";
     return oss.str();
+}
+
+static float bf16_to_float(uint16_t b) {
+    uint32_t x = static_cast<uint32_t>(b) << 16;
+    float y;
+    std::memcpy(&y, &x, sizeof(float));
+    return y;
+}
+
+static uint16_t float_to_bf16(float f) {
+    uint32_t x;
+    std::memcpy(&x, &f, sizeof(float));
+    const uint32_t lsb = (x >> 16) & 1u;
+    const uint32_t rounding_bias = 0x7FFFu + lsb;
+    return static_cast<uint16_t>((x + rounding_bias) >> 16);
+}
+
+static float f16_to_float(uint16_t h) {
+    const uint16_t he = h & 0x7C00u;
+    uint16_t hs = h & 0x03FFu;
+    const uint32_t fs = static_cast<uint32_t>(h & 0x8000u) << 16;
+    uint32_t fe = 0;
+    uint32_t ff = 0;
+    if (he == 0) {
+        if (hs == 0) {
+            uint32_t x = fs;
+            float y;
+            std::memcpy(&y, &x, sizeof(float));
+            return y;
+        }
+        int shift = 0;
+        while ((hs & 0x0400u) == 0) {
+            hs <<= 1;
+            shift++;
+        }
+        hs &= 0x03FFu;
+        fe = static_cast<uint32_t>(127 - 15 - shift) << 23;
+        ff = static_cast<uint32_t>(hs) << 13;
+    } else if (he == 0x7C00u) {
+        fe = 0xFFu << 23;
+        ff = static_cast<uint32_t>(hs) << 13;
+    } else {
+        fe = static_cast<uint32_t>((he >> 10) + (127 - 15)) << 23;
+        ff = static_cast<uint32_t>(hs) << 13;
+    }
+    uint32_t x = fs | fe | ff;
+    float y;
+    std::memcpy(&y, &x, sizeof(float));
+    return y;
+}
+
+static uint16_t float_to_f16(float value) {
+    uint32_t x;
+    std::memcpy(&x, &value, sizeof(float));
+    const uint32_t sign = (x >> 16) & 0x8000u;
+    int exp = static_cast<int>((x >> 23) & 0xFFu) - 127 + 15;
+    uint32_t mant = x & 0x7FFFFFu;
+    if (exp <= 0) {
+        if (exp < -10) return static_cast<uint16_t>(sign);
+        mant |= 0x800000u;
+        const uint32_t shift = static_cast<uint32_t>(14 - exp);
+        uint32_t half_mant = mant >> shift;
+        if ((mant >> (shift - 1)) & 1u) half_mant++;
+        return static_cast<uint16_t>(sign | half_mant);
+    }
+    if (exp >= 31) return static_cast<uint16_t>(sign | 0x7C00u);
+    uint32_t half = sign | (static_cast<uint32_t>(exp) << 10) | (mant >> 13);
+    if (mant & 0x00001000u) half++;
+    return static_cast<uint16_t>(half);
 }
 
 static int env_int_or(const char* name, int fallback) {
@@ -420,6 +490,9 @@ struct AscendEngine {
             env_str_or("ASCEND_RUN_EMBED", "1") != "0") {
             embedding_lookup(ids, len);
         }
+        if (d_hidden && env_str_or("ASCEND_RUN_RMSNORM", "0") != "0") {
+            rms_norm_reference(len);
+        }
         auto t1 = Clock::now();
         time_log("[Ascend][time] prefill copied token_ids to HBM, tokens=" +
                  std::to_string(len) + ", copy_roundtrip_ms=" + std::to_string(elapsed_ms(t0, t1)));
@@ -438,6 +511,50 @@ struct AscendEngine {
             throw std::runtime_error("cannot infer dtype size for tensor shape=" + shape_string(meta.shape));
         }
         return bytes / n;
+    }
+
+    static float load_scalar(const unsigned char* p, const std::string& dtype) {
+        uint16_t u16 = 0;
+        if (dtype == "BF16") {
+            std::memcpy(&u16, p, sizeof(uint16_t));
+            return bf16_to_float(u16);
+        }
+        if (dtype == "F16") {
+            std::memcpy(&u16, p, sizeof(uint16_t));
+            return f16_to_float(u16);
+        }
+        if (dtype == "F32" || dtype == "FLOAT32") {
+            float f = 0.0f;
+            std::memcpy(&f, p, sizeof(float));
+            return f;
+        }
+        throw std::runtime_error("unsupported tensor dtype for scalar load: " + dtype);
+    }
+
+    static void store_scalar(unsigned char* p, const std::string& dtype, float value) {
+        if (dtype == "BF16") {
+            const uint16_t u16 = float_to_bf16(value);
+            std::memcpy(p, &u16, sizeof(uint16_t));
+            return;
+        }
+        if (dtype == "F16") {
+            const uint16_t u16 = float_to_f16(value);
+            std::memcpy(p, &u16, sizeof(uint16_t));
+            return;
+        }
+        if (dtype == "F32" || dtype == "FLOAT32") {
+            std::memcpy(p, &value, sizeof(float));
+            return;
+        }
+        throw std::runtime_error("unsupported tensor dtype for scalar store: " + dtype);
+    }
+
+    const DeviceTensor* find_rms_norm_weight() const {
+        auto it = d_weights.find("model.layers.0.input_layernorm.weight");
+        if (it != d_weights.end()) return &it->second;
+        it = d_weights.find("model.norm.weight");
+        if (it != d_weights.end()) return &it->second;
+        return nullptr;
     }
 
     void ensure_hidden_buffer(const TensorMeta& embed_meta) {
@@ -495,6 +612,77 @@ struct AscendEngine {
                  std::to_string(len) +
                  ", row_bytes=" + std::to_string(row_bytes) +
                  ", total_bytes=" + std::to_string(static_cast<size_t>(len) * row_bytes) +
+                 ", elapsed_ms=" + std::to_string(elapsed_ms(t0, t1)));
+    }
+
+    void rms_norm_reference(int len) {
+        const DeviceTensor* norm = find_rms_norm_weight();
+        if (!norm) {
+            throw std::runtime_error(
+                "ASCEND_RUN_RMSNORM=1 requires model.norm.weight or "
+                "model.layers.0.input_layernorm.weight to be loaded");
+        }
+        if (norm->meta.shape.size() != 1 || norm->meta.shape[0] != static_cast<size_t>(config.hidden)) {
+            throw std::runtime_error("bad RMSNorm weight shape=" + shape_string(norm->meta.shape));
+        }
+        if (!d_hidden || hidden_row_bytes == 0) {
+            throw std::runtime_error("RMSNorm requires hidden buffer from embedding lookup");
+        }
+
+        const size_t hidden = static_cast<size_t>(config.hidden);
+        const TensorMeta& hidden_meta = d_weights.at("model.embed_tokens.weight").meta;
+        const size_t hidden_dtype_bytes = dtype_size_bytes(hidden_meta);
+        if (hidden_row_bytes != hidden * hidden_dtype_bytes) {
+            throw std::runtime_error("hidden buffer row bytes mismatch before RMSNorm");
+        }
+
+        auto t0 = Clock::now();
+        const size_t active_hidden_bytes = static_cast<size_t>(len) * hidden_row_bytes;
+        std::vector<unsigned char> h_hidden(active_hidden_bytes);
+        std::vector<unsigned char> h_norm(norm->bytes);
+
+        check_acl(aclrtMemcpy(h_hidden.data(), active_hidden_bytes, d_hidden, active_hidden_bytes,
+                              ACL_MEMCPY_DEVICE_TO_HOST),
+                  "aclrtMemcpy(D2H hidden for RMSNorm)");
+        check_acl(aclrtMemcpy(h_norm.data(), norm->bytes, norm->data, norm->bytes,
+                              ACL_MEMCPY_DEVICE_TO_HOST),
+                  "aclrtMemcpy(D2H norm weight for RMSNorm)");
+
+        const size_t norm_dtype_bytes = dtype_size_bytes(norm->meta);
+        float first_before = 0.0f;
+        float first_after = 0.0f;
+        for (int tok = 0; tok < len; ++tok) {
+            unsigned char* row = h_hidden.data() + static_cast<size_t>(tok) * hidden_row_bytes;
+            double sum_sq = 0.0;
+            for (size_t j = 0; j < hidden; ++j) {
+                const float x = load_scalar(row + j * hidden_dtype_bytes, hidden_meta.dtype);
+                sum_sq += static_cast<double>(x) * static_cast<double>(x);
+            }
+            const float scale = 1.0f / std::sqrt(static_cast<float>(sum_sq / hidden) + config.rms_norm_eps);
+            for (size_t j = 0; j < hidden; ++j) {
+                const float x = load_scalar(row + j * hidden_dtype_bytes, hidden_meta.dtype);
+                const float w = load_scalar(h_norm.data() + j * norm_dtype_bytes, norm->meta.dtype);
+                const float y = x * scale * w;
+                if (tok == 0 && j == 0) {
+                    first_before = x;
+                    first_after = y;
+                }
+                store_scalar(row + j * hidden_dtype_bytes, hidden_meta.dtype, y);
+            }
+        }
+
+        check_acl(aclrtMemcpy(d_hidden, hidden_bytes, h_hidden.data(), active_hidden_bytes,
+                              ACL_MEMCPY_HOST_TO_DEVICE),
+                  "aclrtMemcpy(H2D hidden after RMSNorm)");
+
+        auto t1 = Clock::now();
+        time_log("[Ascend][time] rmsnorm reference finished, tokens=" +
+                 std::to_string(len) +
+                 ", hidden=" + std::to_string(hidden) +
+                 ", norm_dtype=" + norm->meta.dtype +
+                 ", hidden_dtype=" + hidden_meta.dtype +
+                 ", first_before=" + std::to_string(first_before) +
+                 ", first_after=" + std::to_string(first_after) +
                  ", elapsed_ms=" + std::to_string(elapsed_ms(t0, t1)));
     }
 

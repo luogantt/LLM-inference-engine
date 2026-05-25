@@ -111,6 +111,7 @@ make -f Makefile.cuda_lib lib-ascend ASCEND_HOME=/usr/local/Ascend/cann-8.5.1
 export ASCEND_VISIBLE_DEVICES=4
 export ASCEND_DEVICE_ID=0
 export ASCEND_LOAD_WEIGHTS=minimal
+export ASCEND_RUN_RMSNORM=1
 
 python python_infer.py \
   --model ./deepseek-r1-7b \

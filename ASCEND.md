@@ -164,8 +164,43 @@ Expected extra logs:
 [Ascend][time] requested weights loaded, mode=minimal ...
 ```
 
+## Run RMSNorm Reference Stage
+
+After embedding lookup succeeds, enable the RMSNorm reference stage:
+
+```bash
+export ASCEND_VISIBLE_DEVICES=4
+export ASCEND_DEVICE_ID=0
+export ASCEND_LOAD_WEIGHTS=minimal
+export ASCEND_RUN_EMBED=1
+export ASCEND_RUN_RMSNORM=1
+
+python python_infer.py \
+  --model ./deepseek-r1-7b \
+  --lib ./build/libllm_ascend.so \
+  --prompt "你好 deepseek 介绍一下黑格尔的思想" \
+  --max-new-tokens 1 \
+  --max-seq 800 \
+  --tokenizer-backend tokenizers \
+  --prefill-only
+```
+
+Current RMSNorm is a correctness/reference stage:
+
+```text
+hidden HBM -> D2H -> host RMSNorm math -> H2D -> hidden HBM
+```
+
+It keeps the direct AscendCL data path clear while the next step is replacing the host math with an AscendC kernel.
+
+Expected extra log:
+
+```text
+[Ascend][time] rmsnorm reference finished ...
+```
+
 Next direct-engine milestones:
 
-1. Implement RMSNorm and RoPE with AscendC / ACL custom kernels.
-2. Implement decode GEMV / Linear and KV Cache layout.
-3. Implement GQA Attention, SwiGLU MLP, LM Head, and sampling.
+1. Replace RMSNorm reference with an AscendC kernel.
+2. Implement RoPE and decode GEMV / Linear.
+3. Implement KV Cache layout, GQA Attention, SwiGLU MLP, LM Head, and sampling.
