@@ -15,6 +15,7 @@ def parse_args():
     p.add_argument("--max-seq", type=int, default=256)
     p.add_argument("--repetition-penalty", type=float, default=1.1)
     p.add_argument("--no-chat-template", action="store_true")
+    p.add_argument("--prefill-only", action="store_true")
     return p.parse_args()
 
 
@@ -53,6 +54,12 @@ class CudaLLM:
         self.lib.llm_last_error.argtypes = []
         self.lib.llm_last_error.restype = ctypes.c_char_p
 
+        try:
+            self.lib.llm_backend_name.argtypes = []
+            self.lib.llm_backend_name.restype = ctypes.c_char_p
+        except AttributeError:
+            pass
+
         print(f"[Python] load lib: {lib_path}")
         print(f"[Python] model dir: {model_dir}")
 
@@ -63,6 +70,15 @@ class CudaLLM:
     def last_error(self) -> str:
         p = self.lib.llm_last_error()
         return p.decode("utf-8", errors="replace") if p else "unknown error"
+
+    def backend_name(self) -> str:
+        try:
+            p = self.lib.llm_backend_name()
+            if p:
+                return p.decode("utf-8", errors="replace")
+        except AttributeError:
+            pass
+        return "cuda"
 
     def check(self, ret: int):
         if ret != 0:
@@ -145,16 +161,21 @@ def main():
         )
 
     engine = CudaLLM(args.lib, args.model, args.max_seq)
+    backend = engine.backend_name()
+    print(f"[Python] backend: {backend}")
     engine.set_repetition_penalty(args.repetition_penalty)
     print(f"[Python] repetition penalty: {args.repetition_penalty}")
 
-    print("\n========== CUDA prefill ==========")
+    print(f"\n========== {backend} prefill ==========")
     engine.prefill(input_ids)
+    if args.prefill_only:
+        print("[Python] prefill-only finished")
+        return
 
     stop_ids = eos_set(tokenizer)
     gen_ids: List[int] = []
 
-    print("\n========== CUDA decode ==========")
+    print(f"\n========== {backend} decode ==========")
     for i in range(max_decode_tokens):
         tid = engine.decode_one()
         gen_ids.append(tid)

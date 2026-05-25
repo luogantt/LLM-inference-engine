@@ -102,3 +102,20 @@ python python_infer_ascend.py \
 ```
 
 See `ASCEND.md` for full setup and troubleshooting notes.
+
+The `Ascend` branch also contains a first CUDA-like direct AscendCL shared library skeleton:
+
+```bash
+make -f Makefile.cuda_lib lib-ascend ASCEND_HOME=/usr/local/Ascend/cann-8.5.1
+
+export ASCEND_VISIBLE_DEVICES=4
+export ASCEND_DEVICE_ID=0
+
+python python_infer.py \
+  --model ./deepseek-r1-7b \
+  --lib ./build/libllm_ascend.so \
+  --prompt "你好 deepseek 介绍一下黑格尔的思想" \
+  --max-new-tokens 1 \
+  --max-seq 800 \
+  --prefill-only
+```

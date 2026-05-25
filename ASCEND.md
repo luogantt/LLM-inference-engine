@@ -72,3 +72,63 @@ If the runtime has already remapped the visible card to logical device 0, the sa
 - `python_infer_ascend.py` is framework-based and uses `torch_npu`.
 - The CUDA shared library path `--lib ./build/libllm_cuda.so` is not used on Ascend.
 - For lower latency later, the next engineering step is to build an Ascend backend with ACL / custom operators, using the same separation idea as hardware plugin backends such as vLLM Ascend.
+
+## Direct AscendCL Engine Skeleton
+
+For a CUDA-like path, this branch also provides a direct C ABI shared library:
+
+```text
+Python tokenizer
+  -> ctypes
+  -> build/libllm_ascend.so
+  -> AscendCL / CANN runtime
+  -> Ascend HBM
+```
+
+This is the first direct-runtime stage. It initializes AscendCL, scans safetensors metadata, allocates HBM, copies prefill token ids to the device, and verifies an H2D/D2H roundtrip. Transformer decode kernels are intentionally not faked yet.
+
+Build it on the Ascend machine:
+
+```bash
+make -f Makefile.cuda_lib clean-lib
+
+make -f Makefile.cuda_lib lib-ascend \
+  ASCEND_HOME=/usr/local/Ascend/cann-8.5.1
+```
+
+If your image has the standard `latest` symlink, this also works:
+
+```bash
+make -f Makefile.cuda_lib lib-ascend
+```
+
+Smoke test the direct runtime and prefill path:
+
+```bash
+export ASCEND_VISIBLE_DEVICES=4
+export ASCEND_DEVICE_ID=0
+
+python python_infer.py \
+  --model ./deepseek-r1-7b \
+  --lib ./build/libllm_ascend.so \
+  --prompt "你好 deepseek 介绍一下黑格尔的思想" \
+  --max-new-tokens 1 \
+  --max-seq 800 \
+  --prefill-only
+```
+
+Expected log shape:
+
+```text
+[Python] backend: ascend-direct-acl
+[Ascend][time] create engine ...
+[Ascend][time] prefill copied token_ids to HBM ...
+[Python] prefill-only finished
+```
+
+Next direct-engine milestones:
+
+1. Load selected safetensors weights into Ascend HBM.
+2. Implement RMSNorm and RoPE with AscendC / ACL custom kernels.
+3. Implement decode GEMV / Linear and KV Cache layout.
+4. Implement GQA Attention, SwiGLU MLP, LM Head, and sampling.

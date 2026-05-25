@@ -1,15 +1,22 @@
 NVCC ?= nvcc
 A ?= sm_80
+ASCEND_CXX ?= g++
+ASCEND_HOME ?= /usr/local/Ascend/ascend-toolkit/latest
 
 COMMON_FLAGS = -O3 -std=c++17 -lineinfo
+ASCEND_FLAGS = -O3 -std=c++17 -fPIC
 
 .RECIPEPREFIX := >
 
-.PHONY: lib clean-lib
+.PHONY: lib lib-ascend clean-lib
 
 lib:
 >mkdir -p build
 >$(NVCC) $(COMMON_FLAGS) -arch=$(A) -Xcompiler -fPIC -shared src/llm_cuda_lib.cu -o build/libllm_cuda.so
+
+lib-ascend:
+>mkdir -p build
+>$(ASCEND_CXX) $(ASCEND_FLAGS) -shared src/llm_ascend_lib.cpp -o build/libllm_ascend.so -I$(ASCEND_HOME)/include -I$(ASCEND_HOME)/aarch64-linux/include -L$(ASCEND_HOME)/lib64 -L$(ASCEND_HOME)/aarch64-linux/lib64 -lascendcl
 
 clean-lib:
 >rm -rf build
