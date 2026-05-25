@@ -332,6 +332,9 @@ export ASCEND_REF_CACHE_WEIGHTS=1
 export ASCEND_REF_CACHE_LOG=0
 export ASCEND_REF_KV_CACHE=1
 export ASCEND_REF_LINEAR_THREADS=16
+export ASCEND_REF_ATTN_LINEAR_THREADS=16
+export ASCEND_REF_MLP_THREADS=32
+export ASCEND_REF_DOWN_THREADS=32
 export ASCEND_LM_HEAD_THREADS=16
 # Optional: set to 1 for one short run to profile q/kv/o/mlp/down bottlenecks.
 export ASCEND_REF_PROFILE_LAYERS=0
@@ -370,6 +373,11 @@ the 28-layer path. Use it with a very small `--max-new-tokens` value because it
 adds extra logs. The important fields are `q_ms`, `kv_ms`, `o_ms`,
 `gate_up_ms`, and `down_ms`; the largest fields should be moved to Ascend-side
 kernels first.
+
+`ASCEND_REF_MLP_THREADS` and `ASCEND_REF_DOWN_THREADS` let the CPU reference
+path use more worker threads for the MLP hot path without also increasing every
+Q/K/V/O projection. This is only for reference-path tuning; the real performance
+path is still to move these matmuls to Ascend kernels.
 
 Next direct-engine milestones:
 

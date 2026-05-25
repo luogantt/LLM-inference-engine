@@ -1065,12 +1065,45 @@ struct AscendEngine {
 
     RefThreadPool& ref_pool_for(int n_threads) const {
         n_threads = std::max(1, n_threads);
-        if (!ref_thread_pool || ref_thread_pool_size != n_threads) {
+        if (!ref_thread_pool || ref_thread_pool_size < n_threads) {
             if (ref_thread_pool) delete ref_thread_pool;
             ref_thread_pool = new RefThreadPool(n_threads);
             ref_thread_pool_size = n_threads;
         }
         return *ref_thread_pool;
+    }
+
+    static bool label_contains(const std::string& label, const std::string& needle) {
+        return label.find(needle) != std::string::npos;
+    }
+
+    int reference_threads_for_label(
+        const std::string& label,
+        size_t out_dim,
+        bool gate_up) const {
+        const unsigned hw_threads = std::max(1u, std::thread::hardware_concurrency());
+        int fallback = env_int_or("ASCEND_REF_LINEAR_THREADS", 0);
+        if (fallback <= 0) fallback = static_cast<int>(hw_threads);
+
+        int requested = fallback;
+        if (gate_up || label_contains(label, "down_proj")) {
+            requested = env_int_or("ASCEND_REF_MLP_THREADS", fallback);
+            if (label_contains(label, "down_proj")) {
+                requested = env_int_or("ASCEND_REF_DOWN_THREADS", requested);
+            }
+        } else if (label_contains(label, "q_proj") ||
+                   label_contains(label, "k_proj") ||
+                   label_contains(label, "v_proj") ||
+                   label_contains(label, "o_proj")) {
+            requested = env_int_or("ASCEND_REF_ATTN_LINEAR_THREADS", fallback);
+        }
+
+        int n_threads = std::max(
+            1,
+            std::min<int>(requested > 0 ? requested : static_cast<int>(hw_threads),
+                          static_cast<int>(std::max<size_t>(1, out_dim))));
+        if (out_dim < 1024 && requested <= 0) n_threads = 1;
+        return n_threads;
     }
 
     std::pair<size_t, size_t> matrix_shape(const std::string& name) const {
@@ -1268,11 +1301,7 @@ struct AscendEngine {
         }
         std::vector<float> y(out_dim);
 
-        const int requested_threads = env_int_or("ASCEND_REF_LINEAR_THREADS", 0);
-        const unsigned hw_threads = std::max(1u, std::thread::hardware_concurrency());
-        int n_threads = requested_threads > 0 ? requested_threads : static_cast<int>(hw_threads);
-        n_threads = std::max(1, std::min<int>(n_threads, static_cast<int>(std::max<size_t>(1, out_dim))));
-        if (out_dim < 1024 && requested_threads <= 0) n_threads = 1;
+        const int n_threads = reference_threads_for_label(label, out_dim, false);
 
         auto compute_range = [&](int tid) {
             const size_t begin = (out_dim * static_cast<size_t>(tid)) / static_cast<size_t>(n_threads);
@@ -1310,10 +1339,7 @@ struct AscendEngine {
         }
         std::vector<float> mid(out_dim);
 
-        const int requested_threads = env_int_or("ASCEND_REF_LINEAR_THREADS", 0);
-        const unsigned hw_threads = std::max(1u, std::thread::hardware_concurrency());
-        int n_threads = requested_threads > 0 ? requested_threads : static_cast<int>(hw_threads);
-        n_threads = std::max(1, std::min<int>(n_threads, static_cast<int>(std::max<size_t>(1, out_dim))));
+        const int n_threads = reference_threads_for_label(label, out_dim, true);
 
         auto compute_range = [&](int tid) {
             const size_t begin = (out_dim * static_cast<size_t>(tid)) / static_cast<size_t>(n_threads);
