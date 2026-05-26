@@ -216,3 +216,75 @@ python python_infer.py \
 
 `all_layers_ref` runs all 28 Transformer layers inside `libllm_ascend.so`.
 It is a correctness/reference path and does not import PyTorch.
+
+## Ascend ACLNN Accelerated Inference
+
+Current recommended direct Ascend inference command. This path keeps attention on CPU, and moves QKV, attention output projection, MLP, and lm_head MatMul to ACLNN:
+
+```bash
+cd ~/LLM-inference-engine
+
+git pull --ff-only origin Ascend
+
+make -f Makefile.cuda_lib clean-lib
+make -f Makefile.cuda_lib lib-ascend ASCEND_HOME=/usr/local/Ascend/cann-8.5.1
+
+mkdir -p ~/ascend/log
+
+export ASCEND_VISIBLE_DEVICES=4
+export ASCEND_DEVICE_ID=0
+
+export ASCEND_LOAD_WEIGHTS=all
+export ASCEND_WEIGHT_LOAD_LOG=0
+export ASCEND_HOST_RAW_CACHE=0
+
+export ASCEND_RUN_EMBED=1
+export ASCEND_DIRECT_DECODE=all_layers_ref
+
+export ASCEND_REF_CACHE_WEIGHTS=1
+export ASCEND_REF_CACHE_LOG=0
+export ASCEND_REF_KV_CACHE=1
+export ASCEND_REF_U16_WEIGHTS=1
+
+export ASCEND_REF_FAST_DOT=1
+export ASCEND_REF_DOT4=0
+export ASCEND_REF_NEON_DOT=0
+
+export ASCEND_ATTN_BACKEND=cpu
+
+export ASCEND_QKV_BACKEND=aclnn
+export ASCEND_QKV_FALLBACK=0
+export ASCEND_QKV_LOG=0
+
+export ASCEND_ATTN_PROJ_BACKEND=aclnn
+export ASCEND_ATTN_PROJ_FALLBACK=0
+export ASCEND_ATTN_PROJ_LOG=0
+
+export ASCEND_MLP_BACKEND=aclnn
+export ASCEND_MLP_FALLBACK=0
+export ASCEND_MLP_LOG=0
+
+export ASCEND_LM_HEAD_BACKEND=aclnn
+export ASCEND_LM_HEAD_FALLBACK=0
+export ASCEND_LM_HEAD_LOG=0
+
+export ASCEND_ACLNN_CUBE_MATH_TYPE=0
+
+export ASCEND_REF_LINEAR_THREADS=16
+export ASCEND_REF_ATTN_LINEAR_THREADS=16
+export ASCEND_REF_MLP_THREADS=24
+export ASCEND_REF_DOWN_THREADS=24
+export ASCEND_LM_HEAD_THREADS=16
+
+export ASCEND_REF_PROFILE_LAYERS=0
+export ASCEND_REF_PROFILE_TOKEN_LIMIT=0
+
+python python_infer.py \
+  --model ./deepseek-r1-7b \
+  --lib ./build/libllm_ascend.so \
+  --prompt "黑格尔的哲学思想可以概括为" \
+  --max-new-tokens 128 \
+  --max-seq 800 \
+  --tokenizer-backend tokenizers \
+  --no-chat-template
+```
