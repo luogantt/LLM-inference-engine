@@ -316,7 +316,12 @@ static bool ref_fast_dot_enabled() {
 }
 
 static bool ref_dot4_enabled() {
-    static const bool enabled = env_flag_enabled("ASCEND_REF_DOT4", true);
+    static const bool enabled = env_flag_enabled("ASCEND_REF_DOT4", false);
+    return enabled;
+}
+
+static bool ref_neon_dot_enabled() {
+    static const bool enabled = env_flag_enabled("ASCEND_REF_NEON_DOT", false);
     return enabled;
 }
 
@@ -451,7 +456,9 @@ static float dot_product_reference(const float* __restrict__ x, const float* __r
     }
 
 #if ASCEND_REF_HAVE_NEON
-    return dot_product_neon(x, w, n);
+    if (ref_neon_dot_enabled()) {
+        return dot_product_neon(x, w, n);
+    }
 #endif
 
     float acc0 = 0.0f;
@@ -492,8 +499,10 @@ static void dot_pair_reference(
     }
 
 #if ASCEND_REF_HAVE_NEON
-    dot_pair_neon(x, a, b, n, out_a, out_b);
-    return;
+    if (ref_neon_dot_enabled()) {
+        dot_pair_neon(x, a, b, n, out_a, out_b);
+        return;
+    }
 #endif
 
     float a0 = 0.0f;
@@ -562,8 +571,10 @@ static void dot4_reference(
     }
 
 #if ASCEND_REF_HAVE_NEON
-    dot4_neon(x, w0, w1, w2, w3, n, out0, out1, out2, out3);
-    return;
+    if (ref_neon_dot_enabled()) {
+        dot4_neon(x, w0, w1, w2, w3, n, out0, out1, out2, out3);
+        return;
+    }
 #endif
 
     float a0 = 0.0f;
@@ -1535,21 +1546,28 @@ struct AscendEngine {
         return "model.layers." + std::to_string(layer) + "." + suffix;
     }
 
-    std::vector<float> load_hidden_rows_float(int len) {
+    std::vector<float> load_hidden_rows_float_range(int start, int count) {
         if (!d_hidden || hidden_row_bytes == 0) {
             throw std::runtime_error("hidden rows require embedding prefill first");
+        }
+        if (start < 0 || count < 0 || start > max_seq || count > max_seq - start) {
+            throw std::runtime_error("hidden row range out of bounds");
+        }
+        if (count == 0) {
+            return {};
         }
         const TensorMeta& hidden_meta = require_device_weight("model.embed_tokens.weight").meta;
         const size_t hidden_dtype_bytes = dtype_size_bytes(hidden_meta);
         const size_t hidden = static_cast<size_t>(config.hidden);
-        const size_t active_bytes = static_cast<size_t>(len) * hidden_row_bytes;
+        const size_t active_bytes = static_cast<size_t>(count) * hidden_row_bytes;
         std::vector<unsigned char> raw(active_bytes);
-        check_acl(aclrtMemcpy(raw.data(), active_bytes, d_hidden, active_bytes,
+        char* src = static_cast<char*>(d_hidden) + static_cast<size_t>(start) * hidden_row_bytes;
+        check_acl(aclrtMemcpy(raw.data(), active_bytes, src, active_bytes,
                               ACL_MEMCPY_DEVICE_TO_HOST),
                   "aclrtMemcpy(D2H hidden rows)");
 
-        std::vector<float> rows(static_cast<size_t>(len) * hidden);
-        for (int tok = 0; tok < len; ++tok) {
+        std::vector<float> rows(static_cast<size_t>(count) * hidden);
+        for (int tok = 0; tok < count; ++tok) {
             const unsigned char* row = raw.data() + static_cast<size_t>(tok) * hidden_row_bytes;
             for (size_t j = 0; j < hidden; ++j) {
                 rows[static_cast<size_t>(tok) * hidden + j] =
@@ -1557,6 +1575,10 @@ struct AscendEngine {
             }
         }
         return rows;
+    }
+
+    std::vector<float> load_hidden_rows_float(int len) {
+        return load_hidden_rows_float_range(0, len);
     }
 
     void store_hidden_row_float(int row_idx, const std::vector<float>& x) {
@@ -1885,7 +1907,7 @@ struct AscendEngine {
         auto t0 = Clock::now();
         const int start = full_ref_cached_len;
         auto load0 = Clock::now();
-        std::vector<float> hidden_rows = load_hidden_rows_float(prompt_len);
+        std::vector<float> hidden_rows = load_hidden_rows_float_range(start, prompt_len - start);
         auto load1 = Clock::now();
         auto layers0 = Clock::now();
         const bool profile_layers = ref_layer_profile_enabled();
@@ -1895,9 +1917,10 @@ struct AscendEngine {
         for (int tok = start; tok < prompt_len; ++tok) {
             const bool profile_this_token =
                 profile_layers && (profile_token_limit <= 0 || tok < profile_token_limit);
+            const size_t local_tok = static_cast<size_t>(tok - start);
             std::vector<float> x(
-                hidden_rows.begin() + static_cast<size_t>(tok) * static_cast<size_t>(config.hidden),
-                hidden_rows.begin() + static_cast<size_t>(tok + 1) * static_cast<size_t>(config.hidden));
+                hidden_rows.begin() + local_tok * static_cast<size_t>(config.hidden),
+                hidden_rows.begin() + (local_tok + 1) * static_cast<size_t>(config.hidden));
             RefLayerProfile token_profile;
             for (int layer = 0; layer < config.n_layers; ++layer) {
                 x = layer_forward_reference(
