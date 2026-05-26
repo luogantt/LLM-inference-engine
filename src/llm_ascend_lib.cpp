@@ -782,7 +782,77 @@ struct DeviceTensor {
     size_t bytes = 0;
 };
 
+struct aclTensor;
 struct aclOpExecutor;
+
+struct AclRuntimeTensorApi {
+    using CreateTensorFn = aclTensor* (*)(
+        const int64_t* view_dims,
+        uint64_t view_dim_num,
+        aclDataType data_type,
+        const int64_t* stride,
+        int64_t offset,
+        aclFormat format,
+        const int64_t* storage_dims,
+        uint64_t storage_dim_num,
+        void* tensor_data);
+    using DestroyTensorFn = void (*)(const aclTensor*);
+
+    bool tried = false;
+    bool ready = false;
+    CreateTensorFn create_tensor = nullptr;
+    DestroyTensorFn destroy_tensor = nullptr;
+    std::string error;
+
+    template <typename Fn>
+    bool load_symbol(Fn& fn, void* handle, const char* name) {
+#if defined(__linux__)
+        fn = reinterpret_cast<Fn>(dlsym(handle, name));
+        if (!fn) {
+            error = std::string("missing ACL runtime tensor symbol ") + name;
+            return false;
+        }
+        return true;
+#else
+        (void)fn;
+        (void)handle;
+        (void)name;
+        error = "ACL runtime tensor dynamic loading is only supported on Linux";
+        return false;
+#endif
+    }
+
+    bool load(void* opapi_handle, std::string& reason) {
+        if (tried) {
+            if (!ready) reason = error;
+            return ready;
+        }
+        tried = true;
+#if defined(__linux__)
+        void* handle = RTLD_DEFAULT;
+        ready =
+            load_symbol(create_tensor, handle, "aclCreateTensor") &&
+            load_symbol(destroy_tensor, handle, "aclDestroyTensor");
+        if (!ready && opapi_handle) {
+            error.clear();
+            ready =
+                load_symbol(create_tensor, opapi_handle, "aclCreateTensor") &&
+                load_symbol(destroy_tensor, opapi_handle, "aclDestroyTensor");
+        }
+        if (!ready) reason = error;
+        return ready;
+#else
+        error = "ACL runtime tensor dynamic loading is only supported on Linux";
+        reason = error;
+        return false;
+#endif
+    }
+};
+
+static AclRuntimeTensorApi& global_acl_tensor_api() {
+    static AclRuntimeTensorApi api;
+    return api;
+}
 
 struct AclTensorGuard {
     aclTensor* tensor = nullptr;
@@ -811,7 +881,8 @@ struct AclTensorGuard {
 
     void reset() {
         if (tensor) {
-            aclDestroyTensor(tensor);
+            AclRuntimeTensorApi& api = global_acl_tensor_api();
+            if (api.destroy_tensor) api.destroy_tensor(tensor);
             tensor = nullptr;
         }
     }
@@ -1511,7 +1582,11 @@ struct AscendEngine {
         int64_t dims[2] = {rows, cols};
         int64_t strides[2] = {stride0, stride1};
         int64_t storage_dims[2] = {storage_rows, storage_cols};
-        aclTensor* tensor = aclCreateTensor(
+        AclRuntimeTensorApi& api = global_acl_tensor_api();
+        if (!api.create_tensor) {
+            throw std::runtime_error("aclCreateTensor symbol is not loaded for " + label);
+        }
+        aclTensor* tensor = api.create_tensor(
             dims,
             2,
             dtype,
@@ -1615,6 +1690,8 @@ struct AscendEngine {
         try {
             AclnnApi& api = global_aclnn_api();
             if (!api.load(reason)) return false;
+            AclRuntimeTensorApi& tensor_api = global_acl_tensor_api();
+            if (!tensor_api.load(api.handle, reason)) return false;
 
             const DeviceTensor& gate = require_device_weight(gate_name);
             const DeviceTensor& up = require_device_weight(up_name);
