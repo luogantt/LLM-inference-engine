@@ -325,6 +325,11 @@ static bool ref_neon_dot_enabled() {
     return enabled;
 }
 
+static bool ref_u16_weight_enabled() {
+    static const bool enabled = env_flag_enabled("ASCEND_REF_U16_WEIGHTS", false);
+    return enabled;
+}
+
 #if ASCEND_REF_HAVE_NEON
 static float dot_product_neon(const float* __restrict__ x, const float* __restrict__ w, size_t n) {
     float32x4_t acc0 = vdupq_n_f32(0.0f);
@@ -478,6 +483,69 @@ static float dot_product_reference(const float* __restrict__ x, const float* __r
     return acc;
 }
 
+static float dot_product_bf16_weight_reference(
+    const float* __restrict__ x,
+    const uint16_t* __restrict__ w,
+    size_t n) {
+    if (!ref_fast_dot_enabled()) {
+        float acc = 0.0f;
+        for (size_t i = 0; i < n; ++i) acc = std::fma(x[i], bf16_to_float(w[i]), acc);
+        return acc;
+    }
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+    float acc3 = 0.0f;
+    size_t i = 0;
+    const size_t n4 = n & ~static_cast<size_t>(3);
+    for (; i < n4; i += 4) {
+        acc0 += x[i + 0] * bf16_to_float(w[i + 0]);
+        acc1 += x[i + 1] * bf16_to_float(w[i + 1]);
+        acc2 += x[i + 2] * bf16_to_float(w[i + 2]);
+        acc3 += x[i + 3] * bf16_to_float(w[i + 3]);
+    }
+    float acc = (acc0 + acc1) + (acc2 + acc3);
+    for (; i < n; ++i) acc += x[i] * bf16_to_float(w[i]);
+    return acc;
+}
+
+static float dot_product_f16_weight_reference(
+    const float* __restrict__ x,
+    const uint16_t* __restrict__ w,
+    size_t n) {
+    if (!ref_fast_dot_enabled()) {
+        float acc = 0.0f;
+        for (size_t i = 0; i < n; ++i) acc = std::fma(x[i], f16_to_float(w[i]), acc);
+        return acc;
+    }
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+    float acc3 = 0.0f;
+    size_t i = 0;
+    const size_t n4 = n & ~static_cast<size_t>(3);
+    for (; i < n4; i += 4) {
+        acc0 += x[i + 0] * f16_to_float(w[i + 0]);
+        acc1 += x[i + 1] * f16_to_float(w[i + 1]);
+        acc2 += x[i + 2] * f16_to_float(w[i + 2]);
+        acc3 += x[i + 3] * f16_to_float(w[i + 3]);
+    }
+    float acc = (acc0 + acc1) + (acc2 + acc3);
+    for (; i < n; ++i) acc += x[i] * f16_to_float(w[i]);
+    return acc;
+}
+
+static float dot_product_u16_weight_reference(
+    const float* __restrict__ x,
+    const uint16_t* __restrict__ w,
+    size_t n,
+    bool bf16) {
+    return bf16 ? dot_product_bf16_weight_reference(x, w, n)
+                : dot_product_f16_weight_reference(x, w, n);
+}
+
 static void dot_pair_reference(
     const float* __restrict__ x,
     const float* __restrict__ a,
@@ -538,6 +606,105 @@ static void dot_pair_reference(
     }
     out_a = acc_a;
     out_b = acc_b;
+}
+
+static void dot_pair_bf16_weight_reference(
+    const float* __restrict__ x,
+    const uint16_t* __restrict__ a,
+    const uint16_t* __restrict__ b,
+    size_t n,
+    float& out_a,
+    float& out_b) {
+    float a0 = 0.0f;
+    float a1 = 0.0f;
+    float a2 = 0.0f;
+    float a3 = 0.0f;
+    float b0 = 0.0f;
+    float b1 = 0.0f;
+    float b2 = 0.0f;
+    float b3 = 0.0f;
+    size_t i = 0;
+    const size_t n4 = n & ~static_cast<size_t>(3);
+    for (; i < n4; i += 4) {
+        const float x0 = x[i + 0];
+        const float x1 = x[i + 1];
+        const float x2 = x[i + 2];
+        const float x3 = x[i + 3];
+        a0 += x0 * bf16_to_float(a[i + 0]);
+        a1 += x1 * bf16_to_float(a[i + 1]);
+        a2 += x2 * bf16_to_float(a[i + 2]);
+        a3 += x3 * bf16_to_float(a[i + 3]);
+        b0 += x0 * bf16_to_float(b[i + 0]);
+        b1 += x1 * bf16_to_float(b[i + 1]);
+        b2 += x2 * bf16_to_float(b[i + 2]);
+        b3 += x3 * bf16_to_float(b[i + 3]);
+    }
+    float acc_a = (a0 + a1) + (a2 + a3);
+    float acc_b = (b0 + b1) + (b2 + b3);
+    for (; i < n; ++i) {
+        const float xv = x[i];
+        acc_a += xv * bf16_to_float(a[i]);
+        acc_b += xv * bf16_to_float(b[i]);
+    }
+    out_a = acc_a;
+    out_b = acc_b;
+}
+
+static void dot_pair_f16_weight_reference(
+    const float* __restrict__ x,
+    const uint16_t* __restrict__ a,
+    const uint16_t* __restrict__ b,
+    size_t n,
+    float& out_a,
+    float& out_b) {
+    float a0 = 0.0f;
+    float a1 = 0.0f;
+    float a2 = 0.0f;
+    float a3 = 0.0f;
+    float b0 = 0.0f;
+    float b1 = 0.0f;
+    float b2 = 0.0f;
+    float b3 = 0.0f;
+    size_t i = 0;
+    const size_t n4 = n & ~static_cast<size_t>(3);
+    for (; i < n4; i += 4) {
+        const float x0 = x[i + 0];
+        const float x1 = x[i + 1];
+        const float x2 = x[i + 2];
+        const float x3 = x[i + 3];
+        a0 += x0 * f16_to_float(a[i + 0]);
+        a1 += x1 * f16_to_float(a[i + 1]);
+        a2 += x2 * f16_to_float(a[i + 2]);
+        a3 += x3 * f16_to_float(a[i + 3]);
+        b0 += x0 * f16_to_float(b[i + 0]);
+        b1 += x1 * f16_to_float(b[i + 1]);
+        b2 += x2 * f16_to_float(b[i + 2]);
+        b3 += x3 * f16_to_float(b[i + 3]);
+    }
+    float acc_a = (a0 + a1) + (a2 + a3);
+    float acc_b = (b0 + b1) + (b2 + b3);
+    for (; i < n; ++i) {
+        const float xv = x[i];
+        acc_a += xv * f16_to_float(a[i]);
+        acc_b += xv * f16_to_float(b[i]);
+    }
+    out_a = acc_a;
+    out_b = acc_b;
+}
+
+static void dot_pair_u16_weight_reference(
+    const float* __restrict__ x,
+    const uint16_t* __restrict__ a,
+    const uint16_t* __restrict__ b,
+    size_t n,
+    bool bf16,
+    float& out_a,
+    float& out_b) {
+    if (bf16) {
+        dot_pair_bf16_weight_reference(x, a, b, n, out_a, out_b);
+    } else {
+        dot_pair_f16_weight_reference(x, a, b, n, out_a, out_b);
+    }
 }
 
 static void dot4_reference(
@@ -1675,6 +1842,79 @@ struct AscendEngine {
         return y;
     }
 
+    static bool u16_weight_dtype_supported(const std::string& dtype) {
+        return dtype == "BF16" || dtype == "F16";
+    }
+
+    std::vector<float> linear_with_u16_weight(
+        const std::vector<float>& x,
+        const std::vector<uint16_t>& weight,
+        size_t out_dim,
+        size_t in_dim,
+        const std::string& weight_dtype,
+        const std::string& label,
+        const std::vector<float>* bias = nullptr) const {
+        if (x.size() != in_dim) {
+            throw std::runtime_error(label + " input dim mismatch");
+        }
+        if (weight.size() != out_dim * in_dim) {
+            throw std::runtime_error(label + " raw u16 weight size mismatch");
+        }
+        if (bias && bias->size() != out_dim) {
+            throw std::runtime_error(label + " bias size mismatch");
+        }
+        if (!u16_weight_dtype_supported(weight_dtype)) {
+            throw std::runtime_error(label + " raw u16 weight dtype mismatch: " + weight_dtype);
+        }
+        std::vector<float> y(out_dim);
+
+        const int n_threads = reference_threads_for_label(label, out_dim, false);
+        const bool bf16 = weight_dtype == "BF16";
+
+        auto compute_range = [&](int tid) {
+            const size_t begin = (out_dim * static_cast<size_t>(tid)) / static_cast<size_t>(n_threads);
+            const size_t end = (out_dim * static_cast<size_t>(tid + 1)) / static_cast<size_t>(n_threads);
+            for (size_t out = begin; out < end; ++out) {
+                const uint16_t* wrow = weight.data() + out * in_dim;
+#if defined(__GNUC__) || defined(__clang__)
+                if (out + 1 < end) __builtin_prefetch(weight.data() + (out + 1) * in_dim, 0, 1);
+#endif
+                float acc = dot_product_u16_weight_reference(x.data(), wrow, in_dim, bf16);
+                if (bias) acc += (*bias)[out];
+                y[out] = acc;
+            }
+        };
+
+        if (n_threads == 1) {
+            compute_range(0);
+        } else {
+            ref_pool_for(n_threads).run(n_threads, compute_range);
+        }
+        return y;
+    }
+
+    std::vector<float> linear_with_named_weight(
+        const std::vector<float>& x,
+        const std::string& weight_name,
+        size_t out_dim,
+        size_t in_dim,
+        const std::string& label,
+        const std::vector<float>* bias = nullptr) {
+        const DeviceTensor& tensor = require_device_weight(weight_name);
+        if (tensor.meta.shape.size() != 2 ||
+            tensor.meta.shape[0] != out_dim ||
+            tensor.meta.shape[1] != in_dim) {
+            throw std::runtime_error(label + " weight shape mismatch: " + weight_name +
+                                     " shape=" + shape_string(tensor.meta.shape));
+        }
+        if (ref_u16_weight_enabled() && u16_weight_dtype_supported(tensor.meta.dtype)) {
+            const std::vector<uint16_t>& weight = cached_weight_u16_ref(weight_name);
+            return linear_with_u16_weight(x, weight, out_dim, in_dim, tensor.meta.dtype, label, bias);
+        }
+        const std::vector<float>& weight = cached_weight_float_ref(weight_name);
+        return linear_with_weight(x, weight, out_dim, in_dim, label, bias);
+    }
+
     std::vector<float> gate_up_silu_reference(
         const std::vector<float>& x,
         const std::vector<float>& gate_weight,
@@ -1717,6 +1957,82 @@ struct AscendEngine {
             ref_pool_for(n_threads).run(n_threads, compute_range);
         }
         return mid;
+    }
+
+    std::vector<float> gate_up_silu_u16_reference(
+        const std::vector<float>& x,
+        const std::vector<uint16_t>& gate_weight,
+        const std::vector<uint16_t>& up_weight,
+        size_t out_dim,
+        size_t in_dim,
+        const std::string& weight_dtype,
+        const std::string& label) const {
+        if (x.size() != in_dim) {
+            throw std::runtime_error(label + " input dim mismatch");
+        }
+        if (gate_weight.size() != out_dim * in_dim || up_weight.size() != out_dim * in_dim) {
+            throw std::runtime_error(label + " raw u16 weight size mismatch");
+        }
+        if (!u16_weight_dtype_supported(weight_dtype)) {
+            throw std::runtime_error(label + " raw u16 weight dtype mismatch: " + weight_dtype);
+        }
+        std::vector<float> mid(out_dim);
+
+        const int n_threads = reference_threads_for_label(label, out_dim, true);
+        const bool bf16 = weight_dtype == "BF16";
+
+        auto compute_range = [&](int tid) {
+            const size_t begin = (out_dim * static_cast<size_t>(tid)) / static_cast<size_t>(n_threads);
+            const size_t end = (out_dim * static_cast<size_t>(tid + 1)) / static_cast<size_t>(n_threads);
+            for (size_t out = begin; out < end; ++out) {
+                const uint16_t* grow = gate_weight.data() + out * in_dim;
+                const uint16_t* urow = up_weight.data() + out * in_dim;
+#if defined(__GNUC__) || defined(__clang__)
+                if (out + 1 < end) {
+                    __builtin_prefetch(gate_weight.data() + (out + 1) * in_dim, 0, 1);
+                    __builtin_prefetch(up_weight.data() + (out + 1) * in_dim, 0, 1);
+                }
+#endif
+                float gacc = 0.0f;
+                float uacc = 0.0f;
+                dot_pair_u16_weight_reference(x.data(), grow, urow, in_dim, bf16, gacc, uacc);
+                mid[out] = (gacc / (1.0f + std::exp(-gacc))) * uacc;
+            }
+        };
+
+        if (n_threads == 1) {
+            compute_range(0);
+        } else {
+            ref_pool_for(n_threads).run(n_threads, compute_range);
+        }
+        return mid;
+    }
+
+    std::vector<float> gate_up_silu_named(
+        const std::vector<float>& x,
+        const std::string& gate_name,
+        const std::string& up_name,
+        size_t out_dim,
+        size_t in_dim,
+        const std::string& label) {
+        const DeviceTensor& gate = require_device_weight(gate_name);
+        const DeviceTensor& up = require_device_weight(up_name);
+        if (gate.meta.shape.size() != 2 || up.meta.shape.size() != 2 ||
+            gate.meta.shape[0] != out_dim || gate.meta.shape[1] != in_dim ||
+            up.meta.shape[0] != out_dim || up.meta.shape[1] != in_dim) {
+            throw std::runtime_error(label + " weight shape mismatch");
+        }
+        if (ref_u16_weight_enabled() &&
+            gate.meta.dtype == up.meta.dtype &&
+            u16_weight_dtype_supported(gate.meta.dtype)) {
+            const std::vector<uint16_t>& gate_weight = cached_weight_u16_ref(gate_name);
+            const std::vector<uint16_t>& up_weight = cached_weight_u16_ref(up_name);
+            return gate_up_silu_u16_reference(
+                x, gate_weight, up_weight, out_dim, in_dim, gate.meta.dtype, label);
+        }
+        const std::vector<float>& gate_weight = cached_weight_float_ref(gate_name);
+        const std::vector<float>& up_weight = cached_weight_float_ref(up_name);
+        return gate_up_silu_reference(x, gate_weight, up_weight, out_dim, in_dim, label);
     }
 
     void apply_rope(std::vector<float>& x, int heads, int pos) const {
@@ -1786,14 +2102,18 @@ struct AscendEngine {
         ensure_full_ref_cache(kv_dim);
 
         const std::string prefix = "layer" + std::to_string(layer);
-        const std::vector<float>& ln1 = cached_weight_float_ref(layer_weight_name(layer, "input_layernorm.weight"));
-        const std::vector<float>& wq = cached_weight_float_ref(layer_weight_name(layer, "self_attn.q_proj.weight"));
-        const std::vector<float>& wk = cached_weight_float_ref(layer_weight_name(layer, "self_attn.k_proj.weight"));
-        const std::vector<float>& wv = cached_weight_float_ref(layer_weight_name(layer, "self_attn.v_proj.weight"));
-        const std::vector<float>& wo = cached_weight_float_ref(layer_weight_name(layer, "self_attn.o_proj.weight"));
-        const std::vector<float>* bq = optional_cached_weight_float_ref(layer_weight_name(layer, "self_attn.q_proj.bias"));
-        const std::vector<float>* bk = optional_cached_weight_float_ref(layer_weight_name(layer, "self_attn.k_proj.bias"));
-        const std::vector<float>* bv = optional_cached_weight_float_ref(layer_weight_name(layer, "self_attn.v_proj.bias"));
+        const std::string ln1_name = layer_weight_name(layer, "input_layernorm.weight");
+        const std::string wq_name = layer_weight_name(layer, "self_attn.q_proj.weight");
+        const std::string wk_name = layer_weight_name(layer, "self_attn.k_proj.weight");
+        const std::string wv_name = layer_weight_name(layer, "self_attn.v_proj.weight");
+        const std::string wo_name = layer_weight_name(layer, "self_attn.o_proj.weight");
+        const std::string bq_name = layer_weight_name(layer, "self_attn.q_proj.bias");
+        const std::string bk_name = layer_weight_name(layer, "self_attn.k_proj.bias");
+        const std::string bv_name = layer_weight_name(layer, "self_attn.v_proj.bias");
+        const std::vector<float>& ln1 = cached_weight_float_ref(ln1_name);
+        const std::vector<float>* bq = optional_cached_weight_float_ref(bq_name);
+        const std::vector<float>* bk = optional_cached_weight_float_ref(bk_name);
+        const std::vector<float>* bv = optional_cached_weight_float_ref(bv_name);
 
         std::vector<float> residual = x;
         std::vector<float> qkv_in = x;
@@ -1801,11 +2121,11 @@ struct AscendEngine {
         rms_norm_inplace(qkv_in, ln1);
         auto norm1_1 = Clock::now();
         auto q0 = Clock::now();
-        std::vector<float> q = linear_with_weight(qkv_in, wq, hidden, hidden, prefix + " q_proj", bq);
+        std::vector<float> q = linear_with_named_weight(qkv_in, wq_name, hidden, hidden, prefix + " q_proj", bq);
         auto q1 = Clock::now();
         auto kv0 = Clock::now();
-        std::vector<float> k = linear_with_weight(qkv_in, wk, static_cast<size_t>(kv_dim), hidden, prefix + " k_proj", bk);
-        std::vector<float> v = linear_with_weight(qkv_in, wv, static_cast<size_t>(kv_dim), hidden, prefix + " v_proj", bv);
+        std::vector<float> k = linear_with_named_weight(qkv_in, wk_name, static_cast<size_t>(kv_dim), hidden, prefix + " k_proj", bk);
+        std::vector<float> v = linear_with_named_weight(qkv_in, wv_name, static_cast<size_t>(kv_dim), hidden, prefix + " v_proj", bv);
         auto kv1 = Clock::now();
         auto rope0 = Clock::now();
         apply_rope(q, config.n_heads, pos);
@@ -1852,30 +2172,31 @@ struct AscendEngine {
         auto attn1 = Clock::now();
 
         auto o0 = Clock::now();
-        std::vector<float> attn_out = linear_with_weight(ctx, wo, hidden, hidden, prefix + " o_proj");
+        std::vector<float> attn_out = linear_with_named_weight(ctx, wo_name, hidden, hidden, prefix + " o_proj");
         auto o1 = Clock::now();
         std::vector<float> after_attn(hidden);
         for (size_t i = 0; i < hidden; ++i) after_attn[i] = residual[i] + attn_out[i];
 
-        const std::vector<float>& ln2 = cached_weight_float_ref(layer_weight_name(layer, "post_attention_layernorm.weight"));
+        const std::string ln2_name = layer_weight_name(layer, "post_attention_layernorm.weight");
+        const std::string wgate_name = layer_weight_name(layer, "mlp.gate_proj.weight");
+        const std::string wup_name = layer_weight_name(layer, "mlp.up_proj.weight");
+        const std::string wdown_name = layer_weight_name(layer, "mlp.down_proj.weight");
+        const std::vector<float>& ln2 = cached_weight_float_ref(ln2_name);
         std::vector<float> mlp_in = after_attn;
         auto norm2_0 = Clock::now();
         rms_norm_inplace(mlp_in, ln2);
         auto norm2_1 = Clock::now();
-        const std::vector<float>& wgate = cached_weight_float_ref(layer_weight_name(layer, "mlp.gate_proj.weight"));
-        const std::vector<float>& wup = cached_weight_float_ref(layer_weight_name(layer, "mlp.up_proj.weight"));
-        const std::vector<float>& wdown = cached_weight_float_ref(layer_weight_name(layer, "mlp.down_proj.weight"));
         auto gate0 = Clock::now();
-        std::vector<float> mid = gate_up_silu_reference(
+        std::vector<float> mid = gate_up_silu_named(
             mlp_in,
-            wgate,
-            wup,
+            wgate_name,
+            wup_name,
             static_cast<size_t>(config.intermediate),
             hidden,
             prefix + " gate_up_silu");
         auto gate1 = Clock::now();
         auto down0 = Clock::now();
-        std::vector<float> mlp_out = linear_with_weight(mid, wdown, hidden, static_cast<size_t>(config.intermediate), prefix + " down_proj");
+        std::vector<float> mlp_out = linear_with_named_weight(mid, wdown_name, hidden, static_cast<size_t>(config.intermediate), prefix + " down_proj");
         auto down1 = Clock::now();
         for (size_t i = 0; i < hidden; ++i) after_attn[i] += mlp_out[i];
         auto layer1 = Clock::now();
@@ -2200,7 +2521,15 @@ struct AscendEngine {
         const size_t vocab = meta.shape[0];
         const size_t hidden = meta.shape[1];
         auto t0 = Clock::now();
-        const std::vector<float>& h_head = cached_weight_float_ref("lm_head.weight");
+        const bool use_u16_head = ref_u16_weight_enabled() && u16_weight_dtype_supported(meta.dtype);
+        const bool head_bf16 = meta.dtype == "BF16";
+        const std::vector<uint16_t>* h_head_u16 = nullptr;
+        const std::vector<float>* h_head_float = nullptr;
+        if (use_u16_head) {
+            h_head_u16 = &cached_weight_u16_ref("lm_head.weight");
+        } else {
+            h_head_float = &cached_weight_float_ref("lm_head.weight");
+        }
         const size_t vocab_limit_env = static_cast<size_t>(std::max(0, env_int_or("ASCEND_LM_HEAD_REF_VOCAB", 0)));
         const size_t vocab_limit = vocab_limit_env > 0 ? std::min(vocab, vocab_limit_env) : vocab;
         const bool suppress_special = env_str_or("ASCEND_SUPPRESS_SPECIAL", "0") != "0";
@@ -2225,8 +2554,14 @@ struct AscendEngine {
             int best_id = static_cast<int>(begin);
             for (size_t tok = begin; tok < end; ++tok) {
                 if (suppress_special && tok >= 151000) continue;
-                const float* wrow = h_head.data() + tok * hidden;
-                float logit = dot_product_reference(x.data(), wrow, hidden);
+                float logit = 0.0f;
+                if (use_u16_head) {
+                    const uint16_t* wrow = h_head_u16->data() + tok * hidden;
+                    logit = dot_product_u16_weight_reference(x.data(), wrow, hidden, head_bf16);
+                } else {
+                    const float* wrow = h_head_float->data() + tok * hidden;
+                    logit = dot_product_reference(x.data(), wrow, hidden);
+                }
                 if (tok < seen_tokens.size() && seen_tokens[tok] && repetition_penalty > 1.0f) {
                     logit = logit >= 0.0f ? logit / repetition_penalty : logit * repetition_penalty;
                 }
@@ -2258,6 +2593,7 @@ struct AscendEngine {
                  std::to_string(vocab_limit) +
                  ", hidden=" + std::to_string(hidden) +
                  ", weight_dtype=" + meta.dtype +
+                 ", weight_cache=" + std::string(use_u16_head ? "u16" : "fp32") +
                  ", threads=" + std::to_string(n_threads) +
                  ", token=" + std::to_string(best_id) +
                  ", logit=" + std::to_string(best) +
