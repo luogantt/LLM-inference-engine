@@ -8,6 +8,9 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#if defined(__linux__)
+#include <dlfcn.h>
+#endif
 #include <dirent.h>
 #include <exception>
 #include <fstream>
@@ -779,6 +782,117 @@ struct DeviceTensor {
     size_t bytes = 0;
 };
 
+struct aclOpExecutor;
+
+struct AclTensorGuard {
+    aclTensor* tensor = nullptr;
+
+    AclTensorGuard() = default;
+    explicit AclTensorGuard(aclTensor* t) : tensor(t) {}
+    AclTensorGuard(const AclTensorGuard&) = delete;
+    AclTensorGuard& operator=(const AclTensorGuard&) = delete;
+
+    AclTensorGuard(AclTensorGuard&& other) noexcept : tensor(other.tensor) {
+        other.tensor = nullptr;
+    }
+
+    AclTensorGuard& operator=(AclTensorGuard&& other) noexcept {
+        if (this != &other) {
+            reset();
+            tensor = other.tensor;
+            other.tensor = nullptr;
+        }
+        return *this;
+    }
+
+    ~AclTensorGuard() {
+        reset();
+    }
+
+    void reset() {
+        if (tensor) {
+            aclDestroyTensor(tensor);
+            tensor = nullptr;
+        }
+    }
+
+    aclTensor* get() const {
+        return tensor;
+    }
+};
+
+struct AclnnApi {
+    using MmGetWorkspaceSizeFn = int (*)(const aclTensor*, const aclTensor*, aclTensor*, int8_t, uint64_t*, aclOpExecutor**);
+    using MmFn = int (*)(void*, uint64_t, aclOpExecutor*, aclrtStream);
+    using SiluGetWorkspaceSizeFn = int (*)(const aclTensor*, aclTensor*, uint64_t*, aclOpExecutor**);
+    using SiluFn = int (*)(void*, uint64_t, aclOpExecutor*, aclrtStream);
+    using MulGetWorkspaceSizeFn = int (*)(const aclTensor*, const aclTensor*, aclTensor*, uint64_t*, aclOpExecutor**);
+    using MulFn = int (*)(void*, uint64_t, aclOpExecutor*, aclrtStream);
+
+    bool tried = false;
+    bool ready = false;
+    void* handle = nullptr;
+    MmGetWorkspaceSizeFn mm_ws = nullptr;
+    MmFn mm = nullptr;
+    SiluGetWorkspaceSizeFn silu_ws = nullptr;
+    SiluFn silu = nullptr;
+    MulGetWorkspaceSizeFn mul_ws = nullptr;
+    MulFn mul = nullptr;
+    std::string error;
+
+    template <typename Fn>
+    bool load_symbol(Fn& fn, const char* name) {
+#if defined(__linux__)
+        fn = reinterpret_cast<Fn>(dlsym(handle, name));
+        if (!fn) {
+            error = std::string("missing ACLNN symbol ") + name;
+            return false;
+        }
+        return true;
+#else
+        (void)fn;
+        (void)name;
+        error = "ACLNN dynamic loading is only supported on Linux";
+        return false;
+#endif
+    }
+
+    bool load(std::string& reason) {
+        if (tried) {
+            if (!ready) reason = error;
+            return ready;
+        }
+        tried = true;
+#if defined(__linux__)
+        handle = dlopen("libopapi.so", RTLD_NOW | RTLD_LOCAL);
+        if (!handle) {
+            const char* err = dlerror();
+            error = std::string("dlopen libopapi.so failed: ") + (err ? err : "unknown error");
+            reason = error;
+            return false;
+        }
+        ready =
+            load_symbol(mm_ws, "aclnnMmGetWorkspaceSize") &&
+            load_symbol(mm, "aclnnMm") &&
+            load_symbol(silu_ws, "aclnnSiluGetWorkspaceSize") &&
+            load_symbol(silu, "aclnnSilu") &&
+            load_symbol(mul_ws, "aclnnMulGetWorkspaceSize") &&
+            load_symbol(mul, "aclnnMul");
+        if (!ready) reason = error;
+        return ready;
+#else
+        error = "ACLNN dynamic loading is only supported on Linux";
+        reason = error;
+        return false;
+#endif
+    }
+};
+
+static AclnnApi& global_aclnn_api() {
+    static AclnnApi api;
+    return api;
+}
+
 struct RefLayerProfile {
     double norm1_ms = 0.0;
     double q_ms = 0.0;
@@ -802,6 +916,29 @@ struct RefLayerProfile {
         gate_up_ms += other.gate_up_ms;
         down_ms += other.down_ms;
         total_ms += other.total_ms;
+    }
+};
+
+struct DeviceMlpTiming {
+    double gate_up_ms = 0.0;
+    double down_ms = 0.0;
+};
+
+struct DeviceWorkspaceGuard {
+    std::vector<void*> ptrs;
+
+    ~DeviceWorkspaceGuard() {
+        for (void* p : ptrs) {
+            if (p) aclrtFree(p);
+        }
+    }
+
+    void* allocate(uint64_t bytes, const char* label) {
+        if (bytes == 0) return nullptr;
+        void* p = nullptr;
+        check_acl(aclrtMalloc(&p, static_cast<size_t>(bytes), ACL_MEM_MALLOC_HUGE_FIRST), label);
+        ptrs.push_back(p);
+        return p;
     }
 };
 
@@ -898,6 +1035,11 @@ struct AscendEngine {
     void* d_q = nullptr;
     void* d_k = nullptr;
     void* d_v = nullptr;
+    void* d_mlp_x = nullptr;
+    void* d_mlp_gate = nullptr;
+    void* d_mlp_up = nullptr;
+    void* d_mlp_mid = nullptr;
+    void* d_mlp_out = nullptr;
     size_t token_bytes = 0;
     size_t hidden_bytes = 0;
     size_t hidden_row_bytes = 0;
@@ -907,7 +1049,12 @@ struct AscendEngine {
     size_t k_row_bytes = 0;
     size_t v_bytes = 0;
     size_t v_row_bytes = 0;
+    size_t mlp_hidden_bytes = 0;
+    size_t mlp_intermediate_bytes = 0;
+    std::string mlp_buffer_dtype;
     bool acl_ready = false;
+    bool aclnn_mlp_disabled = false;
+    bool aclnn_mlp_notice_printed = false;
     mutable RefThreadPool* ref_thread_pool = nullptr;
     mutable int ref_thread_pool_size = 0;
     std::unordered_map<std::string, DeviceTensor> d_weights;
@@ -1030,6 +1177,7 @@ struct AscendEngine {
             aclrtFree(d_v);
             d_v = nullptr;
         }
+        free_mlp_buffers();
         if (d_tokens) {
             aclrtFree(d_tokens);
             d_tokens = nullptr;
@@ -1257,6 +1405,319 @@ struct AscendEngine {
             return;
         }
         throw std::runtime_error("unsupported tensor dtype for scalar store: " + dtype);
+    }
+
+    static bool aclnn_mlp_enabled() {
+        const std::string backend = env_str_or("ASCEND_MLP_BACKEND", "");
+        if (!backend.empty()) {
+            return backend == "aclnn" || backend == "acl" || backend == "ascend" || backend == "1";
+        }
+        return env_flag_enabled("ASCEND_ACLNN_MLP", false);
+    }
+
+    static bool aclnn_mlp_fallback_enabled() {
+        return env_flag_enabled("ASCEND_MLP_FALLBACK", true);
+    }
+
+    static bool aclnn_mlp_log_enabled() {
+        return env_flag_enabled("ASCEND_MLP_LOG", false);
+    }
+
+    static int8_t aclnn_cube_math_type() {
+        return static_cast<int8_t>(env_int_or("ASCEND_ACLNN_CUBE_MATH_TYPE", 0));
+    }
+
+    static size_t dtype_size_from_string(const std::string& dtype) {
+        if (dtype == "BF16" || dtype == "F16") return sizeof(uint16_t);
+        if (dtype == "F32" || dtype == "FLOAT32") return sizeof(float);
+        throw std::runtime_error("unsupported ACLNN MLP dtype: " + dtype);
+    }
+
+    static aclDataType acl_dtype_from_string(const std::string& dtype) {
+        if (dtype == "BF16") return ACL_BF16;
+        if (dtype == "F16") return ACL_FLOAT16;
+        if (dtype == "F32" || dtype == "FLOAT32") return ACL_FLOAT;
+        throw std::runtime_error("unsupported ACLNN dtype: " + dtype);
+    }
+
+    void free_mlp_buffers() {
+        auto free_one = [](void*& p) {
+            if (p) {
+                aclrtFree(p);
+                p = nullptr;
+            }
+        };
+        free_one(d_mlp_x);
+        free_one(d_mlp_gate);
+        free_one(d_mlp_up);
+        free_one(d_mlp_mid);
+        free_one(d_mlp_out);
+        mlp_hidden_bytes = 0;
+        mlp_intermediate_bytes = 0;
+        mlp_buffer_dtype.clear();
+    }
+
+    void ensure_mlp_buffers(const std::string& dtype) {
+        const size_t dtype_bytes = dtype_size_from_string(dtype);
+        const size_t hidden = static_cast<size_t>(config.hidden);
+        const size_t intermediate = static_cast<size_t>(config.intermediate);
+        const size_t need_hidden = hidden * dtype_bytes;
+        const size_t need_intermediate = intermediate * dtype_bytes;
+        if (d_mlp_x && d_mlp_gate && d_mlp_up && d_mlp_mid && d_mlp_out &&
+            mlp_buffer_dtype == dtype &&
+            mlp_hidden_bytes == need_hidden &&
+            mlp_intermediate_bytes == need_intermediate) {
+            return;
+        }
+
+        free_mlp_buffers();
+        auto alloc = [](void*& p, size_t bytes, const char* label) {
+            check_acl(aclrtMalloc(&p, bytes, ACL_MEM_MALLOC_HUGE_FIRST), label);
+            check_acl(aclrtMemset(p, bytes, 0, bytes), label);
+        };
+        alloc(d_mlp_x, need_hidden, "aclrtMalloc(MLP input)");
+        alloc(d_mlp_gate, need_intermediate, "aclrtMalloc(MLP gate)");
+        alloc(d_mlp_up, need_intermediate, "aclrtMalloc(MLP up)");
+        alloc(d_mlp_mid, need_intermediate, "aclrtMalloc(MLP mid)");
+        alloc(d_mlp_out, need_hidden, "aclrtMalloc(MLP output)");
+        mlp_hidden_bytes = need_hidden;
+        mlp_intermediate_bytes = need_intermediate;
+        mlp_buffer_dtype = dtype;
+        time_log("[Ascend][time] ACLNN MLP buffers allocated, dtype=" + dtype +
+                 ", hidden_bytes=" + std::to_string(mlp_hidden_bytes) +
+                 ", intermediate_bytes=" + std::to_string(mlp_intermediate_bytes));
+    }
+
+    static AclTensorGuard create_acl_tensor_2d(
+        void* data,
+        int64_t rows,
+        int64_t cols,
+        aclDataType dtype,
+        const std::string& label) {
+        return create_acl_tensor_2d_strided(
+            data, rows, cols, cols, 1, rows, cols, dtype, label);
+    }
+
+    static AclTensorGuard create_acl_tensor_2d_strided(
+        void* data,
+        int64_t rows,
+        int64_t cols,
+        int64_t stride0,
+        int64_t stride1,
+        int64_t storage_rows,
+        int64_t storage_cols,
+        aclDataType dtype,
+        const std::string& label) {
+        int64_t dims[2] = {rows, cols};
+        int64_t strides[2] = {stride0, stride1};
+        int64_t storage_dims[2] = {storage_rows, storage_cols};
+        aclTensor* tensor = aclCreateTensor(
+            dims,
+            2,
+            dtype,
+            strides,
+            0,
+            ACL_FORMAT_ND,
+            storage_dims,
+            2,
+            data);
+        if (!tensor) throw std::runtime_error("aclCreateTensor failed for " + label);
+        return AclTensorGuard(tensor);
+    }
+
+    static void fill_raw_from_float_vector(
+        const std::vector<float>& x,
+        const std::string& dtype,
+        std::vector<unsigned char>& raw) {
+        const size_t dtype_bytes = dtype_size_from_string(dtype);
+        raw.resize(x.size() * dtype_bytes);
+        for (size_t i = 0; i < x.size(); ++i) {
+            store_scalar(raw.data() + i * dtype_bytes, dtype, x[i]);
+        }
+    }
+
+    static std::vector<float> raw_to_float_vector(
+        const std::vector<unsigned char>& raw,
+        const std::string& dtype,
+        size_t elements) {
+        const size_t dtype_bytes = dtype_size_from_string(dtype);
+        if (raw.size() != elements * dtype_bytes) {
+            throw std::runtime_error("raw_to_float_vector byte size mismatch");
+        }
+        std::vector<float> out(elements);
+        for (size_t i = 0; i < elements; ++i) {
+            out[i] = load_scalar(raw.data() + i * dtype_bytes, dtype);
+        }
+        return out;
+    }
+
+    static void check_aclnn_status(int ret, const std::string& label) {
+        if (ret != 0) {
+            throw std::runtime_error(label + " failed, ret=" + std::to_string(ret));
+        }
+    }
+
+    void launch_aclnn_mm(
+        AclnnApi& api,
+        aclTensor* input,
+        aclTensor* weight,
+        aclTensor* output,
+        DeviceWorkspaceGuard& workspaces,
+        const std::string& label) {
+        uint64_t workspace_size = 0;
+        aclOpExecutor* executor = nullptr;
+        check_aclnn_status(
+            api.mm_ws(input, weight, output, aclnn_cube_math_type(), &workspace_size, &executor),
+            label + " GetWorkspaceSize");
+        void* workspace = workspaces.allocate(workspace_size, ("aclrtMalloc(" + label + " workspace)").c_str());
+        check_aclnn_status(api.mm(workspace, workspace_size, executor, stream), label);
+    }
+
+    void launch_aclnn_silu(
+        AclnnApi& api,
+        aclTensor* input,
+        aclTensor* output,
+        DeviceWorkspaceGuard& workspaces,
+        const std::string& label) {
+        uint64_t workspace_size = 0;
+        aclOpExecutor* executor = nullptr;
+        check_aclnn_status(
+            api.silu_ws(input, output, &workspace_size, &executor),
+            label + " GetWorkspaceSize");
+        void* workspace = workspaces.allocate(workspace_size, ("aclrtMalloc(" + label + " workspace)").c_str());
+        check_aclnn_status(api.silu(workspace, workspace_size, executor, stream), label);
+    }
+
+    void launch_aclnn_mul(
+        AclnnApi& api,
+        aclTensor* lhs,
+        aclTensor* rhs,
+        aclTensor* output,
+        DeviceWorkspaceGuard& workspaces,
+        const std::string& label) {
+        uint64_t workspace_size = 0;
+        aclOpExecutor* executor = nullptr;
+        check_aclnn_status(
+            api.mul_ws(lhs, rhs, output, &workspace_size, &executor),
+            label + " GetWorkspaceSize");
+        void* workspace = workspaces.allocate(workspace_size, ("aclrtMalloc(" + label + " workspace)").c_str());
+        check_aclnn_status(api.mul(workspace, workspace_size, executor, stream), label);
+    }
+
+    bool mlp_aclnn_forward(
+        const std::vector<float>& mlp_in,
+        const std::string& gate_name,
+        const std::string& up_name,
+        const std::string& down_name,
+        std::vector<float>& mlp_out,
+        DeviceMlpTiming& timing,
+        std::string& reason) {
+        try {
+            AclnnApi& api = global_aclnn_api();
+            if (!api.load(reason)) return false;
+
+            const DeviceTensor& gate = require_device_weight(gate_name);
+            const DeviceTensor& up = require_device_weight(up_name);
+            const DeviceTensor& down = require_device_weight(down_name);
+            const size_t hidden = static_cast<size_t>(config.hidden);
+            const size_t intermediate = static_cast<size_t>(config.intermediate);
+            if (mlp_in.size() != hidden) {
+                reason = "ACLNN MLP input dim mismatch";
+                return false;
+            }
+            if (gate.meta.dtype != up.meta.dtype || gate.meta.dtype != down.meta.dtype) {
+                reason = "ACLNN MLP requires gate/up/down to share dtype";
+                return false;
+            }
+            if (gate.meta.dtype != "BF16" && gate.meta.dtype != "F16") {
+                reason = "ACLNN MLP currently supports BF16/F16 weights only, got " + gate.meta.dtype;
+                return false;
+            }
+            if (gate.meta.shape.size() != 2 || up.meta.shape.size() != 2 || down.meta.shape.size() != 2 ||
+                gate.meta.shape[0] != intermediate || gate.meta.shape[1] != hidden ||
+                up.meta.shape[0] != intermediate || up.meta.shape[1] != hidden ||
+                down.meta.shape[0] != hidden || down.meta.shape[1] != intermediate) {
+                reason = "ACLNN MLP weight shape mismatch";
+                return false;
+            }
+
+            const std::string dtype = gate.meta.dtype;
+            const aclDataType acl_dtype = acl_dtype_from_string(dtype);
+            ensure_mlp_buffers(dtype);
+
+            auto gate0 = Clock::now();
+            std::vector<unsigned char> raw_in;
+            fill_raw_from_float_vector(mlp_in, dtype, raw_in);
+            check_acl(aclrtMemcpy(d_mlp_x, mlp_hidden_bytes, raw_in.data(), raw_in.size(), ACL_MEMCPY_HOST_TO_DEVICE),
+                      "aclrtMemcpy(H2D ACLNN MLP input)");
+
+            AclTensorGuard x = create_acl_tensor_2d(d_mlp_x, 1, static_cast<int64_t>(hidden), acl_dtype, "MLP input");
+            AclTensorGuard gate_w_t = create_acl_tensor_2d_strided(
+                gate.data,
+                static_cast<int64_t>(hidden),
+                static_cast<int64_t>(intermediate),
+                1,
+                static_cast<int64_t>(hidden),
+                static_cast<int64_t>(intermediate),
+                static_cast<int64_t>(hidden),
+                acl_dtype,
+                "MLP gate weight transposed view");
+            AclTensorGuard up_w_t = create_acl_tensor_2d_strided(
+                up.data,
+                static_cast<int64_t>(hidden),
+                static_cast<int64_t>(intermediate),
+                1,
+                static_cast<int64_t>(hidden),
+                static_cast<int64_t>(intermediate),
+                static_cast<int64_t>(hidden),
+                acl_dtype,
+                "MLP up weight transposed view");
+            AclTensorGuard down_w_t = create_acl_tensor_2d_strided(
+                down.data,
+                static_cast<int64_t>(intermediate),
+                static_cast<int64_t>(hidden),
+                1,
+                static_cast<int64_t>(intermediate),
+                static_cast<int64_t>(hidden),
+                static_cast<int64_t>(intermediate),
+                acl_dtype,
+                "MLP down weight transposed view");
+            AclTensorGuard gate_out = create_acl_tensor_2d(d_mlp_gate, 1, static_cast<int64_t>(intermediate), acl_dtype, "MLP gate output");
+            AclTensorGuard up_out = create_acl_tensor_2d(d_mlp_up, 1, static_cast<int64_t>(intermediate), acl_dtype, "MLP up output");
+            AclTensorGuard mid = create_acl_tensor_2d(d_mlp_mid, 1, static_cast<int64_t>(intermediate), acl_dtype, "MLP mid");
+            AclTensorGuard out = create_acl_tensor_2d(d_mlp_out, 1, static_cast<int64_t>(hidden), acl_dtype, "MLP output");
+
+            DeviceWorkspaceGuard workspaces;
+            launch_aclnn_mm(api, x.get(), gate_w_t.get(), gate_out.get(), workspaces, "ACLNN MLP gate mm");
+            launch_aclnn_mm(api, x.get(), up_w_t.get(), up_out.get(), workspaces, "ACLNN MLP up mm");
+            launch_aclnn_silu(api, gate_out.get(), mid.get(), workspaces, "ACLNN MLP silu");
+            launch_aclnn_mul(api, mid.get(), up_out.get(), gate_out.get(), workspaces, "ACLNN MLP silu_mul");
+            auto gate1 = Clock::now();
+            auto down0 = Clock::now();
+            launch_aclnn_mm(api, gate_out.get(), down_w_t.get(), out.get(), workspaces, "ACLNN MLP down mm");
+            check_acl(aclrtSynchronizeStream(stream), "aclrtSynchronizeStream(ACLNN MLP)");
+
+            std::vector<unsigned char> raw_out(mlp_hidden_bytes);
+            check_acl(aclrtMemcpy(raw_out.data(), raw_out.size(), d_mlp_out, mlp_hidden_bytes, ACL_MEMCPY_DEVICE_TO_HOST),
+                      "aclrtMemcpy(D2H ACLNN MLP output)");
+            auto down1 = Clock::now();
+            mlp_out = raw_to_float_vector(raw_out, dtype, hidden);
+            timing.gate_up_ms = elapsed_ms(gate0, gate1);
+            timing.down_ms = elapsed_ms(down0, down1);
+
+            if (!aclnn_mlp_notice_printed || aclnn_mlp_log_enabled()) {
+                time_log("[Ascend][time] ACLNN MLP path active, dtype=" + dtype +
+                         ", hidden=" + std::to_string(hidden) +
+                         ", intermediate=" + std::to_string(intermediate) +
+                         ", gate_up_enqueue_ms=" + std::to_string(timing.gate_up_ms) +
+                         ", down_sync_d2h_ms=" + std::to_string(timing.down_ms));
+                aclnn_mlp_notice_printed = true;
+            }
+            return true;
+        } catch (const std::exception& e) {
+            reason = e.what();
+            return false;
+        }
     }
 
     const DeviceTensor* find_rms_norm_weight() const {
@@ -2187,18 +2648,46 @@ struct AscendEngine {
         auto norm2_0 = Clock::now();
         rms_norm_inplace(mlp_in, ln2);
         auto norm2_1 = Clock::now();
+        DeviceMlpTiming mlp_timing;
+        bool used_device_mlp = false;
+        std::vector<float> mlp_out;
+        if (aclnn_mlp_enabled() && !aclnn_mlp_disabled) {
+            std::string reason;
+            used_device_mlp = mlp_aclnn_forward(
+                mlp_in,
+                wgate_name,
+                wup_name,
+                wdown_name,
+                mlp_out,
+                mlp_timing,
+                reason);
+            if (!used_device_mlp) {
+                aclnn_mlp_disabled = true;
+                time_log("[Ascend][warn] ACLNN MLP disabled, fallback=cpu, reason=" + reason);
+                if (!aclnn_mlp_fallback_enabled()) {
+                    throw std::runtime_error("ACLNN MLP failed and ASCEND_MLP_FALLBACK=0: " + reason);
+                }
+            }
+        }
         auto gate0 = Clock::now();
-        std::vector<float> mid = gate_up_silu_named(
-            mlp_in,
-            wgate_name,
-            wup_name,
-            static_cast<size_t>(config.intermediate),
-            hidden,
-            prefix + " gate_up_silu");
-        auto gate1 = Clock::now();
-        auto down0 = Clock::now();
-        std::vector<float> mlp_out = linear_with_named_weight(mid, wdown_name, hidden, static_cast<size_t>(config.intermediate), prefix + " down_proj");
-        auto down1 = Clock::now();
+        auto gate1 = gate0;
+        auto down0 = gate0;
+        auto down1 = gate0;
+        if (!used_device_mlp) {
+            std::vector<float> mid = gate_up_silu_named(
+                mlp_in,
+                wgate_name,
+                wup_name,
+                static_cast<size_t>(config.intermediate),
+                hidden,
+                prefix + " gate_up_silu");
+            gate1 = Clock::now();
+            down0 = Clock::now();
+            mlp_out = linear_with_named_weight(mid, wdown_name, hidden, static_cast<size_t>(config.intermediate), prefix + " down_proj");
+            down1 = Clock::now();
+            mlp_timing.gate_up_ms = elapsed_ms(gate0, gate1);
+            mlp_timing.down_ms = elapsed_ms(down0, down1);
+        }
         for (size_t i = 0; i < hidden; ++i) after_attn[i] += mlp_out[i];
         auto layer1 = Clock::now();
         if (profile) {
@@ -2209,8 +2698,8 @@ struct AscendEngine {
             profile->attn_ms += elapsed_ms(attn0, attn1);
             profile->o_ms += elapsed_ms(o0, o1);
             profile->norm2_ms += elapsed_ms(norm2_0, norm2_1);
-            profile->gate_up_ms += elapsed_ms(gate0, gate1);
-            profile->down_ms += elapsed_ms(down0, down1);
+            profile->gate_up_ms += mlp_timing.gate_up_ms;
+            profile->down_ms += mlp_timing.down_ms;
             profile->total_ms += elapsed_ms(layer0, layer1);
         }
         return after_attn;

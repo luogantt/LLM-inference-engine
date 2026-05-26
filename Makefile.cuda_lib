@@ -16,7 +16,7 @@ lib:
 
 lib-ascend:
 >mkdir -p build
->$(ASCEND_CXX) $(ASCEND_FLAGS) -shared src/llm_ascend_lib.cpp -o build/libllm_ascend.so -I$(ASCEND_HOME)/include -I$(ASCEND_HOME)/aarch64-linux/include -L$(ASCEND_HOME)/lib64 -L$(ASCEND_HOME)/aarch64-linux/lib64 -lascendcl
+>$(ASCEND_CXX) $(ASCEND_FLAGS) -shared src/llm_ascend_lib.cpp -o build/libllm_ascend.so -I$(ASCEND_HOME)/include -I$(ASCEND_HOME)/aarch64-linux/include -L$(ASCEND_HOME)/lib64 -L$(ASCEND_HOME)/aarch64-linux/lib64 -lascendcl -ldl
 
 clean-lib:
 >rm -rf build
