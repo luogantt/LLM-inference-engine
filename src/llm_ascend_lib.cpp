@@ -1213,6 +1213,11 @@ struct AscendEngine {
     int full_ref_cached_len = 0;
     int full_ref_kv_dim = 0;
     std::vector<float> full_last_hidden;
+    mutable int rope_cache_head_dim = 0;
+    mutable int rope_cache_max_seq = 0;
+    mutable float rope_cache_theta = 0.0f;
+    mutable std::vector<float> rope_cos_cache;
+    mutable std::vector<float> rope_sin_cache;
 
     bool ref_cache_log_enabled() const {
         const std::string explicit_flag = env_str_or("ASCEND_REF_CACHE_LOG", "");
@@ -2889,6 +2894,96 @@ struct AscendEngine {
         return n_threads;
     }
 
+    int reference_attention_threads(int seq_len) const {
+        if (seq_len <= 0) return 1;
+        const bool explicit_attention_threads =
+            !env_str_or("ASCEND_REF_ATTN_THREADS", "").empty() ||
+            !env_str_or("ASCEND_REF_ATTENTION_THREADS", "").empty();
+        const int min_seq_for_threads = std::max(1, env_int_or("ASCEND_REF_ATTN_THREAD_MIN_SEQ", 32));
+        if (!explicit_attention_threads && seq_len < min_seq_for_threads) {
+            return 1;
+        }
+
+        const unsigned hw_threads = std::max(1u, std::thread::hardware_concurrency());
+        int requested = env_int_or(
+            "ASCEND_REF_ATTN_THREADS",
+            env_int_or(
+                "ASCEND_REF_ATTENTION_THREADS",
+                env_int_or("ASCEND_REF_ATTN_LINEAR_THREADS", static_cast<int>(hw_threads))));
+        if (requested <= 0) requested = static_cast<int>(hw_threads);
+        return std::max(1, std::min(requested, config.n_heads));
+    }
+
+    void attention_cpu_reference(
+        const std::vector<float>& q,
+        const std::vector<float>& k_cache,
+        const std::vector<float>& v_cache,
+        int pos,
+        int head_dim,
+        int group,
+        int kv_dim,
+        std::vector<float>& ctx) const {
+        const int seq_len = pos + 1;
+        if (q.size() != static_cast<size_t>(config.n_heads * head_dim) ||
+            k_cache.size() < static_cast<size_t>(seq_len) * static_cast<size_t>(kv_dim) ||
+            v_cache.size() < static_cast<size_t>(seq_len) * static_cast<size_t>(kv_dim) ||
+            ctx.size() != static_cast<size_t>(config.n_heads * head_dim)) {
+            throw std::runtime_error("CPU attention shape mismatch");
+        }
+
+        const float attn_scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+        const int n_threads = reference_attention_threads(seq_len);
+
+        auto compute_heads = [&](int tid) {
+            const int h_begin = (config.n_heads * tid) / n_threads;
+            const int h_end = (config.n_heads * (tid + 1)) / n_threads;
+            std::vector<float> scores(static_cast<size_t>(seq_len));
+
+            for (int h = h_begin; h < h_end; ++h) {
+                const int kh = h / group;
+                const float* qh = q.data() + static_cast<size_t>(h) * static_cast<size_t>(head_dim);
+                float max_score = -std::numeric_limits<float>::infinity();
+                for (int tok = 0; tok < seq_len; ++tok) {
+                    const float* kk =
+                        k_cache.data() +
+                        static_cast<size_t>(tok) * static_cast<size_t>(kv_dim) +
+                        static_cast<size_t>(kh) * static_cast<size_t>(head_dim);
+                    const float score =
+                        dot_product_reference(qh, kk, static_cast<size_t>(head_dim)) * attn_scale;
+                    scores[static_cast<size_t>(tok)] = score;
+                    max_score = std::max(max_score, score);
+                }
+
+                double denom = 0.0;
+                for (int tok = 0; tok < seq_len; ++tok) {
+                    float& s = scores[static_cast<size_t>(tok)];
+                    s = std::exp(s - max_score);
+                    denom += s;
+                }
+                const float inv_denom = denom > 0.0 ? static_cast<float>(1.0 / denom) : 0.0f;
+
+                float* out = ctx.data() + static_cast<size_t>(h) * static_cast<size_t>(head_dim);
+                std::fill(out, out + head_dim, 0.0f);
+                for (int tok = 0; tok < seq_len; ++tok) {
+                    const float prob = scores[static_cast<size_t>(tok)] * inv_denom;
+                    const float* vv =
+                        v_cache.data() +
+                        static_cast<size_t>(tok) * static_cast<size_t>(kv_dim) +
+                        static_cast<size_t>(kh) * static_cast<size_t>(head_dim);
+                    for (int d = 0; d < head_dim; ++d) {
+                        out[d] = std::fma(prob, vv[d], out[d]);
+                    }
+                }
+            }
+        };
+
+        if (n_threads == 1) {
+            compute_heads(0);
+        } else {
+            ref_pool_for(n_threads).run(n_threads, compute_heads);
+        }
+    }
+
     std::pair<size_t, size_t> matrix_shape(const std::string& name) const {
         const DeviceTensor& w = require_device_weight(name);
         if (w.meta.shape.size() != 2) {
@@ -3367,20 +3462,58 @@ struct AscendEngine {
         return gate_up_silu_reference(x, gate_weight, up_weight, out_dim, in_dim, label);
     }
 
+    void ensure_rope_cache(int head_dim) const {
+        if (head_dim <= 0 || head_dim % 2 != 0) throw std::runtime_error("bad RoPE head_dim");
+        if (rope_cache_head_dim == head_dim &&
+            rope_cache_max_seq >= max_seq &&
+            rope_cache_theta == config.rope_theta &&
+            !rope_cos_cache.empty() &&
+            !rope_sin_cache.empty()) {
+            return;
+        }
+
+        const int half = head_dim / 2;
+        rope_cache_head_dim = head_dim;
+        rope_cache_max_seq = max_seq;
+        rope_cache_theta = config.rope_theta;
+        rope_cos_cache.assign(static_cast<size_t>(max_seq) * static_cast<size_t>(half), 0.0f);
+        rope_sin_cache.assign(static_cast<size_t>(max_seq) * static_cast<size_t>(half), 0.0f);
+
+        std::vector<float> inv_freq(static_cast<size_t>(half));
+        for (int p = 0; p < half; ++p) {
+            inv_freq[static_cast<size_t>(p)] =
+                std::pow(config.rope_theta, -static_cast<float>(2 * p) / static_cast<float>(head_dim));
+        }
+        for (int seq_pos = 0; seq_pos < max_seq; ++seq_pos) {
+            float* cos_row = rope_cos_cache.data() + static_cast<size_t>(seq_pos) * static_cast<size_t>(half);
+            float* sin_row = rope_sin_cache.data() + static_cast<size_t>(seq_pos) * static_cast<size_t>(half);
+            for (int p = 0; p < half; ++p) {
+                const float angle = static_cast<float>(seq_pos) * inv_freq[static_cast<size_t>(p)];
+                cos_row[p] = std::cos(angle);
+                sin_row[p] = std::sin(angle);
+            }
+        }
+        time_log("[Ascend][time] RoPE cache built, max_seq=" +
+                 std::to_string(max_seq) +
+                 ", head_dim=" + std::to_string(head_dim));
+    }
+
     void apply_rope(std::vector<float>& x, int heads, int pos) const {
         const int head_dim = config.hidden / config.n_heads;
         if (head_dim <= 0 || head_dim % 2 != 0) throw std::runtime_error("bad RoPE head_dim");
+        if (pos < 0 || pos >= max_seq) throw std::runtime_error("RoPE position out of range");
         if (x.size() != static_cast<size_t>(heads * head_dim)) {
             throw std::runtime_error("RoPE vector size mismatch");
         }
+        ensure_rope_cache(head_dim);
         const int half = head_dim / 2;
+        const float* cos_row = rope_cos_cache.data() + static_cast<size_t>(pos) * static_cast<size_t>(half);
+        const float* sin_row = rope_sin_cache.data() + static_cast<size_t>(pos) * static_cast<size_t>(half);
         for (int h = 0; h < heads; ++h) {
             const int base = h * head_dim;
             for (int p = 0; p < half; ++p) {
-                const float inv = std::pow(config.rope_theta, -static_cast<float>(2 * p) / head_dim);
-                const float angle = static_cast<float>(pos) * inv;
-                const float c = std::cos(angle);
-                const float s = std::sin(angle);
+                const float c = cos_row[p];
+                const float s = sin_row[p];
                 const int d0 = base + p;
                 const int d1 = base + p + half;
                 const float v0 = x[d0];
@@ -3529,36 +3662,7 @@ struct AscendEngine {
             }
         }
         if (!used_device_attention) {
-            const float attn_scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
-            std::vector<float> scores(static_cast<size_t>(pos + 1));
-            for (int h = 0; h < config.n_heads; ++h) {
-                const int kh = h / group;
-                const float* qh = q.data() + static_cast<size_t>(h) * head_dim;
-                float max_score = -std::numeric_limits<float>::infinity();
-                for (int tok = 0; tok <= pos; ++tok) {
-                    const float* kk = k_cache.data() + static_cast<size_t>(tok) * kv_dim + static_cast<size_t>(kh) * head_dim;
-                    const float dot = dot_product_reference(qh, kk, static_cast<size_t>(head_dim));
-                    scores[static_cast<size_t>(tok)] = dot * attn_scale;
-                    max_score = std::max(max_score, scores[static_cast<size_t>(tok)]);
-                }
-
-                double denom = 0.0;
-                for (int tok = 0; tok <= pos; ++tok) {
-                    float& s = scores[static_cast<size_t>(tok)];
-                    s = std::exp(s - max_score);
-                    denom += s;
-                }
-                const float inv_denom = denom > 0.0 ? static_cast<float>(1.0 / denom) : 0.0f;
-                for (int d = 0; d < head_dim; ++d) {
-                    float acc = 0.0f;
-                    for (int tok = 0; tok <= pos; ++tok) {
-                        const float prob = scores[static_cast<size_t>(tok)] * inv_denom;
-                        const float* vv = v_cache.data() + static_cast<size_t>(tok) * kv_dim + static_cast<size_t>(kh) * head_dim;
-                        acc = std::fma(prob, vv[d], acc);
-                    }
-                    ctx[static_cast<size_t>(h) * head_dim + d] = acc;
-                }
-            }
+            attention_cpu_reference(q, k_cache, v_cache, pos, head_dim, group, kv_dim, ctx);
         }
         auto attn1 = Clock::now();
 
@@ -3788,35 +3892,7 @@ struct AscendEngine {
         auto t_kv = Clock::now();
 
         std::vector<float> ctx(hidden, 0.0f);
-        const float attn_scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
-        std::vector<float> scores(len);
-        for (int h = 0; h < config.n_heads; ++h) {
-            const int kh = h / group;
-            const float* qh = q.data() + static_cast<size_t>(h) * head_dim;
-            float max_score = -std::numeric_limits<float>::infinity();
-            for (int tok = 0; tok < len; ++tok) {
-                const float* kk = layer0_k_cache.data() + static_cast<size_t>(tok) * kv_dim + static_cast<size_t>(kh) * head_dim;
-                const float dot = dot_product_reference(qh, kk, static_cast<size_t>(head_dim));
-                scores[tok] = dot * attn_scale;
-                max_score = std::max(max_score, scores[tok]);
-            }
-
-            double denom = 0.0;
-            for (int tok = 0; tok < len; ++tok) {
-                scores[tok] = std::exp(scores[tok] - max_score);
-                denom += scores[tok];
-            }
-            const float inv_denom = denom > 0.0 ? static_cast<float>(1.0 / denom) : 0.0f;
-            for (int d = 0; d < head_dim; ++d) {
-                float acc = 0.0f;
-                for (int tok = 0; tok < len; ++tok) {
-                    const float prob = scores[tok] * inv_denom;
-                    const float* vv = layer0_v_cache.data() + static_cast<size_t>(tok) * kv_dim + static_cast<size_t>(kh) * head_dim;
-                    acc = std::fma(prob, vv[d], acc);
-                }
-                ctx[static_cast<size_t>(h) * head_dim + d] = acc;
-            }
-        }
+        attention_cpu_reference(q, layer0_k_cache, layer0_v_cache, len - 1, head_dim, group, kv_dim, ctx);
         auto t_attn = Clock::now();
 
         std::vector<float> attn_out = linear_with_weight(ctx, wo, hidden, hidden, "layer0 o_proj");
