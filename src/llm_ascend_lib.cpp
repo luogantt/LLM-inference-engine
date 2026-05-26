@@ -834,7 +834,7 @@ struct RefThreadPool {
         {
             std::lock_guard<std::mutex> lock(mu);
             active = active_threads;
-            pending = n_threads;
+            pending = active_threads;
             job = fn;
             generation++;
         }
@@ -870,8 +870,9 @@ struct RefThreadPool {
                 local_job = job;
                 local_active = active;
             }
-            if (local_job && tid < local_active) local_job(tid);
-            {
+            const bool participates = local_job && tid < local_active;
+            if (participates) local_job(tid);
+            if (participates) {
                 std::lock_guard<std::mutex> lock(mu);
                 pending--;
                 if (pending == 0) cv_done.notify_one();
