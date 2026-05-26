@@ -1148,6 +1148,7 @@ struct AscendEngine {
     void* d_mlp_x = nullptr;
     void* d_mlp_gate = nullptr;
     void* d_mlp_up = nullptr;
+    void* d_mlp_gate_up = nullptr;
     void* d_mlp_mid = nullptr;
     void* d_mlp_out = nullptr;
     void* d_vec_mm_x = nullptr;
@@ -1174,6 +1175,7 @@ struct AscendEngine {
     size_t v_row_bytes = 0;
     size_t mlp_hidden_bytes = 0;
     size_t mlp_intermediate_bytes = 0;
+    size_t mlp_gate_up_bytes = 0;
     std::string mlp_buffer_dtype;
     size_t vec_mm_x_bytes = 0;
     size_t vec_mm_out_bytes = 0;
@@ -1192,6 +1194,7 @@ struct AscendEngine {
     bool acl_ready = false;
     bool aclnn_mlp_disabled = false;
     bool aclnn_mlp_notice_printed = false;
+    bool mlp_gate_up_fusion_disabled = false;
     bool aclnn_qkv_disabled = false;
     bool aclnn_qkv_notice_printed = false;
     bool aclnn_attn_disabled = false;
@@ -1204,6 +1207,7 @@ struct AscendEngine {
     mutable int ref_thread_pool_size = 0;
     std::unordered_map<std::string, DeviceTensor> d_weights;
     std::unordered_map<std::string, DeviceTensor> d_fused_qkv_weights;
+    std::unordered_map<std::string, DeviceTensor> d_fused_mlp_gate_up_weights;
     std::unordered_map<std::string, std::vector<unsigned char>> h_weight_raw_cache;
     std::unordered_map<std::string, std::vector<float>> h_weight_cache;
     std::unordered_map<std::string, std::vector<uint16_t>> h_weight_u16_cache;
@@ -1319,6 +1323,13 @@ struct AscendEngine {
             }
         }
         d_fused_qkv_weights.clear();
+        for (auto& kv : d_fused_mlp_gate_up_weights) {
+            if (kv.second.data) {
+                aclrtFree(kv.second.data);
+                kv.second.data = nullptr;
+            }
+        }
+        d_fused_mlp_gate_up_weights.clear();
         if (d_hidden) {
             aclrtFree(d_hidden);
             d_hidden = nullptr;
@@ -1576,6 +1587,10 @@ struct AscendEngine {
         return env_flag_enabled("ASCEND_ACLNN_MLP", false);
     }
 
+    static bool mlp_gate_up_fusion_enabled() {
+        return env_flag_enabled("ASCEND_MLP_FUSE_GATE_UP", true);
+    }
+
     static bool aclnn_mlp_fallback_enabled() {
         return env_flag_enabled("ASCEND_MLP_FALLBACK", true);
     }
@@ -1692,10 +1707,12 @@ struct AscendEngine {
         free_one(d_mlp_x);
         free_one(d_mlp_gate);
         free_one(d_mlp_up);
+        free_one(d_mlp_gate_up);
         free_one(d_mlp_mid);
         free_one(d_mlp_out);
         mlp_hidden_bytes = 0;
         mlp_intermediate_bytes = 0;
+        mlp_gate_up_bytes = 0;
         mlp_buffer_dtype.clear();
     }
 
@@ -1870,10 +1887,12 @@ struct AscendEngine {
         const size_t intermediate = static_cast<size_t>(config.intermediate);
         const size_t need_hidden = hidden * dtype_bytes;
         const size_t need_intermediate = intermediate * dtype_bytes;
-        if (d_mlp_x && d_mlp_gate && d_mlp_up && d_mlp_mid && d_mlp_out &&
+        const size_t need_gate_up = need_intermediate * 2;
+        if (d_mlp_x && d_mlp_gate && d_mlp_up && d_mlp_gate_up && d_mlp_mid && d_mlp_out &&
             mlp_buffer_dtype == dtype &&
             mlp_hidden_bytes == need_hidden &&
-            mlp_intermediate_bytes == need_intermediate) {
+            mlp_intermediate_bytes == need_intermediate &&
+            mlp_gate_up_bytes == need_gate_up) {
             return;
         }
 
@@ -1885,14 +1904,17 @@ struct AscendEngine {
         alloc(d_mlp_x, need_hidden, "aclrtMalloc(MLP input)");
         alloc(d_mlp_gate, need_intermediate, "aclrtMalloc(MLP gate)");
         alloc(d_mlp_up, need_intermediate, "aclrtMalloc(MLP up)");
+        alloc(d_mlp_gate_up, need_gate_up, "aclrtMalloc(MLP fused gate/up)");
         alloc(d_mlp_mid, need_intermediate, "aclrtMalloc(MLP mid)");
         alloc(d_mlp_out, need_hidden, "aclrtMalloc(MLP output)");
         mlp_hidden_bytes = need_hidden;
         mlp_intermediate_bytes = need_intermediate;
+        mlp_gate_up_bytes = need_gate_up;
         mlp_buffer_dtype = dtype;
         time_log("[Ascend][time] ACLNN MLP buffers allocated, dtype=" + dtype +
                  ", hidden_bytes=" + std::to_string(mlp_hidden_bytes) +
-                 ", intermediate_bytes=" + std::to_string(mlp_intermediate_bytes));
+                 ", intermediate_bytes=" + std::to_string(mlp_intermediate_bytes) +
+                 ", gate_up_bytes=" + std::to_string(mlp_gate_up_bytes));
     }
 
     static AclTensorGuard create_acl_tensor_2d(
@@ -2100,6 +2122,76 @@ struct AscendEngine {
             if (aclnn_qkv_log_enabled()) {
                 time_log("[Ascend][time] fused QKV weight cached, name=" + q_name +
                          ", dtype=" + q_weight.meta.dtype +
+                         ", fused_dim=" + std::to_string(fused_dim) +
+                         ", bytes=" + std::to_string(fused.bytes) +
+                         ", d2d_ms=" + std::to_string(elapsed_ms(t0, t1)));
+            }
+            return &inserted.first->second;
+        } catch (const std::exception& e) {
+            reason = e.what();
+            return nullptr;
+        }
+    }
+
+    const DeviceTensor* ensure_fused_mlp_gate_up_weight(
+        const std::string& gate_name,
+        const std::string& up_name,
+        const DeviceTensor& gate,
+        const DeviceTensor& up,
+        size_t hidden,
+        size_t intermediate,
+        std::string& reason) {
+        const std::string key = gate_name + "|" + up_name;
+        auto cached = d_fused_mlp_gate_up_weights.find(key);
+        if (cached != d_fused_mlp_gate_up_weights.end()) return &cached->second;
+
+        try {
+            const size_t fused_dim = intermediate * 2;
+            if (gate.meta.shape.size() != 2 ||
+                up.meta.shape.size() != 2 ||
+                gate.meta.shape[0] != intermediate ||
+                gate.meta.shape[1] != hidden ||
+                up.meta.shape[0] != intermediate ||
+                up.meta.shape[1] != hidden) {
+                reason = "MLP gate/up fusion weight shape mismatch";
+                return nullptr;
+            }
+            if (gate.meta.dtype != up.meta.dtype) {
+                reason = "MLP gate/up fusion requires same dtype";
+                return nullptr;
+            }
+
+            DeviceTensor fused;
+            fused.meta = gate.meta;
+            fused.meta.file = gate_name + "+" + up_name;
+            fused.meta.shape = {fused_dim, hidden};
+            fused.bytes = gate.bytes + up.bytes;
+            const size_t expected_bytes =
+                fused_dim * hidden * dtype_size_from_string(gate.meta.dtype);
+            if (fused.bytes != expected_bytes) {
+                reason = "MLP gate/up fusion byte size mismatch";
+                return nullptr;
+            }
+
+            auto t0 = Clock::now();
+            check_acl(aclrtMalloc(&fused.data, fused.bytes, ACL_MEM_MALLOC_HUGE_FIRST),
+                      ("aclrtMalloc(fused MLP gate/up weight " + gate_name + ")").c_str());
+            unsigned char* dst = reinterpret_cast<unsigned char*>(fused.data);
+            check_acl(aclrtMemcpy(dst, fused.bytes, gate.data, gate.bytes, ACL_MEMCPY_DEVICE_TO_DEVICE),
+                      "aclrtMemcpy(D2D fused MLP gate)");
+            check_acl(aclrtMemcpy(dst + gate.bytes, fused.bytes - gate.bytes,
+                                  up.data, up.bytes, ACL_MEMCPY_DEVICE_TO_DEVICE),
+                      "aclrtMemcpy(D2D fused MLP up)");
+            auto t1 = Clock::now();
+
+            auto inserted = d_fused_mlp_gate_up_weights.emplace(key, fused);
+            if (!inserted.second) {
+                aclrtFree(fused.data);
+                return &inserted.first->second;
+            }
+            if (aclnn_mlp_log_enabled()) {
+                time_log("[Ascend][time] fused MLP gate/up weight cached, name=" + gate_name +
+                         ", dtype=" + gate.meta.dtype +
                          ", fused_dim=" + std::to_string(fused_dim) +
                          ", bytes=" + std::to_string(fused.bytes) +
                          ", d2d_ms=" + std::to_string(elapsed_ms(t0, t1)));
@@ -2656,26 +2748,6 @@ struct AscendEngine {
                       "aclrtMemcpy(H2D ACLNN MLP input)");
 
             AclTensorGuard x = create_acl_tensor_2d(d_mlp_x, 1, static_cast<int64_t>(hidden), acl_dtype, "MLP input");
-            AclTensorGuard gate_w_t = create_acl_tensor_2d_strided(
-                gate.data,
-                static_cast<int64_t>(hidden),
-                static_cast<int64_t>(intermediate),
-                1,
-                static_cast<int64_t>(hidden),
-                static_cast<int64_t>(intermediate),
-                static_cast<int64_t>(hidden),
-                acl_dtype,
-                "MLP gate weight transposed view");
-            AclTensorGuard up_w_t = create_acl_tensor_2d_strided(
-                up.data,
-                static_cast<int64_t>(hidden),
-                static_cast<int64_t>(intermediate),
-                1,
-                static_cast<int64_t>(hidden),
-                static_cast<int64_t>(intermediate),
-                static_cast<int64_t>(hidden),
-                acl_dtype,
-                "MLP up weight transposed view");
             AclTensorGuard down_w_t = create_acl_tensor_2d_strided(
                 down.data,
                 static_cast<int64_t>(intermediate),
@@ -2686,14 +2758,88 @@ struct AscendEngine {
                 static_cast<int64_t>(intermediate),
                 acl_dtype,
                 "MLP down weight transposed view");
-            AclTensorGuard gate_out = create_acl_tensor_2d(d_mlp_gate, 1, static_cast<int64_t>(intermediate), acl_dtype, "MLP gate output");
-            AclTensorGuard up_out = create_acl_tensor_2d(d_mlp_up, 1, static_cast<int64_t>(intermediate), acl_dtype, "MLP up output");
             AclTensorGuard mid = create_acl_tensor_2d(d_mlp_mid, 1, static_cast<int64_t>(intermediate), acl_dtype, "MLP mid");
             AclTensorGuard out = create_acl_tensor_2d(d_mlp_out, 1, static_cast<int64_t>(hidden), acl_dtype, "MLP output");
 
             DeviceWorkspaceGuard workspaces;
-            launch_aclnn_mm(api, x.get(), gate_w_t.get(), gate_out.get(), workspaces, "ACLNN MLP gate mm");
-            launch_aclnn_mm(api, x.get(), up_w_t.get(), up_out.get(), workspaces, "ACLNN MLP up mm");
+            bool used_fused_gate_up = false;
+            AclTensorGuard gate_out;
+            AclTensorGuard up_out;
+            if (mlp_gate_up_fusion_enabled() && !mlp_gate_up_fusion_disabled) {
+                std::string fusion_reason;
+                const DeviceTensor* fused_gate_up = ensure_fused_mlp_gate_up_weight(
+                    gate_name,
+                    up_name,
+                    gate,
+                    up,
+                    hidden,
+                    intermediate,
+                    fusion_reason);
+                if (fused_gate_up) {
+                    const size_t fused_dim = intermediate * 2;
+                    AclTensorGuard gate_up_w_t = create_acl_tensor_2d_strided(
+                        fused_gate_up->data,
+                        static_cast<int64_t>(hidden),
+                        static_cast<int64_t>(fused_dim),
+                        1,
+                        static_cast<int64_t>(hidden),
+                        static_cast<int64_t>(fused_dim),
+                        static_cast<int64_t>(hidden),
+                        acl_dtype,
+                        "MLP fused gate/up weight transposed view");
+                    AclTensorGuard gate_up_out = create_acl_tensor_2d(
+                        d_mlp_gate_up,
+                        1,
+                        static_cast<int64_t>(fused_dim),
+                        acl_dtype,
+                        "MLP fused gate/up output");
+                    launch_aclnn_mm(api, x.get(), gate_up_w_t.get(), gate_up_out.get(), workspaces, "ACLNN MLP fused gate/up mm");
+                    gate_out = create_acl_tensor_2d(
+                        d_mlp_gate_up,
+                        1,
+                        static_cast<int64_t>(intermediate),
+                        acl_dtype,
+                        "MLP fused gate view");
+                    up_out = create_acl_tensor_2d(
+                        static_cast<unsigned char*>(d_mlp_gate_up) + mlp_intermediate_bytes,
+                        1,
+                        static_cast<int64_t>(intermediate),
+                        acl_dtype,
+                        "MLP fused up view");
+                    used_fused_gate_up = true;
+                } else {
+                    mlp_gate_up_fusion_disabled = true;
+                    if (aclnn_mlp_log_enabled()) {
+                        time_log("[Ascend][warn] fused MLP gate/up disabled, reason=" + fusion_reason);
+                    }
+                }
+            }
+            if (!used_fused_gate_up) {
+                AclTensorGuard gate_w_t = create_acl_tensor_2d_strided(
+                    gate.data,
+                    static_cast<int64_t>(hidden),
+                    static_cast<int64_t>(intermediate),
+                    1,
+                    static_cast<int64_t>(hidden),
+                    static_cast<int64_t>(intermediate),
+                    static_cast<int64_t>(hidden),
+                    acl_dtype,
+                    "MLP gate weight transposed view");
+                AclTensorGuard up_w_t = create_acl_tensor_2d_strided(
+                    up.data,
+                    static_cast<int64_t>(hidden),
+                    static_cast<int64_t>(intermediate),
+                    1,
+                    static_cast<int64_t>(hidden),
+                    static_cast<int64_t>(intermediate),
+                    static_cast<int64_t>(hidden),
+                    acl_dtype,
+                    "MLP up weight transposed view");
+                gate_out = create_acl_tensor_2d(d_mlp_gate, 1, static_cast<int64_t>(intermediate), acl_dtype, "MLP gate output");
+                up_out = create_acl_tensor_2d(d_mlp_up, 1, static_cast<int64_t>(intermediate), acl_dtype, "MLP up output");
+                launch_aclnn_mm(api, x.get(), gate_w_t.get(), gate_out.get(), workspaces, "ACLNN MLP gate mm");
+                launch_aclnn_mm(api, x.get(), up_w_t.get(), up_out.get(), workspaces, "ACLNN MLP up mm");
+            }
             launch_aclnn_silu(api, gate_out.get(), mid.get(), workspaces, "ACLNN MLP silu");
             launch_aclnn_mul(api, mid.get(), up_out.get(), gate_out.get(), workspaces, "ACLNN MLP silu_mul");
             auto gate1 = Clock::now();
@@ -2713,6 +2859,8 @@ struct AscendEngine {
                 time_log("[Ascend][time] ACLNN MLP path active, dtype=" + dtype +
                          ", hidden=" + std::to_string(hidden) +
                          ", intermediate=" + std::to_string(intermediate) +
+                         ", gate_up_fusion=" + std::string(used_fused_gate_up ? "1" : "0") +
+                         ", gate_up_mm_ops=" + std::to_string(used_fused_gate_up ? 1 : 2) +
                          ", gate_up_enqueue_ms=" + std::to_string(timing.gate_up_ms) +
                          ", down_sync_d2h_ms=" + std::to_string(timing.down_ms));
                 aclnn_mlp_notice_printed = true;
