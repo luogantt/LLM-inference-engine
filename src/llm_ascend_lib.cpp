@@ -1156,6 +1156,7 @@ struct AscendEngine {
     void* d_qkv_q = nullptr;
     void* d_qkv_k = nullptr;
     void* d_qkv_v = nullptr;
+    void* d_qkv_out = nullptr;
     void* d_attn_q = nullptr;
     void* d_attn_k_cache = nullptr;
     void* d_attn_v_cache = nullptr;
@@ -1181,6 +1182,7 @@ struct AscendEngine {
     size_t qkv_q_bytes = 0;
     size_t qkv_k_bytes = 0;
     size_t qkv_v_bytes = 0;
+    size_t qkv_out_bytes = 0;
     std::string qkv_buffer_dtype;
     size_t attn_q_bytes = 0;
     size_t attn_kv_cache_bytes = 0;
@@ -1201,6 +1203,7 @@ struct AscendEngine {
     mutable RefThreadPool* ref_thread_pool = nullptr;
     mutable int ref_thread_pool_size = 0;
     std::unordered_map<std::string, DeviceTensor> d_weights;
+    std::unordered_map<std::string, DeviceTensor> d_fused_qkv_weights;
     std::unordered_map<std::string, std::vector<unsigned char>> h_weight_raw_cache;
     std::unordered_map<std::string, std::vector<float>> h_weight_cache;
     std::unordered_map<std::string, std::vector<uint16_t>> h_weight_u16_cache;
@@ -1309,6 +1312,13 @@ struct AscendEngine {
             }
         }
         d_weights.clear();
+        for (auto& kv : d_fused_qkv_weights) {
+            if (kv.second.data) {
+                aclrtFree(kv.second.data);
+                kv.second.data = nullptr;
+            }
+        }
+        d_fused_qkv_weights.clear();
         if (d_hidden) {
             aclrtFree(d_hidden);
             d_hidden = nullptr;
@@ -1588,6 +1598,10 @@ struct AscendEngine {
         return env_flag_enabled("ASCEND_ACLNN_ATTN_PROJ", false);
     }
 
+    static bool qkv_weight_fusion_enabled() {
+        return env_flag_enabled("ASCEND_QKV_FUSE_WEIGHTS", true);
+    }
+
     static bool aclnn_qkv_fallback_enabled() {
         return env_flag_enabled("ASCEND_QKV_FALLBACK", true);
     }
@@ -1710,10 +1724,12 @@ struct AscendEngine {
         free_one(d_qkv_q);
         free_one(d_qkv_k);
         free_one(d_qkv_v);
+        free_one(d_qkv_out);
         qkv_x_bytes = 0;
         qkv_q_bytes = 0;
         qkv_k_bytes = 0;
         qkv_v_bytes = 0;
+        qkv_out_bytes = 0;
         qkv_buffer_dtype.clear();
     }
 
@@ -1769,12 +1785,14 @@ struct AscendEngine {
         const size_t need_q = hidden * dtype_bytes;
         const size_t need_k = kv_dim * dtype_bytes;
         const size_t need_v = kv_dim * dtype_bytes;
-        if (d_qkv_x && d_qkv_q && d_qkv_k && d_qkv_v &&
+        const size_t need_out = need_q + need_k + need_v;
+        if (d_qkv_x && d_qkv_q && d_qkv_k && d_qkv_v && d_qkv_out &&
             qkv_buffer_dtype == dtype &&
             qkv_x_bytes >= need_x &&
             qkv_q_bytes >= need_q &&
             qkv_k_bytes >= need_k &&
-            qkv_v_bytes >= need_v) {
+            qkv_v_bytes >= need_v &&
+            qkv_out_bytes >= need_out) {
             return;
         }
 
@@ -1787,14 +1805,17 @@ struct AscendEngine {
         alloc(d_qkv_q, need_q, "aclrtMalloc(QKV q output)");
         alloc(d_qkv_k, need_k, "aclrtMalloc(QKV k output)");
         alloc(d_qkv_v, need_v, "aclrtMalloc(QKV v output)");
+        alloc(d_qkv_out, need_out, "aclrtMalloc(QKV fused output)");
         qkv_x_bytes = need_x;
         qkv_q_bytes = need_q;
         qkv_k_bytes = need_k;
         qkv_v_bytes = need_v;
+        qkv_out_bytes = need_out;
         qkv_buffer_dtype = dtype;
         time_log("[Ascend][time] ACLNN QKV buffers allocated, dtype=" + dtype +
                  ", hidden_bytes=" + std::to_string(qkv_x_bytes) +
-                 ", kv_bytes=" + std::to_string(qkv_k_bytes));
+                 ", kv_bytes=" + std::to_string(qkv_k_bytes) +
+                 ", fused_out_bytes=" + std::to_string(qkv_out_bytes));
     }
 
     void ensure_attention_buffers(
@@ -2010,6 +2031,86 @@ struct AscendEngine {
         check_aclnn_status(api.softmax(workspace, workspace_size, executor, stream), label);
     }
 
+    const DeviceTensor* ensure_fused_qkv_weight(
+        const std::string& q_name,
+        const std::string& k_name,
+        const std::string& v_name,
+        const DeviceTensor& q_weight,
+        const DeviceTensor& k_weight,
+        const DeviceTensor& v_weight,
+        size_t hidden,
+        size_t kv_dim,
+        std::string& reason) {
+        const std::string key = q_name + "|" + k_name + "|" + v_name;
+        auto cached = d_fused_qkv_weights.find(key);
+        if (cached != d_fused_qkv_weights.end()) return &cached->second;
+
+        try {
+            const size_t fused_dim = hidden + kv_dim + kv_dim;
+            if (q_weight.meta.shape.size() != 2 ||
+                k_weight.meta.shape.size() != 2 ||
+                v_weight.meta.shape.size() != 2 ||
+                q_weight.meta.shape[0] != hidden ||
+                q_weight.meta.shape[1] != hidden ||
+                k_weight.meta.shape[0] != kv_dim ||
+                k_weight.meta.shape[1] != hidden ||
+                v_weight.meta.shape[0] != kv_dim ||
+                v_weight.meta.shape[1] != hidden) {
+                reason = "QKV fusion weight shape mismatch";
+                return nullptr;
+            }
+            if (q_weight.meta.dtype != k_weight.meta.dtype ||
+                q_weight.meta.dtype != v_weight.meta.dtype) {
+                reason = "QKV fusion requires same dtype";
+                return nullptr;
+            }
+
+            DeviceTensor fused;
+            fused.meta = q_weight.meta;
+            fused.meta.file = q_name + "+" + k_name + "+" + v_name;
+            fused.meta.shape = {fused_dim, hidden};
+            fused.bytes = q_weight.bytes + k_weight.bytes + v_weight.bytes;
+            const size_t expected_bytes =
+                fused_dim * hidden * dtype_size_from_string(q_weight.meta.dtype);
+            if (fused.bytes != expected_bytes) {
+                reason = "QKV fusion byte size mismatch";
+                return nullptr;
+            }
+
+            auto t0 = Clock::now();
+            check_acl(aclrtMalloc(&fused.data, fused.bytes, ACL_MEM_MALLOC_HUGE_FIRST),
+                      ("aclrtMalloc(fused QKV weight " + q_name + ")").c_str());
+            unsigned char* dst = reinterpret_cast<unsigned char*>(fused.data);
+            check_acl(aclrtMemcpy(dst, fused.bytes, q_weight.data, q_weight.bytes, ACL_MEMCPY_DEVICE_TO_DEVICE),
+                      "aclrtMemcpy(D2D fused QKV q)");
+            check_acl(aclrtMemcpy(dst + q_weight.bytes, fused.bytes - q_weight.bytes,
+                                  k_weight.data, k_weight.bytes, ACL_MEMCPY_DEVICE_TO_DEVICE),
+                      "aclrtMemcpy(D2D fused QKV k)");
+            check_acl(aclrtMemcpy(dst + q_weight.bytes + k_weight.bytes,
+                                  fused.bytes - q_weight.bytes - k_weight.bytes,
+                                  v_weight.data, v_weight.bytes, ACL_MEMCPY_DEVICE_TO_DEVICE),
+                      "aclrtMemcpy(D2D fused QKV v)");
+            auto t1 = Clock::now();
+
+            auto inserted = d_fused_qkv_weights.emplace(key, fused);
+            if (!inserted.second) {
+                aclrtFree(fused.data);
+                return &inserted.first->second;
+            }
+            if (aclnn_qkv_log_enabled()) {
+                time_log("[Ascend][time] fused QKV weight cached, name=" + q_name +
+                         ", dtype=" + q_weight.meta.dtype +
+                         ", fused_dim=" + std::to_string(fused_dim) +
+                         ", bytes=" + std::to_string(fused.bytes) +
+                         ", d2d_ms=" + std::to_string(elapsed_ms(t0, t1)));
+            }
+            return &inserted.first->second;
+        } catch (const std::exception& e) {
+            reason = e.what();
+            return nullptr;
+        }
+    }
+
     bool vector_mm_aclnn_forward(
         const std::vector<float>& x,
         const DeviceTensor& weight,
@@ -2170,72 +2271,126 @@ struct AscendEngine {
                 static_cast<int64_t>(hidden),
                 acl_dtype,
                 prefix + " QKV input");
-            AclTensorGuard q_w_t = create_acl_tensor_2d_strided(
-                q_weight.data,
-                static_cast<int64_t>(hidden),
-                static_cast<int64_t>(hidden),
-                1,
-                static_cast<int64_t>(hidden),
-                static_cast<int64_t>(hidden),
-                static_cast<int64_t>(hidden),
-                acl_dtype,
-                prefix + " q weight transposed view");
-            AclTensorGuard k_w_t = create_acl_tensor_2d_strided(
-                k_weight.data,
-                static_cast<int64_t>(hidden),
-                static_cast<int64_t>(kv_dim),
-                1,
-                static_cast<int64_t>(hidden),
-                static_cast<int64_t>(kv_dim),
-                static_cast<int64_t>(hidden),
-                acl_dtype,
-                prefix + " k weight transposed view");
-            AclTensorGuard v_w_t = create_acl_tensor_2d_strided(
-                v_weight.data,
-                static_cast<int64_t>(hidden),
-                static_cast<int64_t>(kv_dim),
-                1,
-                static_cast<int64_t>(hidden),
-                static_cast<int64_t>(kv_dim),
-                static_cast<int64_t>(hidden),
-                acl_dtype,
-                prefix + " v weight transposed view");
-            AclTensorGuard q_out = create_acl_tensor_2d(
-                d_qkv_q,
-                1,
-                static_cast<int64_t>(hidden),
-                acl_dtype,
-                prefix + " q output");
-            AclTensorGuard k_out = create_acl_tensor_2d(
-                d_qkv_k,
-                1,
-                static_cast<int64_t>(kv_dim),
-                acl_dtype,
-                prefix + " k output");
-            AclTensorGuard v_out = create_acl_tensor_2d(
-                d_qkv_v,
-                1,
-                static_cast<int64_t>(kv_dim),
-                acl_dtype,
-                prefix + " v output");
 
             DeviceWorkspaceGuard workspaces;
             auto enqueue0 = Clock::now();
-            launch_aclnn_mm(api, x.get(), q_w_t.get(), q_out.get(), workspaces, prefix + " ACLNN q mm");
-            launch_aclnn_mm(api, x.get(), k_w_t.get(), k_out.get(), workspaces, prefix + " ACLNN k mm");
-            launch_aclnn_mm(api, x.get(), v_w_t.get(), v_out.get(), workspaces, prefix + " ACLNN v mm");
+            bool used_fused_weight = false;
+            const size_t fused_dim = hidden + kv_dim + kv_dim;
+            if (qkv_weight_fusion_enabled()) {
+                std::string fusion_reason;
+                const DeviceTensor* fused_weight = ensure_fused_qkv_weight(
+                    q_name,
+                    k_name,
+                    v_name,
+                    q_weight,
+                    k_weight,
+                    v_weight,
+                    hidden,
+                    kv_dim,
+                    fusion_reason);
+                if (fused_weight) {
+                    AclTensorGuard fused_w_t = create_acl_tensor_2d_strided(
+                        fused_weight->data,
+                        static_cast<int64_t>(hidden),
+                        static_cast<int64_t>(fused_dim),
+                        1,
+                        static_cast<int64_t>(hidden),
+                        static_cast<int64_t>(fused_dim),
+                        static_cast<int64_t>(hidden),
+                        acl_dtype,
+                        prefix + " fused QKV weight transposed view");
+                    AclTensorGuard fused_out = create_acl_tensor_2d(
+                        d_qkv_out,
+                        1,
+                        static_cast<int64_t>(fused_dim),
+                        acl_dtype,
+                        prefix + " fused QKV output");
+                    launch_aclnn_mm(api, x.get(), fused_w_t.get(), fused_out.get(), workspaces, prefix + " ACLNN fused qkv mm");
+                    used_fused_weight = true;
+                } else if (aclnn_qkv_log_enabled()) {
+                    time_log("[Ascend][warn] fused QKV weight unavailable, label=" +
+                             prefix + ", reason=" + fusion_reason);
+                }
+            }
+            if (!used_fused_weight) {
+                AclTensorGuard q_w_t = create_acl_tensor_2d_strided(
+                    q_weight.data,
+                    static_cast<int64_t>(hidden),
+                    static_cast<int64_t>(hidden),
+                    1,
+                    static_cast<int64_t>(hidden),
+                    static_cast<int64_t>(hidden),
+                    static_cast<int64_t>(hidden),
+                    acl_dtype,
+                    prefix + " q weight transposed view");
+                AclTensorGuard k_w_t = create_acl_tensor_2d_strided(
+                    k_weight.data,
+                    static_cast<int64_t>(hidden),
+                    static_cast<int64_t>(kv_dim),
+                    1,
+                    static_cast<int64_t>(hidden),
+                    static_cast<int64_t>(kv_dim),
+                    static_cast<int64_t>(hidden),
+                    acl_dtype,
+                    prefix + " k weight transposed view");
+                AclTensorGuard v_w_t = create_acl_tensor_2d_strided(
+                    v_weight.data,
+                    static_cast<int64_t>(hidden),
+                    static_cast<int64_t>(kv_dim),
+                    1,
+                    static_cast<int64_t>(hidden),
+                    static_cast<int64_t>(kv_dim),
+                    static_cast<int64_t>(hidden),
+                    acl_dtype,
+                    prefix + " v weight transposed view");
+                AclTensorGuard q_out = create_acl_tensor_2d(
+                    d_qkv_q,
+                    1,
+                    static_cast<int64_t>(hidden),
+                    acl_dtype,
+                    prefix + " q output");
+                AclTensorGuard k_out = create_acl_tensor_2d(
+                    d_qkv_k,
+                    1,
+                    static_cast<int64_t>(kv_dim),
+                    acl_dtype,
+                    prefix + " k output");
+                AclTensorGuard v_out = create_acl_tensor_2d(
+                    d_qkv_v,
+                    1,
+                    static_cast<int64_t>(kv_dim),
+                    acl_dtype,
+                    prefix + " v output");
+                launch_aclnn_mm(api, x.get(), q_w_t.get(), q_out.get(), workspaces, prefix + " ACLNN q mm");
+                launch_aclnn_mm(api, x.get(), k_w_t.get(), k_out.get(), workspaces, prefix + " ACLNN k mm");
+                launch_aclnn_mm(api, x.get(), v_w_t.get(), v_out.get(), workspaces, prefix + " ACLNN v mm");
+            }
             auto enqueue1 = Clock::now();
             check_acl(aclrtSynchronizeStream(stream), "aclrtSynchronizeStream(ACLNN QKV)");
 
-            std::vector<unsigned char> raw_q(hidden * dtype_bytes);
-            std::vector<unsigned char> raw_k(kv_dim * dtype_bytes);
-            std::vector<unsigned char> raw_v(kv_dim * dtype_bytes);
-            check_acl(aclrtMemcpy(raw_q.data(), raw_q.size(), d_qkv_q, raw_q.size(), ACL_MEMCPY_DEVICE_TO_HOST),
-                      "aclrtMemcpy(D2H ACLNN QKV q)");
-            check_acl(aclrtMemcpy(raw_k.data(), raw_k.size(), d_qkv_k, raw_k.size(), ACL_MEMCPY_DEVICE_TO_HOST),
-                      "aclrtMemcpy(D2H ACLNN QKV k)");
-            check_acl(aclrtMemcpy(raw_v.data(), raw_v.size(), d_qkv_v, raw_v.size(), ACL_MEMCPY_DEVICE_TO_HOST),
-                      "aclrtMemcpy(D2H ACLNN QKV v)");
+            std::vector<unsigned char> raw_q;
+            std::vector<unsigned char> raw_k;
+            std::vector<unsigned char> raw_v;
+            if (used_fused_weight) {
+                std::vector<unsigned char> raw_all(fused_dim * dtype_bytes);
+                check_acl(aclrtMemcpy(raw_all.data(), raw_all.size(), d_qkv_out, raw_all.size(), ACL_MEMCPY_DEVICE_TO_HOST),
+                          "aclrtMemcpy(D2H ACLNN fused QKV)");
+                const size_t q_raw_bytes = hidden * dtype_bytes;
+                const size_t kv_raw_bytes = kv_dim * dtype_bytes;
+                raw_q.assign(raw_all.data(), raw_all.data() + q_raw_bytes);
+                raw_k.assign(raw_all.data() + q_raw_bytes, raw_all.data() + q_raw_bytes + kv_raw_bytes);
+                raw_v.assign(raw_all.data() + q_raw_bytes + kv_raw_bytes, raw_all.data() + raw_all.size());
+            } else {
+                raw_q.resize(hidden * dtype_bytes);
+                raw_k.resize(kv_dim * dtype_bytes);
+                raw_v.resize(kv_dim * dtype_bytes);
+                check_acl(aclrtMemcpy(raw_q.data(), raw_q.size(), d_qkv_q, raw_q.size(), ACL_MEMCPY_DEVICE_TO_HOST),
+                          "aclrtMemcpy(D2H ACLNN QKV q)");
+                check_acl(aclrtMemcpy(raw_k.data(), raw_k.size(), d_qkv_k, raw_k.size(), ACL_MEMCPY_DEVICE_TO_HOST),
+                          "aclrtMemcpy(D2H ACLNN QKV k)");
+                check_acl(aclrtMemcpy(raw_v.data(), raw_v.size(), d_qkv_v, raw_v.size(), ACL_MEMCPY_DEVICE_TO_HOST),
+                          "aclrtMemcpy(D2H ACLNN QKV v)");
+            }
             q = raw_to_float_vector(raw_q, dtype, hidden);
             k = raw_to_float_vector(raw_k, dtype, kv_dim);
             v = raw_to_float_vector(raw_v, dtype, kv_dim);
@@ -2257,6 +2412,8 @@ struct AscendEngine {
                          ", dtype=" + dtype +
                          ", hidden=" + std::to_string(hidden) +
                          ", kv_dim=" + std::to_string(kv_dim) +
+                         ", weight_fusion=" + std::string(used_fused_weight ? "1" : "0") +
+                         ", mm_ops=" + std::to_string(used_fused_weight ? 1 : 3) +
                          ", enqueue_ms=" + std::to_string(timing.enqueue_ms) +
                          ", sync_d2h_ms=" + std::to_string(timing.total_ms - timing.enqueue_ms) +
                          ", total_ms=" + std::to_string(timing.total_ms));
