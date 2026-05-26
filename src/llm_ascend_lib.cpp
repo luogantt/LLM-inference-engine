@@ -899,9 +899,13 @@ struct AclnnApi {
     using SiluFn = int (*)(void*, uint64_t, aclOpExecutor*, aclrtStream);
     using MulGetWorkspaceSizeFn = int (*)(const aclTensor*, const aclTensor*, aclTensor*, uint64_t*, aclOpExecutor**);
     using MulFn = int (*)(void*, uint64_t, aclOpExecutor*, aclrtStream);
+    using SoftmaxGetWorkspaceSizeFn = int (*)(const aclTensor*, int64_t, aclTensor*, uint64_t*, aclOpExecutor**);
+    using SoftmaxFn = int (*)(void*, uint64_t, aclOpExecutor*, aclrtStream);
 
     bool tried = false;
     bool ready = false;
+    bool softmax_tried = false;
+    bool softmax_ready = false;
     void* handle = nullptr;
     MmGetWorkspaceSizeFn mm_ws = nullptr;
     MmFn mm = nullptr;
@@ -909,7 +913,10 @@ struct AclnnApi {
     SiluFn silu = nullptr;
     MulGetWorkspaceSizeFn mul_ws = nullptr;
     MulFn mul = nullptr;
+    SoftmaxGetWorkspaceSizeFn softmax_ws = nullptr;
+    SoftmaxFn softmax = nullptr;
     std::string error;
+    std::string softmax_error;
 
     template <typename Fn>
     bool load_symbol(Fn& fn, const char* name) {
@@ -957,6 +964,29 @@ struct AclnnApi {
         return false;
 #endif
     }
+
+    bool load_softmax(std::string& reason) {
+        if (!load(reason)) return false;
+        if (softmax_tried) {
+            if (!softmax_ready) reason = softmax_error;
+            return softmax_ready;
+        }
+        softmax_tried = true;
+#if defined(__linux__)
+        softmax_ready =
+            load_symbol(softmax_ws, "aclnnSoftmaxGetWorkspaceSize") &&
+            load_symbol(softmax, "aclnnSoftmax");
+        if (!softmax_ready) {
+            softmax_error = error;
+            reason = softmax_error;
+        }
+        return softmax_ready;
+#else
+        softmax_error = "ACLNN softmax dynamic loading is only supported on Linux";
+        reason = softmax_error;
+        return false;
+#endif
+    }
 };
 
 static AclnnApi& global_aclnn_api() {
@@ -996,6 +1026,11 @@ struct DeviceMlpTiming {
 };
 
 struct DeviceLinearTiming {
+    double total_ms = 0.0;
+};
+
+struct DeviceQkvTiming {
+    double enqueue_ms = 0.0;
     double total_ms = 0.0;
 };
 
@@ -1117,6 +1152,16 @@ struct AscendEngine {
     void* d_mlp_out = nullptr;
     void* d_vec_mm_x = nullptr;
     void* d_vec_mm_out = nullptr;
+    void* d_qkv_x = nullptr;
+    void* d_qkv_q = nullptr;
+    void* d_qkv_k = nullptr;
+    void* d_qkv_v = nullptr;
+    void* d_attn_q = nullptr;
+    void* d_attn_k_cache = nullptr;
+    void* d_attn_v_cache = nullptr;
+    void* d_attn_scores = nullptr;
+    void* d_attn_probs = nullptr;
+    void* d_attn_ctx = nullptr;
     size_t token_bytes = 0;
     size_t hidden_bytes = 0;
     size_t hidden_row_bytes = 0;
@@ -1132,9 +1177,23 @@ struct AscendEngine {
     size_t vec_mm_x_bytes = 0;
     size_t vec_mm_out_bytes = 0;
     std::string vec_mm_buffer_dtype;
+    size_t qkv_x_bytes = 0;
+    size_t qkv_q_bytes = 0;
+    size_t qkv_k_bytes = 0;
+    size_t qkv_v_bytes = 0;
+    std::string qkv_buffer_dtype;
+    size_t attn_q_bytes = 0;
+    size_t attn_kv_cache_bytes = 0;
+    size_t attn_scores_bytes = 0;
+    size_t attn_ctx_bytes = 0;
+    std::string attn_buffer_dtype;
     bool acl_ready = false;
     bool aclnn_mlp_disabled = false;
     bool aclnn_mlp_notice_printed = false;
+    bool aclnn_qkv_disabled = false;
+    bool aclnn_qkv_notice_printed = false;
+    bool aclnn_attn_disabled = false;
+    bool aclnn_attn_notice_printed = false;
     bool aclnn_attn_proj_disabled = false;
     bool aclnn_attn_proj_notice_printed = false;
     bool aclnn_lm_head_disabled = false;
@@ -1263,6 +1322,8 @@ struct AscendEngine {
         }
         free_mlp_buffers();
         free_vec_mm_buffers();
+        free_qkv_buffers();
+        free_attn_buffers();
         if (d_tokens) {
             aclrtFree(d_tokens);
             d_tokens = nullptr;
@@ -1508,6 +1569,44 @@ struct AscendEngine {
         return env_flag_enabled("ASCEND_MLP_LOG", false);
     }
 
+    static bool aclnn_qkv_enabled() {
+        const std::string backend = env_str_or("ASCEND_QKV_BACKEND", "");
+        if (!backend.empty()) {
+            return backend == "aclnn" || backend == "acl" || backend == "ascend" || backend == "1";
+        }
+        if (env_flag_enabled("ASCEND_ACLNN_QKV", false)) return true;
+        const std::string proj_backend = env_str_or("ASCEND_ATTN_PROJ_BACKEND", "");
+        if (!proj_backend.empty()) {
+            return proj_backend == "aclnn" || proj_backend == "acl" ||
+                   proj_backend == "ascend" || proj_backend == "1";
+        }
+        return env_flag_enabled("ASCEND_ACLNN_ATTN_PROJ", false);
+    }
+
+    static bool aclnn_qkv_fallback_enabled() {
+        return env_flag_enabled("ASCEND_QKV_FALLBACK", true);
+    }
+
+    static bool aclnn_qkv_log_enabled() {
+        return env_flag_enabled("ASCEND_QKV_LOG", false);
+    }
+
+    static bool aclnn_attention_enabled() {
+        const std::string backend = env_str_or("ASCEND_ATTN_BACKEND", "");
+        if (!backend.empty()) {
+            return backend == "aclnn" || backend == "acl" || backend == "ascend" || backend == "1";
+        }
+        return env_flag_enabled("ASCEND_ACLNN_ATTN", false);
+    }
+
+    static bool aclnn_attention_fallback_enabled() {
+        return env_flag_enabled("ASCEND_ATTN_FALLBACK", true);
+    }
+
+    static bool aclnn_attention_log_enabled() {
+        return env_flag_enabled("ASCEND_ATTN_LOG", false);
+    }
+
     static bool aclnn_attn_proj_enabled() {
         const std::string backend = env_str_or("ASCEND_ATTN_PROJ_BACKEND", "");
         if (!backend.empty()) {
@@ -1595,6 +1694,44 @@ struct AscendEngine {
         vec_mm_buffer_dtype.clear();
     }
 
+    void free_qkv_buffers() {
+        auto free_one = [](void*& p) {
+            if (p) {
+                aclrtFree(p);
+                p = nullptr;
+            }
+        };
+        free_one(d_qkv_x);
+        free_one(d_qkv_q);
+        free_one(d_qkv_k);
+        free_one(d_qkv_v);
+        qkv_x_bytes = 0;
+        qkv_q_bytes = 0;
+        qkv_k_bytes = 0;
+        qkv_v_bytes = 0;
+        qkv_buffer_dtype.clear();
+    }
+
+    void free_attn_buffers() {
+        auto free_one = [](void*& p) {
+            if (p) {
+                aclrtFree(p);
+                p = nullptr;
+            }
+        };
+        free_one(d_attn_q);
+        free_one(d_attn_k_cache);
+        free_one(d_attn_v_cache);
+        free_one(d_attn_scores);
+        free_one(d_attn_probs);
+        free_one(d_attn_ctx);
+        attn_q_bytes = 0;
+        attn_kv_cache_bytes = 0;
+        attn_scores_bytes = 0;
+        attn_ctx_bytes = 0;
+        attn_buffer_dtype.clear();
+    }
+
     void ensure_vec_mm_buffers(const std::string& dtype, size_t in_dim, size_t out_dim) {
         const size_t dtype_bytes = dtype_size_from_string(dtype);
         const size_t need_x = in_dim * dtype_bytes;
@@ -1619,6 +1756,86 @@ struct AscendEngine {
         time_log("[Ascend][time] ACLNN vector MM buffers allocated, dtype=" + dtype +
                  ", input_bytes=" + std::to_string(vec_mm_x_bytes) +
                  ", output_bytes=" + std::to_string(vec_mm_out_bytes));
+    }
+
+    void ensure_qkv_buffers(const std::string& dtype, size_t hidden, size_t kv_dim) {
+        const size_t dtype_bytes = dtype_size_from_string(dtype);
+        const size_t need_x = hidden * dtype_bytes;
+        const size_t need_q = hidden * dtype_bytes;
+        const size_t need_k = kv_dim * dtype_bytes;
+        const size_t need_v = kv_dim * dtype_bytes;
+        if (d_qkv_x && d_qkv_q && d_qkv_k && d_qkv_v &&
+            qkv_buffer_dtype == dtype &&
+            qkv_x_bytes >= need_x &&
+            qkv_q_bytes >= need_q &&
+            qkv_k_bytes >= need_k &&
+            qkv_v_bytes >= need_v) {
+            return;
+        }
+
+        free_qkv_buffers();
+        auto alloc = [](void*& p, size_t bytes, const char* label) {
+            check_acl(aclrtMalloc(&p, bytes, ACL_MEM_MALLOC_HUGE_FIRST), label);
+            check_acl(aclrtMemset(p, bytes, 0, bytes), label);
+        };
+        alloc(d_qkv_x, need_x, "aclrtMalloc(QKV input)");
+        alloc(d_qkv_q, need_q, "aclrtMalloc(QKV q output)");
+        alloc(d_qkv_k, need_k, "aclrtMalloc(QKV k output)");
+        alloc(d_qkv_v, need_v, "aclrtMalloc(QKV v output)");
+        qkv_x_bytes = need_x;
+        qkv_q_bytes = need_q;
+        qkv_k_bytes = need_k;
+        qkv_v_bytes = need_v;
+        qkv_buffer_dtype = dtype;
+        time_log("[Ascend][time] ACLNN QKV buffers allocated, dtype=" + dtype +
+                 ", hidden_bytes=" + std::to_string(qkv_x_bytes) +
+                 ", kv_bytes=" + std::to_string(qkv_k_bytes));
+    }
+
+    void ensure_attention_buffers(
+        const std::string& dtype,
+        size_t hidden,
+        size_t kv_dim,
+        size_t group) {
+        const size_t dtype_bytes = dtype_size_from_string(dtype);
+        const size_t need_q = hidden * dtype_bytes;
+        const size_t need_cache =
+            static_cast<size_t>(config.n_layers) *
+            static_cast<size_t>(max_seq) *
+            kv_dim *
+            dtype_bytes;
+        const size_t need_scores = group * static_cast<size_t>(max_seq) * dtype_bytes;
+        const size_t need_ctx = hidden * dtype_bytes;
+        if (d_attn_q && d_attn_k_cache && d_attn_v_cache &&
+            d_attn_scores && d_attn_probs && d_attn_ctx &&
+            attn_buffer_dtype == dtype &&
+            attn_q_bytes >= need_q &&
+            attn_kv_cache_bytes >= need_cache &&
+            attn_scores_bytes >= need_scores &&
+            attn_ctx_bytes >= need_ctx) {
+            return;
+        }
+
+        free_attn_buffers();
+        auto alloc = [](void*& p, size_t bytes, const char* label) {
+            check_acl(aclrtMalloc(&p, bytes, ACL_MEM_MALLOC_HUGE_FIRST), label);
+            check_acl(aclrtMemset(p, bytes, 0, bytes), label);
+        };
+        alloc(d_attn_q, need_q, "aclrtMalloc(attention q)");
+        alloc(d_attn_k_cache, need_cache, "aclrtMalloc(attention k cache)");
+        alloc(d_attn_v_cache, need_cache, "aclrtMalloc(attention v cache)");
+        alloc(d_attn_scores, need_scores, "aclrtMalloc(attention scores)");
+        alloc(d_attn_probs, need_scores, "aclrtMalloc(attention probs)");
+        alloc(d_attn_ctx, need_ctx, "aclrtMalloc(attention ctx)");
+        attn_q_bytes = need_q;
+        attn_kv_cache_bytes = need_cache;
+        attn_scores_bytes = need_scores;
+        attn_ctx_bytes = need_ctx;
+        attn_buffer_dtype = dtype;
+        time_log("[Ascend][time] ACLNN attention buffers allocated, dtype=" + dtype +
+                 ", q_bytes=" + std::to_string(attn_q_bytes) +
+                 ", cache_bytes_each=" + std::to_string(attn_kv_cache_bytes) +
+                 ", score_bytes=" + std::to_string(attn_scores_bytes));
     }
 
     void ensure_mlp_buffers(const std::string& dtype) {
@@ -1772,6 +1989,22 @@ struct AscendEngine {
         check_aclnn_status(api.mul(workspace, workspace_size, executor, stream), label);
     }
 
+    void launch_aclnn_softmax(
+        AclnnApi& api,
+        aclTensor* input,
+        aclTensor* output,
+        int64_t dim,
+        DeviceWorkspaceGuard& workspaces,
+        const std::string& label) {
+        uint64_t workspace_size = 0;
+        aclOpExecutor* executor = nullptr;
+        check_aclnn_status(
+            api.softmax_ws(input, dim, output, &workspace_size, &executor),
+            label + " GetWorkspaceSize");
+        void* workspace = workspaces.allocate(workspace_size, ("aclrtMalloc(" + label + " workspace)").c_str());
+        check_aclnn_status(api.softmax(workspace, workspace_size, executor, stream), label);
+    }
+
     bool vector_mm_aclnn_forward(
         const std::vector<float>& x,
         const DeviceTensor& weight,
@@ -1846,6 +2079,364 @@ struct AscendEngine {
             out = raw_to_float_vector(raw_out, dtype, out_dim);
             auto t1 = Clock::now();
             timing.total_ms = elapsed_ms(t0, t1);
+            return true;
+        } catch (const std::exception& e) {
+            reason = e.what();
+            return false;
+        }
+    }
+
+    bool qkv_aclnn_forward(
+        const std::vector<float>& qkv_in,
+        const std::string& q_name,
+        const std::string& k_name,
+        const std::string& v_name,
+        const std::vector<float>* q_bias,
+        const std::vector<float>* k_bias,
+        const std::vector<float>* v_bias,
+        std::vector<float>& q,
+        std::vector<float>& k,
+        std::vector<float>& v,
+        DeviceQkvTiming& timing,
+        const std::string& prefix,
+        std::string& reason) {
+        try {
+            AclnnApi& api = global_aclnn_api();
+            if (!api.load(reason)) return false;
+            AclRuntimeTensorApi& tensor_api = global_acl_tensor_api();
+            if (!tensor_api.load(api.handle, reason)) return false;
+
+            const DeviceTensor& q_weight = require_device_weight(q_name);
+            const DeviceTensor& k_weight = require_device_weight(k_name);
+            const DeviceTensor& v_weight = require_device_weight(v_name);
+            const size_t hidden = static_cast<size_t>(config.hidden);
+            const int head_dim = config.hidden / config.n_heads;
+            const size_t kv_dim = static_cast<size_t>(config.n_kv_heads * head_dim);
+            if (qkv_in.size() != hidden) {
+                reason = "ACLNN QKV input dim mismatch";
+                return false;
+            }
+            if (head_dim <= 0 || kv_dim == 0) {
+                reason = "ACLNN QKV bad head config";
+                return false;
+            }
+            if (q_weight.meta.dtype != k_weight.meta.dtype ||
+                q_weight.meta.dtype != v_weight.meta.dtype) {
+                reason = "ACLNN QKV requires q/k/v weights to share dtype";
+                return false;
+            }
+            if (q_weight.meta.dtype != "BF16" && q_weight.meta.dtype != "F16") {
+                reason = "ACLNN QKV currently supports BF16/F16 weights only, got " + q_weight.meta.dtype;
+                return false;
+            }
+            if (q_weight.meta.shape.size() != 2 ||
+                k_weight.meta.shape.size() != 2 ||
+                v_weight.meta.shape.size() != 2 ||
+                q_weight.meta.shape[0] != hidden ||
+                q_weight.meta.shape[1] != hidden ||
+                k_weight.meta.shape[0] != kv_dim ||
+                k_weight.meta.shape[1] != hidden ||
+                v_weight.meta.shape[0] != kv_dim ||
+                v_weight.meta.shape[1] != hidden) {
+                reason = "ACLNN QKV weight shape mismatch";
+                return false;
+            }
+            if ((q_bias && q_bias->size() != hidden) ||
+                (k_bias && k_bias->size() != kv_dim) ||
+                (v_bias && v_bias->size() != kv_dim)) {
+                reason = "ACLNN QKV bias size mismatch";
+                return false;
+            }
+
+            const std::string dtype = q_weight.meta.dtype;
+            const aclDataType acl_dtype = acl_dtype_from_string(dtype);
+            const size_t dtype_bytes = dtype_size_from_string(dtype);
+            ensure_qkv_buffers(dtype, hidden, kv_dim);
+
+            auto t0 = Clock::now();
+            std::vector<unsigned char> raw_in;
+            fill_raw_from_float_vector(qkv_in, dtype, raw_in);
+            check_acl(aclrtMemcpy(d_qkv_x, qkv_x_bytes, raw_in.data(), raw_in.size(), ACL_MEMCPY_HOST_TO_DEVICE),
+                      "aclrtMemcpy(H2D ACLNN QKV input)");
+
+            AclTensorGuard x = create_acl_tensor_2d(
+                d_qkv_x,
+                1,
+                static_cast<int64_t>(hidden),
+                acl_dtype,
+                prefix + " QKV input");
+            AclTensorGuard q_w_t = create_acl_tensor_2d_strided(
+                q_weight.data,
+                static_cast<int64_t>(hidden),
+                static_cast<int64_t>(hidden),
+                1,
+                static_cast<int64_t>(hidden),
+                static_cast<int64_t>(hidden),
+                static_cast<int64_t>(hidden),
+                acl_dtype,
+                prefix + " q weight transposed view");
+            AclTensorGuard k_w_t = create_acl_tensor_2d_strided(
+                k_weight.data,
+                static_cast<int64_t>(hidden),
+                static_cast<int64_t>(kv_dim),
+                1,
+                static_cast<int64_t>(hidden),
+                static_cast<int64_t>(kv_dim),
+                static_cast<int64_t>(hidden),
+                acl_dtype,
+                prefix + " k weight transposed view");
+            AclTensorGuard v_w_t = create_acl_tensor_2d_strided(
+                v_weight.data,
+                static_cast<int64_t>(hidden),
+                static_cast<int64_t>(kv_dim),
+                1,
+                static_cast<int64_t>(hidden),
+                static_cast<int64_t>(kv_dim),
+                static_cast<int64_t>(hidden),
+                acl_dtype,
+                prefix + " v weight transposed view");
+            AclTensorGuard q_out = create_acl_tensor_2d(
+                d_qkv_q,
+                1,
+                static_cast<int64_t>(hidden),
+                acl_dtype,
+                prefix + " q output");
+            AclTensorGuard k_out = create_acl_tensor_2d(
+                d_qkv_k,
+                1,
+                static_cast<int64_t>(kv_dim),
+                acl_dtype,
+                prefix + " k output");
+            AclTensorGuard v_out = create_acl_tensor_2d(
+                d_qkv_v,
+                1,
+                static_cast<int64_t>(kv_dim),
+                acl_dtype,
+                prefix + " v output");
+
+            DeviceWorkspaceGuard workspaces;
+            auto enqueue0 = Clock::now();
+            launch_aclnn_mm(api, x.get(), q_w_t.get(), q_out.get(), workspaces, prefix + " ACLNN q mm");
+            launch_aclnn_mm(api, x.get(), k_w_t.get(), k_out.get(), workspaces, prefix + " ACLNN k mm");
+            launch_aclnn_mm(api, x.get(), v_w_t.get(), v_out.get(), workspaces, prefix + " ACLNN v mm");
+            auto enqueue1 = Clock::now();
+            check_acl(aclrtSynchronizeStream(stream), "aclrtSynchronizeStream(ACLNN QKV)");
+
+            std::vector<unsigned char> raw_q(hidden * dtype_bytes);
+            std::vector<unsigned char> raw_k(kv_dim * dtype_bytes);
+            std::vector<unsigned char> raw_v(kv_dim * dtype_bytes);
+            check_acl(aclrtMemcpy(raw_q.data(), raw_q.size(), d_qkv_q, raw_q.size(), ACL_MEMCPY_DEVICE_TO_HOST),
+                      "aclrtMemcpy(D2H ACLNN QKV q)");
+            check_acl(aclrtMemcpy(raw_k.data(), raw_k.size(), d_qkv_k, raw_k.size(), ACL_MEMCPY_DEVICE_TO_HOST),
+                      "aclrtMemcpy(D2H ACLNN QKV k)");
+            check_acl(aclrtMemcpy(raw_v.data(), raw_v.size(), d_qkv_v, raw_v.size(), ACL_MEMCPY_DEVICE_TO_HOST),
+                      "aclrtMemcpy(D2H ACLNN QKV v)");
+            q = raw_to_float_vector(raw_q, dtype, hidden);
+            k = raw_to_float_vector(raw_k, dtype, kv_dim);
+            v = raw_to_float_vector(raw_v, dtype, kv_dim);
+            if (q_bias) {
+                for (size_t i = 0; i < hidden; ++i) q[i] += (*q_bias)[i];
+            }
+            if (k_bias) {
+                for (size_t i = 0; i < kv_dim; ++i) k[i] += (*k_bias)[i];
+            }
+            if (v_bias) {
+                for (size_t i = 0; i < kv_dim; ++i) v[i] += (*v_bias)[i];
+            }
+
+            auto t1 = Clock::now();
+            timing.enqueue_ms = elapsed_ms(enqueue0, enqueue1);
+            timing.total_ms = elapsed_ms(t0, t1);
+            if (!aclnn_qkv_notice_printed || aclnn_qkv_log_enabled()) {
+                time_log("[Ascend][time] ACLNN fused QKV path active, label=" + prefix +
+                         ", dtype=" + dtype +
+                         ", hidden=" + std::to_string(hidden) +
+                         ", kv_dim=" + std::to_string(kv_dim) +
+                         ", enqueue_ms=" + std::to_string(timing.enqueue_ms) +
+                         ", sync_d2h_ms=" + std::to_string(timing.total_ms - timing.enqueue_ms) +
+                         ", total_ms=" + std::to_string(timing.total_ms));
+                aclnn_qkv_notice_printed = true;
+            }
+            return true;
+        } catch (const std::exception& e) {
+            reason = e.what();
+            return false;
+        }
+    }
+
+    bool attention_aclnn_forward(
+        const std::vector<float>& q,
+        const std::vector<float>& k,
+        const std::vector<float>& v,
+        int layer,
+        int pos,
+        std::vector<float>& ctx,
+        double& elapsed_out,
+        std::string& reason) {
+        try {
+            AclnnApi& api = global_aclnn_api();
+            if (!api.load_softmax(reason)) return false;
+            AclRuntimeTensorApi& tensor_api = global_acl_tensor_api();
+            if (!tensor_api.load(api.handle, reason)) return false;
+
+            const int head_dim = config.hidden / config.n_heads;
+            const int group = config.n_heads / config.n_kv_heads;
+            const int kv_dim = config.n_kv_heads * head_dim;
+            const size_t hidden = static_cast<size_t>(config.hidden);
+            if (head_dim <= 0 || group <= 0 ||
+                config.n_heads % config.n_kv_heads != 0 ||
+                kv_dim <= 0) {
+                reason = "ACLNN attention bad head config";
+                return false;
+            }
+            if (layer < 0 || layer >= config.n_layers || pos < 0 || pos >= max_seq) {
+                reason = "ACLNN attention layer/position out of range";
+                return false;
+            }
+            if (q.size() != hidden ||
+                k.size() != static_cast<size_t>(kv_dim) ||
+                v.size() != static_cast<size_t>(kv_dim)) {
+                reason = "ACLNN attention q/k/v size mismatch";
+                return false;
+            }
+
+            std::string dtype = env_str_or("ASCEND_ATTN_DTYPE", "BF16");
+            if (dtype.empty()) dtype = "BF16";
+            if (dtype != "BF16" && dtype != "F16") {
+                reason = "ACLNN attention supports BF16/F16 staging only, got " + dtype;
+                return false;
+            }
+            const aclDataType acl_dtype = acl_dtype_from_string(dtype);
+            const size_t dtype_bytes = dtype_size_from_string(dtype);
+            const size_t seq_len = static_cast<size_t>(pos + 1);
+            const float attn_scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+            ensure_attention_buffers(dtype, hidden, static_cast<size_t>(kv_dim), static_cast<size_t>(group));
+
+            auto t0 = Clock::now();
+            std::vector<float> q_scaled(q);
+            for (float& value : q_scaled) value *= attn_scale;
+            std::vector<unsigned char> raw_q;
+            std::vector<unsigned char> raw_k;
+            std::vector<unsigned char> raw_v;
+            fill_raw_from_float_vector(q_scaled, dtype, raw_q);
+            fill_raw_from_float_vector(k, dtype, raw_k);
+            fill_raw_from_float_vector(v, dtype, raw_v);
+
+            char* k_layer = static_cast<char*>(d_attn_k_cache) +
+                static_cast<size_t>(layer) *
+                static_cast<size_t>(max_seq) *
+                static_cast<size_t>(kv_dim) *
+                dtype_bytes;
+            char* v_layer = static_cast<char*>(d_attn_v_cache) +
+                static_cast<size_t>(layer) *
+                static_cast<size_t>(max_seq) *
+                static_cast<size_t>(kv_dim) *
+                dtype_bytes;
+            char* k_dst = k_layer + static_cast<size_t>(pos) * static_cast<size_t>(kv_dim) * dtype_bytes;
+            char* v_dst = v_layer + static_cast<size_t>(pos) * static_cast<size_t>(kv_dim) * dtype_bytes;
+
+            check_acl(aclrtMemcpy(d_attn_q, attn_q_bytes, raw_q.data(), raw_q.size(), ACL_MEMCPY_HOST_TO_DEVICE),
+                      "aclrtMemcpy(H2D ACLNN attention q)");
+            check_acl(aclrtMemcpy(k_dst, raw_k.size(), raw_k.data(), raw_k.size(), ACL_MEMCPY_HOST_TO_DEVICE),
+                      "aclrtMemcpy(H2D ACLNN attention k cache)");
+            check_acl(aclrtMemcpy(v_dst, raw_v.size(), raw_v.data(), raw_v.size(), ACL_MEMCPY_HOST_TO_DEVICE),
+                      "aclrtMemcpy(H2D ACLNN attention v cache)");
+            check_acl(aclrtMemset(d_attn_ctx, attn_ctx_bytes, 0, attn_ctx_bytes),
+                      "aclrtMemset(ACLNN attention ctx)");
+
+            DeviceWorkspaceGuard workspaces;
+            std::vector<AclTensorGuard> tensor_guards;
+            tensor_guards.reserve(static_cast<size_t>(config.n_kv_heads) * 7);
+            auto keep_tensor = [&](AclTensorGuard tensor) -> aclTensor* {
+                tensor_guards.push_back(std::move(tensor));
+                return tensor_guards.back().get();
+            };
+            for (int kh = 0; kh < config.n_kv_heads; ++kh) {
+                char* q_group_ptr = static_cast<char*>(d_attn_q) +
+                    static_cast<size_t>(kh) *
+                    static_cast<size_t>(group) *
+                    static_cast<size_t>(head_dim) *
+                    dtype_bytes;
+                char* k_head_ptr = k_layer +
+                    static_cast<size_t>(kh) *
+                    static_cast<size_t>(head_dim) *
+                    dtype_bytes;
+                char* v_head_ptr = v_layer +
+                    static_cast<size_t>(kh) *
+                    static_cast<size_t>(head_dim) *
+                    dtype_bytes;
+                char* ctx_group_ptr = static_cast<char*>(d_attn_ctx) +
+                    static_cast<size_t>(kh) *
+                    static_cast<size_t>(group) *
+                    static_cast<size_t>(head_dim) *
+                    dtype_bytes;
+
+                aclTensor* q_group = keep_tensor(create_acl_tensor_2d(
+                    q_group_ptr,
+                    static_cast<int64_t>(group),
+                    static_cast<int64_t>(head_dim),
+                    acl_dtype,
+                    "attention q group"));
+                aclTensor* k_t = keep_tensor(create_acl_tensor_2d_strided(
+                    k_head_ptr,
+                    static_cast<int64_t>(head_dim),
+                    static_cast<int64_t>(seq_len),
+                    1,
+                    static_cast<int64_t>(kv_dim),
+                    static_cast<int64_t>(max_seq),
+                    static_cast<int64_t>(kv_dim),
+                    acl_dtype,
+                    "attention k transposed view"));
+                aclTensor* scores = keep_tensor(create_acl_tensor_2d(
+                    d_attn_scores,
+                    static_cast<int64_t>(group),
+                    static_cast<int64_t>(seq_len),
+                    acl_dtype,
+                    "attention scores"));
+                aclTensor* probs = keep_tensor(create_acl_tensor_2d(
+                    d_attn_probs,
+                    static_cast<int64_t>(group),
+                    static_cast<int64_t>(seq_len),
+                    acl_dtype,
+                    "attention probs"));
+                aclTensor* v_mat = keep_tensor(create_acl_tensor_2d_strided(
+                    v_head_ptr,
+                    static_cast<int64_t>(seq_len),
+                    static_cast<int64_t>(head_dim),
+                    static_cast<int64_t>(kv_dim),
+                    1,
+                    static_cast<int64_t>(max_seq),
+                    static_cast<int64_t>(kv_dim),
+                    acl_dtype,
+                    "attention v view"));
+                aclTensor* ctx_group = keep_tensor(create_acl_tensor_2d(
+                    ctx_group_ptr,
+                    static_cast<int64_t>(group),
+                    static_cast<int64_t>(head_dim),
+                    acl_dtype,
+                    "attention ctx group"));
+
+                launch_aclnn_mm(api, q_group, k_t, scores, workspaces, "ACLNN attention score mm");
+                launch_aclnn_softmax(api, scores, probs, 1, workspaces, "ACLNN attention softmax");
+                launch_aclnn_mm(api, probs, v_mat, ctx_group, workspaces, "ACLNN attention value mm");
+            }
+
+            check_acl(aclrtSynchronizeStream(stream), "aclrtSynchronizeStream(ACLNN attention)");
+            std::vector<unsigned char> raw_ctx(hidden * dtype_bytes);
+            check_acl(aclrtMemcpy(raw_ctx.data(), raw_ctx.size(), d_attn_ctx, raw_ctx.size(), ACL_MEMCPY_DEVICE_TO_HOST),
+                      "aclrtMemcpy(D2H ACLNN attention ctx)");
+            ctx = raw_to_float_vector(raw_ctx, dtype, hidden);
+            auto t1 = Clock::now();
+            elapsed_out = elapsed_ms(t0, t1);
+            if (!aclnn_attn_notice_printed || aclnn_attention_log_enabled()) {
+                time_log("[Ascend][time] ACLNN attention path active, layer=" +
+                         std::to_string(layer) +
+                         ", pos=" + std::to_string(pos) +
+                         ", dtype=" + dtype +
+                         ", seq_len=" + std::to_string(seq_len) +
+                         ", elapsed_ms=" + std::to_string(elapsed_out));
+                aclnn_attn_notice_printed = true;
+            }
             return true;
         } catch (const std::exception& e) {
             reason = e.what();
@@ -2862,12 +3453,47 @@ struct AscendEngine {
         rms_norm_inplace(qkv_in, ln1);
         auto norm1_1 = Clock::now();
         auto q0 = Clock::now();
-        std::vector<float> q = linear_with_named_weight(qkv_in, wq_name, hidden, hidden, prefix + " q_proj", bq);
+        std::vector<float> q;
+        std::vector<float> k;
+        std::vector<float> v;
+        bool used_device_qkv = false;
+        DeviceQkvTiming qkv_timing;
+        if (aclnn_qkv_enabled() && !aclnn_qkv_disabled) {
+            std::string reason;
+            used_device_qkv = qkv_aclnn_forward(
+                qkv_in,
+                wq_name,
+                wk_name,
+                wv_name,
+                bq,
+                bk,
+                bv,
+                q,
+                k,
+                v,
+                qkv_timing,
+                prefix,
+                reason);
+            if (!used_device_qkv) {
+                aclnn_qkv_disabled = true;
+                time_log("[Ascend][warn] ACLNN fused QKV disabled, fallback=projection, label=" +
+                         prefix + ", reason=" + reason);
+                if (!aclnn_qkv_fallback_enabled()) {
+                    throw std::runtime_error("ACLNN fused QKV failed and ASCEND_QKV_FALLBACK=0: " + reason);
+                }
+            }
+        }
         auto q1 = Clock::now();
-        auto kv0 = Clock::now();
-        std::vector<float> k = linear_with_named_weight(qkv_in, wk_name, static_cast<size_t>(kv_dim), hidden, prefix + " k_proj", bk);
-        std::vector<float> v = linear_with_named_weight(qkv_in, wv_name, static_cast<size_t>(kv_dim), hidden, prefix + " v_proj", bv);
-        auto kv1 = Clock::now();
+        auto kv0 = q1;
+        auto kv1 = q1;
+        if (!used_device_qkv) {
+            q = linear_with_named_weight(qkv_in, wq_name, hidden, hidden, prefix + " q_proj", bq);
+            q1 = Clock::now();
+            kv0 = Clock::now();
+            k = linear_with_named_weight(qkv_in, wk_name, static_cast<size_t>(kv_dim), hidden, prefix + " k_proj", bk);
+            v = linear_with_named_weight(qkv_in, wv_name, static_cast<size_t>(kv_dim), hidden, prefix + " v_proj", bv);
+            kv1 = Clock::now();
+        }
         auto rope0 = Clock::now();
         apply_rope(q, config.n_heads, pos);
         apply_rope(k, config.n_kv_heads, pos);
@@ -2878,36 +3504,60 @@ struct AscendEngine {
         std::copy(k.begin(), k.end(), k_cache.begin() + static_cast<size_t>(pos) * kv_dim);
         std::copy(v.begin(), v.end(), v_cache.begin() + static_cast<size_t>(pos) * kv_dim);
 
-        std::vector<float> ctx(hidden, 0.0f);
-        const float attn_scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
-        std::vector<float> scores(static_cast<size_t>(pos + 1));
         auto attn0 = Clock::now();
-        for (int h = 0; h < config.n_heads; ++h) {
-            const int kh = h / group;
-            const float* qh = q.data() + static_cast<size_t>(h) * head_dim;
-            float max_score = -std::numeric_limits<float>::infinity();
-            for (int tok = 0; tok <= pos; ++tok) {
-                const float* kk = k_cache.data() + static_cast<size_t>(tok) * kv_dim + static_cast<size_t>(kh) * head_dim;
-                const float dot = dot_product_reference(qh, kk, static_cast<size_t>(head_dim));
-                scores[static_cast<size_t>(tok)] = dot * attn_scale;
-                max_score = std::max(max_score, scores[static_cast<size_t>(tok)]);
-            }
-
-            double denom = 0.0;
-            for (int tok = 0; tok <= pos; ++tok) {
-                float& s = scores[static_cast<size_t>(tok)];
-                s = std::exp(s - max_score);
-                denom += s;
-            }
-            const float inv_denom = denom > 0.0 ? static_cast<float>(1.0 / denom) : 0.0f;
-            for (int d = 0; d < head_dim; ++d) {
-                float acc = 0.0f;
-                for (int tok = 0; tok <= pos; ++tok) {
-                    const float prob = scores[static_cast<size_t>(tok)] * inv_denom;
-                    const float* vv = v_cache.data() + static_cast<size_t>(tok) * kv_dim + static_cast<size_t>(kh) * head_dim;
-                    acc = std::fma(prob, vv[d], acc);
+        std::vector<float> ctx(hidden, 0.0f);
+        bool used_device_attention = false;
+        double device_attention_ms = 0.0;
+        if (aclnn_attention_enabled() && !aclnn_attn_disabled) {
+            std::string reason;
+            used_device_attention = attention_aclnn_forward(
+                q,
+                k,
+                v,
+                layer,
+                pos,
+                ctx,
+                device_attention_ms,
+                reason);
+            if (!used_device_attention) {
+                aclnn_attn_disabled = true;
+                time_log("[Ascend][warn] ACLNN attention disabled, fallback=cpu, layer=" +
+                         std::to_string(layer) + ", reason=" + reason);
+                if (!aclnn_attention_fallback_enabled()) {
+                    throw std::runtime_error("ACLNN attention failed and ASCEND_ATTN_FALLBACK=0: " + reason);
                 }
-                ctx[static_cast<size_t>(h) * head_dim + d] = acc;
+            }
+        }
+        if (!used_device_attention) {
+            const float attn_scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+            std::vector<float> scores(static_cast<size_t>(pos + 1));
+            for (int h = 0; h < config.n_heads; ++h) {
+                const int kh = h / group;
+                const float* qh = q.data() + static_cast<size_t>(h) * head_dim;
+                float max_score = -std::numeric_limits<float>::infinity();
+                for (int tok = 0; tok <= pos; ++tok) {
+                    const float* kk = k_cache.data() + static_cast<size_t>(tok) * kv_dim + static_cast<size_t>(kh) * head_dim;
+                    const float dot = dot_product_reference(qh, kk, static_cast<size_t>(head_dim));
+                    scores[static_cast<size_t>(tok)] = dot * attn_scale;
+                    max_score = std::max(max_score, scores[static_cast<size_t>(tok)]);
+                }
+
+                double denom = 0.0;
+                for (int tok = 0; tok <= pos; ++tok) {
+                    float& s = scores[static_cast<size_t>(tok)];
+                    s = std::exp(s - max_score);
+                    denom += s;
+                }
+                const float inv_denom = denom > 0.0 ? static_cast<float>(1.0 / denom) : 0.0f;
+                for (int d = 0; d < head_dim; ++d) {
+                    float acc = 0.0f;
+                    for (int tok = 0; tok <= pos; ++tok) {
+                        const float prob = scores[static_cast<size_t>(tok)] * inv_denom;
+                        const float* vv = v_cache.data() + static_cast<size_t>(tok) * kv_dim + static_cast<size_t>(kh) * head_dim;
+                        acc = std::fma(prob, vv[d], acc);
+                    }
+                    ctx[static_cast<size_t>(h) * head_dim + d] = acc;
+                }
             }
         }
         auto attn1 = Clock::now();
