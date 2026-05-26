@@ -995,6 +995,10 @@ struct DeviceMlpTiming {
     double down_ms = 0.0;
 };
 
+struct DeviceLinearTiming {
+    double total_ms = 0.0;
+};
+
 struct DeviceWorkspaceGuard {
     std::vector<void*> ptrs;
 
@@ -1111,6 +1115,8 @@ struct AscendEngine {
     void* d_mlp_up = nullptr;
     void* d_mlp_mid = nullptr;
     void* d_mlp_out = nullptr;
+    void* d_vec_mm_x = nullptr;
+    void* d_vec_mm_out = nullptr;
     size_t token_bytes = 0;
     size_t hidden_bytes = 0;
     size_t hidden_row_bytes = 0;
@@ -1123,9 +1129,16 @@ struct AscendEngine {
     size_t mlp_hidden_bytes = 0;
     size_t mlp_intermediate_bytes = 0;
     std::string mlp_buffer_dtype;
+    size_t vec_mm_x_bytes = 0;
+    size_t vec_mm_out_bytes = 0;
+    std::string vec_mm_buffer_dtype;
     bool acl_ready = false;
     bool aclnn_mlp_disabled = false;
     bool aclnn_mlp_notice_printed = false;
+    bool aclnn_attn_proj_disabled = false;
+    bool aclnn_attn_proj_notice_printed = false;
+    bool aclnn_lm_head_disabled = false;
+    bool aclnn_lm_head_notice_printed = false;
     mutable RefThreadPool* ref_thread_pool = nullptr;
     mutable int ref_thread_pool_size = 0;
     std::unordered_map<std::string, DeviceTensor> d_weights;
@@ -1249,6 +1262,7 @@ struct AscendEngine {
             d_v = nullptr;
         }
         free_mlp_buffers();
+        free_vec_mm_buffers();
         if (d_tokens) {
             aclrtFree(d_tokens);
             d_tokens = nullptr;
@@ -1494,6 +1508,45 @@ struct AscendEngine {
         return env_flag_enabled("ASCEND_MLP_LOG", false);
     }
 
+    static bool aclnn_attn_proj_enabled() {
+        const std::string backend = env_str_or("ASCEND_ATTN_PROJ_BACKEND", "");
+        if (!backend.empty()) {
+            return backend == "aclnn" || backend == "acl" || backend == "ascend" || backend == "1";
+        }
+        return env_flag_enabled("ASCEND_ACLNN_ATTN_PROJ", false);
+    }
+
+    static bool aclnn_attn_proj_fallback_enabled() {
+        return env_flag_enabled("ASCEND_ATTN_PROJ_FALLBACK", true);
+    }
+
+    static bool aclnn_attn_proj_log_enabled() {
+        return env_flag_enabled("ASCEND_ATTN_PROJ_LOG", false);
+    }
+
+    static bool aclnn_lm_head_enabled() {
+        const std::string backend = env_str_or("ASCEND_LM_HEAD_BACKEND", "");
+        if (!backend.empty()) {
+            return backend == "aclnn" || backend == "acl" || backend == "ascend" || backend == "1";
+        }
+        return env_flag_enabled("ASCEND_ACLNN_LM_HEAD", false);
+    }
+
+    static bool aclnn_lm_head_fallback_enabled() {
+        return env_flag_enabled("ASCEND_LM_HEAD_FALLBACK", true);
+    }
+
+    static bool aclnn_lm_head_log_enabled() {
+        return env_flag_enabled("ASCEND_LM_HEAD_LOG", false);
+    }
+
+    static bool is_attention_projection_label(const std::string& label) {
+        return label_contains(label, " q_proj") ||
+               label_contains(label, " k_proj") ||
+               label_contains(label, " v_proj") ||
+               label_contains(label, " o_proj");
+    }
+
     static int8_t aclnn_cube_math_type() {
         return static_cast<int8_t>(env_int_or("ASCEND_ACLNN_CUBE_MATH_TYPE", 0));
     }
@@ -1526,6 +1579,46 @@ struct AscendEngine {
         mlp_hidden_bytes = 0;
         mlp_intermediate_bytes = 0;
         mlp_buffer_dtype.clear();
+    }
+
+    void free_vec_mm_buffers() {
+        auto free_one = [](void*& p) {
+            if (p) {
+                aclrtFree(p);
+                p = nullptr;
+            }
+        };
+        free_one(d_vec_mm_x);
+        free_one(d_vec_mm_out);
+        vec_mm_x_bytes = 0;
+        vec_mm_out_bytes = 0;
+        vec_mm_buffer_dtype.clear();
+    }
+
+    void ensure_vec_mm_buffers(const std::string& dtype, size_t in_dim, size_t out_dim) {
+        const size_t dtype_bytes = dtype_size_from_string(dtype);
+        const size_t need_x = in_dim * dtype_bytes;
+        const size_t need_out = out_dim * dtype_bytes;
+        if (d_vec_mm_x && d_vec_mm_out &&
+            vec_mm_buffer_dtype == dtype &&
+            vec_mm_x_bytes >= need_x &&
+            vec_mm_out_bytes >= need_out) {
+            return;
+        }
+
+        free_vec_mm_buffers();
+        auto alloc = [](void*& p, size_t bytes, const char* label) {
+            check_acl(aclrtMalloc(&p, bytes, ACL_MEM_MALLOC_HUGE_FIRST), label);
+            check_acl(aclrtMemset(p, bytes, 0, bytes), label);
+        };
+        alloc(d_vec_mm_x, need_x, "aclrtMalloc(vector MM input)");
+        alloc(d_vec_mm_out, need_out, "aclrtMalloc(vector MM output)");
+        vec_mm_x_bytes = need_x;
+        vec_mm_out_bytes = need_out;
+        vec_mm_buffer_dtype = dtype;
+        time_log("[Ascend][time] ACLNN vector MM buffers allocated, dtype=" + dtype +
+                 ", input_bytes=" + std::to_string(vec_mm_x_bytes) +
+                 ", output_bytes=" + std::to_string(vec_mm_out_bytes));
     }
 
     void ensure_mlp_buffers(const std::string& dtype) {
@@ -1677,6 +1770,87 @@ struct AscendEngine {
             label + " GetWorkspaceSize");
         void* workspace = workspaces.allocate(workspace_size, ("aclrtMalloc(" + label + " workspace)").c_str());
         check_aclnn_status(api.mul(workspace, workspace_size, executor, stream), label);
+    }
+
+    bool vector_mm_aclnn_forward(
+        const std::vector<float>& x,
+        const DeviceTensor& weight,
+        size_t out_dim,
+        size_t in_dim,
+        std::vector<float>& out,
+        DeviceLinearTiming& timing,
+        const std::string& label,
+        std::string& reason) {
+        try {
+            AclnnApi& api = global_aclnn_api();
+            if (!api.load(reason)) return false;
+            AclRuntimeTensorApi& tensor_api = global_acl_tensor_api();
+            if (!tensor_api.load(api.handle, reason)) return false;
+
+            if (x.size() != in_dim) {
+                reason = label + " input dim mismatch";
+                return false;
+            }
+            if (weight.meta.shape.size() != 2 ||
+                weight.meta.shape[0] != out_dim ||
+                weight.meta.shape[1] != in_dim) {
+                reason = label + " weight shape mismatch: " + shape_string(weight.meta.shape);
+                return false;
+            }
+            if (weight.meta.dtype != "BF16" && weight.meta.dtype != "F16") {
+                reason = label + " currently supports BF16/F16 weights only, got " + weight.meta.dtype;
+                return false;
+            }
+
+            const std::string dtype = weight.meta.dtype;
+            const aclDataType acl_dtype = acl_dtype_from_string(dtype);
+            ensure_vec_mm_buffers(dtype, in_dim, out_dim);
+
+            auto t0 = Clock::now();
+            std::vector<unsigned char> raw_in;
+            fill_raw_from_float_vector(x, dtype, raw_in);
+            check_acl(aclrtMemcpy(d_vec_mm_x, vec_mm_x_bytes, raw_in.data(), raw_in.size(), ACL_MEMCPY_HOST_TO_DEVICE),
+                      ("aclrtMemcpy(H2D " + label + " input)").c_str());
+
+            AclTensorGuard input = create_acl_tensor_2d(
+                d_vec_mm_x,
+                1,
+                static_cast<int64_t>(in_dim),
+                acl_dtype,
+                label + " input");
+            AclTensorGuard weight_t = create_acl_tensor_2d_strided(
+                weight.data,
+                static_cast<int64_t>(in_dim),
+                static_cast<int64_t>(out_dim),
+                1,
+                static_cast<int64_t>(in_dim),
+                static_cast<int64_t>(out_dim),
+                static_cast<int64_t>(in_dim),
+                acl_dtype,
+                label + " weight transposed view");
+            AclTensorGuard output = create_acl_tensor_2d(
+                d_vec_mm_out,
+                1,
+                static_cast<int64_t>(out_dim),
+                acl_dtype,
+                label + " output");
+
+            DeviceWorkspaceGuard workspaces;
+            launch_aclnn_mm(api, input.get(), weight_t.get(), output.get(), workspaces, label + " mm");
+            check_acl(aclrtSynchronizeStream(stream), ("aclrtSynchronizeStream(" + label + ")").c_str());
+
+            const size_t out_bytes = out_dim * dtype_size_from_string(dtype);
+            std::vector<unsigned char> raw_out(out_bytes);
+            check_acl(aclrtMemcpy(raw_out.data(), raw_out.size(), d_vec_mm_out, out_bytes, ACL_MEMCPY_DEVICE_TO_HOST),
+                      ("aclrtMemcpy(D2H " + label + " output)").c_str());
+            out = raw_to_float_vector(raw_out, dtype, out_dim);
+            auto t1 = Clock::now();
+            timing.total_ms = elapsed_ms(t0, t1);
+            return true;
+        } catch (const std::exception& e) {
+            reason = e.what();
+            return false;
+        }
     }
 
     bool mlp_aclnn_forward(
@@ -2446,6 +2620,34 @@ struct AscendEngine {
             throw std::runtime_error(label + " weight shape mismatch: " + weight_name +
                                      " shape=" + shape_string(tensor.meta.shape));
         }
+        if (aclnn_attn_proj_enabled() &&
+            !aclnn_attn_proj_disabled &&
+            is_attention_projection_label(label)) {
+            std::vector<float> y;
+            DeviceLinearTiming timing;
+            std::string reason;
+            if (vector_mm_aclnn_forward(x, tensor, out_dim, in_dim, y, timing, "ACLNN " + label, reason)) {
+                if (bias) {
+                    if (bias->size() != out_dim) throw std::runtime_error(label + " bias size mismatch");
+                    for (size_t i = 0; i < out_dim; ++i) y[i] += (*bias)[i];
+                }
+                if (!aclnn_attn_proj_notice_printed || aclnn_attn_proj_log_enabled()) {
+                    time_log("[Ascend][time] ACLNN attention projection active, label=" + label +
+                             ", dtype=" + tensor.meta.dtype +
+                             ", out_dim=" + std::to_string(out_dim) +
+                             ", elapsed_ms=" + std::to_string(timing.total_ms));
+                    aclnn_attn_proj_notice_printed = true;
+                }
+                return y;
+            }
+
+            aclnn_attn_proj_disabled = true;
+            time_log("[Ascend][warn] ACLNN attention projection disabled, fallback=cpu, label=" +
+                     label + ", reason=" + reason);
+            if (!aclnn_attn_proj_fallback_enabled()) {
+                throw std::runtime_error("ACLNN attention projection failed and ASCEND_ATTN_PROJ_FALLBACK=0: " + reason);
+            }
+        }
         if (ref_u16_weight_enabled() && u16_weight_dtype_supported(tensor.meta.dtype)) {
             const std::vector<uint16_t>& weight = cached_weight_u16_ref(weight_name);
             return linear_with_u16_weight(x, weight, out_dim, in_dim, tensor.meta.dtype, label, bias);
@@ -3071,6 +3273,53 @@ struct AscendEngine {
         return x;
     }
 
+    int lm_head_argmax_aclnn(
+        const std::vector<float>& x,
+        const DeviceTensor& head,
+        size_t vocab,
+        size_t hidden,
+        size_t vocab_limit,
+        bool suppress_special,
+        float& best_out,
+        double& elapsed_out,
+        std::string& reason) {
+        std::vector<float> logits;
+        DeviceLinearTiming timing;
+        if (!vector_mm_aclnn_forward(
+                x,
+                head,
+                vocab,
+                hidden,
+                logits,
+                timing,
+                "ACLNN lm_head",
+                reason)) {
+            return -1;
+        }
+        if (logits.size() != vocab) {
+            reason = "ACLNN lm_head logits size mismatch";
+            return -1;
+        }
+
+        float best = -std::numeric_limits<float>::infinity();
+        int best_id = 0;
+        for (size_t tok = 0; tok < vocab_limit; ++tok) {
+            if (suppress_special && tok >= 151000) continue;
+            float logit = logits[tok];
+            if (tok < seen_tokens.size() && seen_tokens[tok] && repetition_penalty > 1.0f) {
+                logit = logit >= 0.0f ? logit / repetition_penalty : logit * repetition_penalty;
+            }
+            if (logit > best || (logit == best && static_cast<int>(tok) < best_id)) {
+                best = logit;
+                best_id = static_cast<int>(tok);
+            }
+        }
+
+        best_out = best;
+        elapsed_out = timing.total_ms;
+        return best_id;
+    }
+
     int lm_head_argmax_reference(const std::vector<float>& x) {
         auto head_it = d_weights.find("lm_head.weight");
         if (head_it == d_weights.end()) {
@@ -3088,6 +3337,55 @@ struct AscendEngine {
         const size_t vocab = meta.shape[0];
         const size_t hidden = meta.shape[1];
         auto t0 = Clock::now();
+        const size_t vocab_limit_env = static_cast<size_t>(std::max(0, env_int_or("ASCEND_LM_HEAD_REF_VOCAB", 0)));
+        const size_t vocab_limit = vocab_limit_env > 0 ? std::min(vocab, vocab_limit_env) : vocab;
+        const bool suppress_special = env_str_or("ASCEND_SUPPRESS_SPECIAL", "0") != "0";
+
+        if (aclnn_lm_head_enabled() && !aclnn_lm_head_disabled) {
+            std::string reason;
+            float best = -std::numeric_limits<float>::infinity();
+            double device_ms = 0.0;
+            const int token = lm_head_argmax_aclnn(
+                x,
+                head,
+                vocab,
+                hidden,
+                vocab_limit,
+                suppress_special,
+                best,
+                device_ms,
+                reason);
+            if (token >= 0) {
+                auto t1 = Clock::now();
+                if (!aclnn_lm_head_notice_printed || aclnn_lm_head_log_enabled()) {
+                    time_log("[Ascend][time] ACLNN lm_head active, vocab_scanned=" +
+                             std::to_string(vocab_limit) +
+                             ", hidden=" + std::to_string(hidden) +
+                             ", weight_dtype=" + meta.dtype +
+                             ", token=" + std::to_string(token) +
+                             ", logit=" + std::to_string(best) +
+                             ", device_ms=" + std::to_string(device_ms) +
+                             ", elapsed_ms=" + std::to_string(elapsed_ms(t0, t1)));
+                    aclnn_lm_head_notice_printed = true;
+                } else {
+                    time_log("[Ascend][time] lm_head argmax aclnn finished, vocab_scanned=" +
+                             std::to_string(vocab_limit) +
+                             ", hidden=" + std::to_string(hidden) +
+                             ", weight_dtype=" + meta.dtype +
+                             ", token=" + std::to_string(token) +
+                             ", logit=" + std::to_string(best) +
+                             ", elapsed_ms=" + std::to_string(elapsed_ms(t0, t1)));
+                }
+                return token;
+            }
+
+            aclnn_lm_head_disabled = true;
+            time_log("[Ascend][warn] ACLNN lm_head disabled, fallback=cpu, reason=" + reason);
+            if (!aclnn_lm_head_fallback_enabled()) {
+                throw std::runtime_error("ACLNN lm_head failed and ASCEND_LM_HEAD_FALLBACK=0: " + reason);
+            }
+        }
+
         const bool use_u16_head = ref_u16_weight_enabled() && u16_weight_dtype_supported(meta.dtype);
         const bool head_bf16 = meta.dtype == "BF16";
         const std::vector<uint16_t>* h_head_u16 = nullptr;
@@ -3097,9 +3395,6 @@ struct AscendEngine {
         } else {
             h_head_float = &cached_weight_float_ref("lm_head.weight");
         }
-        const size_t vocab_limit_env = static_cast<size_t>(std::max(0, env_int_or("ASCEND_LM_HEAD_REF_VOCAB", 0)));
-        const size_t vocab_limit = vocab_limit_env > 0 ? std::min(vocab, vocab_limit_env) : vocab;
-        const bool suppress_special = env_str_or("ASCEND_SUPPRESS_SPECIAL", "0") != "0";
         const int requested_threads = env_int_or("ASCEND_LM_HEAD_THREADS", 0);
         const unsigned hw_threads = std::max(1u, std::thread::hardware_concurrency());
         const int n_threads = std::max(
