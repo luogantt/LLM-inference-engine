@@ -24,6 +24,13 @@
 #include <utility>
 #include <vector>
 
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+#define ASCEND_REF_HAVE_NEON 1
+#else
+#define ASCEND_REF_HAVE_NEON 0
+#endif
+
 static thread_local std::string g_err;
 using Clock = std::chrono::steady_clock;
 
@@ -308,12 +315,144 @@ static bool ref_fast_dot_enabled() {
     return enabled;
 }
 
+static bool ref_dot4_enabled() {
+    static const bool enabled = env_flag_enabled("ASCEND_REF_DOT4", true);
+    return enabled;
+}
+
+#if ASCEND_REF_HAVE_NEON
+static float dot_product_neon(const float* __restrict__ x, const float* __restrict__ w, size_t n) {
+    float32x4_t acc0 = vdupq_n_f32(0.0f);
+    float32x4_t acc1 = vdupq_n_f32(0.0f);
+    float32x4_t acc2 = vdupq_n_f32(0.0f);
+    float32x4_t acc3 = vdupq_n_f32(0.0f);
+    size_t i = 0;
+    for (; i + 15 < n; i += 16) {
+        acc0 = vmlaq_f32(acc0, vld1q_f32(x + i + 0), vld1q_f32(w + i + 0));
+        acc1 = vmlaq_f32(acc1, vld1q_f32(x + i + 4), vld1q_f32(w + i + 4));
+        acc2 = vmlaq_f32(acc2, vld1q_f32(x + i + 8), vld1q_f32(w + i + 8));
+        acc3 = vmlaq_f32(acc3, vld1q_f32(x + i + 12), vld1q_f32(w + i + 12));
+    }
+    float32x4_t accv = vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3));
+    float acc = vaddvq_f32(accv);
+    for (; i < n; ++i) acc += x[i] * w[i];
+    return acc;
+}
+
+static void dot_pair_neon(
+    const float* __restrict__ x,
+    const float* __restrict__ a,
+    const float* __restrict__ b,
+    size_t n,
+    float& out_a,
+    float& out_b) {
+    float32x4_t a0 = vdupq_n_f32(0.0f);
+    float32x4_t a1 = vdupq_n_f32(0.0f);
+    float32x4_t a2 = vdupq_n_f32(0.0f);
+    float32x4_t a3 = vdupq_n_f32(0.0f);
+    float32x4_t b0 = vdupq_n_f32(0.0f);
+    float32x4_t b1 = vdupq_n_f32(0.0f);
+    float32x4_t b2 = vdupq_n_f32(0.0f);
+    float32x4_t b3 = vdupq_n_f32(0.0f);
+    size_t i = 0;
+    for (; i + 15 < n; i += 16) {
+        const float32x4_t x0 = vld1q_f32(x + i + 0);
+        const float32x4_t x1 = vld1q_f32(x + i + 4);
+        const float32x4_t x2 = vld1q_f32(x + i + 8);
+        const float32x4_t x3 = vld1q_f32(x + i + 12);
+        a0 = vmlaq_f32(a0, x0, vld1q_f32(a + i + 0));
+        a1 = vmlaq_f32(a1, x1, vld1q_f32(a + i + 4));
+        a2 = vmlaq_f32(a2, x2, vld1q_f32(a + i + 8));
+        a3 = vmlaq_f32(a3, x3, vld1q_f32(a + i + 12));
+        b0 = vmlaq_f32(b0, x0, vld1q_f32(b + i + 0));
+        b1 = vmlaq_f32(b1, x1, vld1q_f32(b + i + 4));
+        b2 = vmlaq_f32(b2, x2, vld1q_f32(b + i + 8));
+        b3 = vmlaq_f32(b3, x3, vld1q_f32(b + i + 12));
+    }
+    float32x4_t av = vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3));
+    float32x4_t bv = vaddq_f32(vaddq_f32(b0, b1), vaddq_f32(b2, b3));
+    float acc_a = vaddvq_f32(av);
+    float acc_b = vaddvq_f32(bv);
+    for (; i < n; ++i) {
+        const float xv = x[i];
+        acc_a += xv * a[i];
+        acc_b += xv * b[i];
+    }
+    out_a = acc_a;
+    out_b = acc_b;
+}
+
+static void dot4_neon(
+    const float* __restrict__ x,
+    const float* __restrict__ w0,
+    const float* __restrict__ w1,
+    const float* __restrict__ w2,
+    const float* __restrict__ w3,
+    size_t n,
+    float& out0,
+    float& out1,
+    float& out2,
+    float& out3) {
+    float32x4_t a0 = vdupq_n_f32(0.0f);
+    float32x4_t a1 = vdupq_n_f32(0.0f);
+    float32x4_t a2 = vdupq_n_f32(0.0f);
+    float32x4_t a3 = vdupq_n_f32(0.0f);
+    size_t i = 0;
+    for (; i + 15 < n; i += 16) {
+        const float32x4_t x0 = vld1q_f32(x + i + 0);
+        const float32x4_t x1 = vld1q_f32(x + i + 4);
+        const float32x4_t x2 = vld1q_f32(x + i + 8);
+        const float32x4_t x3 = vld1q_f32(x + i + 12);
+
+        a0 = vmlaq_f32(a0, x0, vld1q_f32(w0 + i + 0));
+        a0 = vmlaq_f32(a0, x1, vld1q_f32(w0 + i + 4));
+        a0 = vmlaq_f32(a0, x2, vld1q_f32(w0 + i + 8));
+        a0 = vmlaq_f32(a0, x3, vld1q_f32(w0 + i + 12));
+
+        a1 = vmlaq_f32(a1, x0, vld1q_f32(w1 + i + 0));
+        a1 = vmlaq_f32(a1, x1, vld1q_f32(w1 + i + 4));
+        a1 = vmlaq_f32(a1, x2, vld1q_f32(w1 + i + 8));
+        a1 = vmlaq_f32(a1, x3, vld1q_f32(w1 + i + 12));
+
+        a2 = vmlaq_f32(a2, x0, vld1q_f32(w2 + i + 0));
+        a2 = vmlaq_f32(a2, x1, vld1q_f32(w2 + i + 4));
+        a2 = vmlaq_f32(a2, x2, vld1q_f32(w2 + i + 8));
+        a2 = vmlaq_f32(a2, x3, vld1q_f32(w2 + i + 12));
+
+        a3 = vmlaq_f32(a3, x0, vld1q_f32(w3 + i + 0));
+        a3 = vmlaq_f32(a3, x1, vld1q_f32(w3 + i + 4));
+        a3 = vmlaq_f32(a3, x2, vld1q_f32(w3 + i + 8));
+        a3 = vmlaq_f32(a3, x3, vld1q_f32(w3 + i + 12));
+    }
+
+    float acc0 = vaddvq_f32(a0);
+    float acc1 = vaddvq_f32(a1);
+    float acc2 = vaddvq_f32(a2);
+    float acc3 = vaddvq_f32(a3);
+    for (; i < n; ++i) {
+        const float xv = x[i];
+        acc0 += xv * w0[i];
+        acc1 += xv * w1[i];
+        acc2 += xv * w2[i];
+        acc3 += xv * w3[i];
+    }
+    out0 = acc0;
+    out1 = acc1;
+    out2 = acc2;
+    out3 = acc3;
+}
+#endif
+
 static float dot_product_reference(const float* __restrict__ x, const float* __restrict__ w, size_t n) {
     if (!ref_fast_dot_enabled()) {
         float acc = 0.0f;
         for (size_t i = 0; i < n; ++i) acc = std::fma(x[i], w[i], acc);
         return acc;
     }
+
+#if ASCEND_REF_HAVE_NEON
+    return dot_product_neon(x, w, n);
+#endif
 
     float acc0 = 0.0f;
     float acc1 = 0.0f;
@@ -352,6 +491,11 @@ static void dot_pair_reference(
         return;
     }
 
+#if ASCEND_REF_HAVE_NEON
+    dot_pair_neon(x, a, b, n, out_a, out_b);
+    return;
+#endif
+
     float a0 = 0.0f;
     float a1 = 0.0f;
     float a2 = 0.0f;
@@ -385,6 +529,70 @@ static void dot_pair_reference(
     }
     out_a = acc_a;
     out_b = acc_b;
+}
+
+static void dot4_reference(
+    const float* __restrict__ x,
+    const float* __restrict__ w0,
+    const float* __restrict__ w1,
+    const float* __restrict__ w2,
+    const float* __restrict__ w3,
+    size_t n,
+    float& out0,
+    float& out1,
+    float& out2,
+    float& out3) {
+    if (!ref_fast_dot_enabled()) {
+        float a0 = 0.0f;
+        float a1 = 0.0f;
+        float a2 = 0.0f;
+        float a3 = 0.0f;
+        for (size_t i = 0; i < n; ++i) {
+            const float xv = x[i];
+            a0 = std::fma(xv, w0[i], a0);
+            a1 = std::fma(xv, w1[i], a1);
+            a2 = std::fma(xv, w2[i], a2);
+            a3 = std::fma(xv, w3[i], a3);
+        }
+        out0 = a0;
+        out1 = a1;
+        out2 = a2;
+        out3 = a3;
+        return;
+    }
+
+#if ASCEND_REF_HAVE_NEON
+    dot4_neon(x, w0, w1, w2, w3, n, out0, out1, out2, out3);
+    return;
+#endif
+
+    float a0 = 0.0f;
+    float a1 = 0.0f;
+    float a2 = 0.0f;
+    float a3 = 0.0f;
+    size_t i = 0;
+    const size_t n4 = n & ~static_cast<size_t>(3);
+    for (; i < n4; i += 4) {
+        const float x0 = x[i + 0];
+        const float x1 = x[i + 1];
+        const float x2 = x[i + 2];
+        const float x3 = x[i + 3];
+        a0 += x0 * w0[i + 0] + x1 * w0[i + 1] + x2 * w0[i + 2] + x3 * w0[i + 3];
+        a1 += x0 * w1[i + 0] + x1 * w1[i + 1] + x2 * w1[i + 2] + x3 * w1[i + 3];
+        a2 += x0 * w2[i + 0] + x1 * w2[i + 1] + x2 * w2[i + 2] + x3 * w2[i + 3];
+        a3 += x0 * w3[i + 0] + x1 * w3[i + 1] + x2 * w3[i + 2] + x3 * w3[i + 3];
+    }
+    for (; i < n; ++i) {
+        const float xv = x[i];
+        a0 += xv * w0[i];
+        a1 += xv * w1[i];
+        a2 += xv * w2[i];
+        a3 += xv * w3[i];
+    }
+    out0 = a0;
+    out1 = a1;
+    out2 = a2;
+    out3 = a3;
 }
 
 struct DeviceTensor {
@@ -1399,8 +1607,38 @@ struct AscendEngine {
         auto compute_range = [&](int tid) {
             const size_t begin = (out_dim * static_cast<size_t>(tid)) / static_cast<size_t>(n_threads);
             const size_t end = (out_dim * static_cast<size_t>(tid + 1)) / static_cast<size_t>(n_threads);
-            for (size_t out = begin; out < end; ++out) {
+            size_t out = begin;
+            if (ref_dot4_enabled() && in_dim >= 16) {
+                for (; out + 3 < end; out += 4) {
+                    const float* w0 = weight.data() + (out + 0) * in_dim;
+                    const float* w1 = weight.data() + (out + 1) * in_dim;
+                    const float* w2 = weight.data() + (out + 2) * in_dim;
+                    const float* w3 = weight.data() + (out + 3) * in_dim;
+#if defined(__GNUC__) || defined(__clang__)
+                    if (out + 4 < end) __builtin_prefetch(weight.data() + (out + 4) * in_dim, 0, 1);
+#endif
+                    float y0 = 0.0f;
+                    float y1 = 0.0f;
+                    float y2 = 0.0f;
+                    float y3 = 0.0f;
+                    dot4_reference(x.data(), w0, w1, w2, w3, in_dim, y0, y1, y2, y3);
+                    if (bias) {
+                        y0 += (*bias)[out + 0];
+                        y1 += (*bias)[out + 1];
+                        y2 += (*bias)[out + 2];
+                        y3 += (*bias)[out + 3];
+                    }
+                    y[out + 0] = y0;
+                    y[out + 1] = y1;
+                    y[out + 2] = y2;
+                    y[out + 3] = y3;
+                }
+            }
+            for (; out < end; ++out) {
                 const float* wrow = weight.data() + out * in_dim;
+#if defined(__GNUC__) || defined(__clang__)
+                if (out + 1 < end) __builtin_prefetch(weight.data() + (out + 1) * in_dim, 0, 1);
+#endif
                 float acc = dot_product_reference(x.data(), wrow, in_dim);
                 if (bias) acc += (*bias)[out];
                 y[out] = acc;
@@ -1438,6 +1676,12 @@ struct AscendEngine {
             for (size_t out = begin; out < end; ++out) {
                 const float* grow = gate_weight.data() + out * in_dim;
                 const float* urow = up_weight.data() + out * in_dim;
+#if defined(__GNUC__) || defined(__clang__)
+                if (out + 1 < end) {
+                    __builtin_prefetch(gate_weight.data() + (out + 1) * in_dim, 0, 1);
+                    __builtin_prefetch(up_weight.data() + (out + 1) * in_dim, 0, 1);
+                }
+#endif
                 float gacc = 0.0f;
                 float uacc = 0.0f;
                 dot_pair_reference(x.data(), grow, urow, in_dim, gacc, uacc);
