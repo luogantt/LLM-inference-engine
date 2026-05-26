@@ -298,6 +298,95 @@ static std::string env_str_or(const char* name, const std::string& fallback) {
     return (s && *s) ? std::string(s) : fallback;
 }
 
+static bool env_flag_enabled(const char* name, bool fallback) {
+    const std::string value = env_str_or(name, fallback ? "1" : "0");
+    return value != "0" && value != "false" && value != "False";
+}
+
+static bool ref_fast_dot_enabled() {
+    static const bool enabled = env_flag_enabled("ASCEND_REF_FAST_DOT", true);
+    return enabled;
+}
+
+static float dot_product_reference(const float* __restrict__ x, const float* __restrict__ w, size_t n) {
+    if (!ref_fast_dot_enabled()) {
+        float acc = 0.0f;
+        for (size_t i = 0; i < n; ++i) acc = std::fma(x[i], w[i], acc);
+        return acc;
+    }
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+    float acc3 = 0.0f;
+    size_t i = 0;
+    const size_t n4 = n & ~static_cast<size_t>(3);
+    for (; i < n4; i += 4) {
+        acc0 += x[i + 0] * w[i + 0];
+        acc1 += x[i + 1] * w[i + 1];
+        acc2 += x[i + 2] * w[i + 2];
+        acc3 += x[i + 3] * w[i + 3];
+    }
+    float acc = (acc0 + acc1) + (acc2 + acc3);
+    for (; i < n; ++i) acc += x[i] * w[i];
+    return acc;
+}
+
+static void dot_pair_reference(
+    const float* __restrict__ x,
+    const float* __restrict__ a,
+    const float* __restrict__ b,
+    size_t n,
+    float& out_a,
+    float& out_b) {
+    if (!ref_fast_dot_enabled()) {
+        float acc_a = 0.0f;
+        float acc_b = 0.0f;
+        for (size_t i = 0; i < n; ++i) {
+            const float xv = x[i];
+            acc_a = std::fma(xv, a[i], acc_a);
+            acc_b = std::fma(xv, b[i], acc_b);
+        }
+        out_a = acc_a;
+        out_b = acc_b;
+        return;
+    }
+
+    float a0 = 0.0f;
+    float a1 = 0.0f;
+    float a2 = 0.0f;
+    float a3 = 0.0f;
+    float b0 = 0.0f;
+    float b1 = 0.0f;
+    float b2 = 0.0f;
+    float b3 = 0.0f;
+    size_t i = 0;
+    const size_t n4 = n & ~static_cast<size_t>(3);
+    for (; i < n4; i += 4) {
+        const float x0 = x[i + 0];
+        const float x1 = x[i + 1];
+        const float x2 = x[i + 2];
+        const float x3 = x[i + 3];
+        a0 += x0 * a[i + 0];
+        a1 += x1 * a[i + 1];
+        a2 += x2 * a[i + 2];
+        a3 += x3 * a[i + 3];
+        b0 += x0 * b[i + 0];
+        b1 += x1 * b[i + 1];
+        b2 += x2 * b[i + 2];
+        b3 += x3 * b[i + 3];
+    }
+    float acc_a = (a0 + a1) + (a2 + a3);
+    float acc_b = (b0 + b1) + (b2 + b3);
+    for (; i < n; ++i) {
+        const float xv = x[i];
+        acc_a += xv * a[i];
+        acc_b += xv * b[i];
+    }
+    out_a = acc_a;
+    out_b = acc_b;
+}
+
 struct DeviceTensor {
     TensorMeta meta;
     void* data = nullptr;
@@ -1312,10 +1401,8 @@ struct AscendEngine {
             const size_t end = (out_dim * static_cast<size_t>(tid + 1)) / static_cast<size_t>(n_threads);
             for (size_t out = begin; out < end; ++out) {
                 const float* wrow = weight.data() + out * in_dim;
-                float acc = bias ? (*bias)[out] : 0.0f;
-                for (size_t in = 0; in < in_dim; ++in) {
-                    acc = std::fma(x[in], wrow[in], acc);
-                }
+                float acc = dot_product_reference(x.data(), wrow, in_dim);
+                if (bias) acc += (*bias)[out];
                 y[out] = acc;
             }
         };
@@ -1353,11 +1440,7 @@ struct AscendEngine {
                 const float* urow = up_weight.data() + out * in_dim;
                 float gacc = 0.0f;
                 float uacc = 0.0f;
-                for (size_t in = 0; in < in_dim; ++in) {
-                    const float xv = x[in];
-                    gacc = std::fma(xv, grow[in], gacc);
-                    uacc = std::fma(xv, urow[in], uacc);
-                }
+                dot_pair_reference(x.data(), grow, urow, in_dim, gacc, uacc);
                 mid[out] = (gacc / (1.0f + std::exp(-gacc))) * uacc;
             }
         };
@@ -1478,8 +1561,7 @@ struct AscendEngine {
             float max_score = -std::numeric_limits<float>::infinity();
             for (int tok = 0; tok <= pos; ++tok) {
                 const float* kk = k_cache.data() + static_cast<size_t>(tok) * kv_dim + static_cast<size_t>(kh) * head_dim;
-                float dot = 0.0f;
-                for (int d = 0; d < head_dim; ++d) dot = std::fma(qh[d], kk[d], dot);
+                const float dot = dot_product_reference(qh, kk, static_cast<size_t>(head_dim));
                 scores[static_cast<size_t>(tok)] = dot * attn_scale;
                 max_score = std::max(max_score, scores[static_cast<size_t>(tok)]);
             }
@@ -1707,10 +1789,7 @@ struct AscendEngine {
             float max_score = -std::numeric_limits<float>::infinity();
             for (int tok = 0; tok < len; ++tok) {
                 const float* kk = layer0_k_cache.data() + static_cast<size_t>(tok) * kv_dim + static_cast<size_t>(kh) * head_dim;
-                float dot = 0.0f;
-                for (int d = 0; d < head_dim; ++d) {
-                    dot = std::fma(qh[d], kk[d], dot);
-                }
+                const float dot = dot_product_reference(qh, kk, static_cast<size_t>(head_dim));
                 scores[tok] = dot * attn_scale;
                 max_score = std::max(max_score, scores[tok]);
             }
@@ -1880,11 +1959,7 @@ struct AscendEngine {
             for (size_t tok = begin; tok < end; ++tok) {
                 if (suppress_special && tok >= 151000) continue;
                 const float* wrow = h_head.data() + tok * hidden;
-                float acc = 0.0f;
-                for (size_t j = 0; j < hidden; ++j) {
-                    acc = std::fma(x[j], wrow[j], acc);
-                }
-                float logit = acc;
+                float logit = dot_product_reference(x.data(), wrow, hidden);
                 if (tok < seen_tokens.size() && seen_tokens[tok] && repetition_penalty > 1.0f) {
                     logit = logit >= 0.0f ? logit / repetition_penalty : logit * repetition_penalty;
                 }
