@@ -1,38 +1,40 @@
 # LLM CUDA Inference Engine
 
-一个从零实现的 CUDA 大模型推理引擎，当前主要面向 DeepSeek-R1-Distill-Qwen-7B 的单 batch 推理�?
+一个从零实现的 CUDA / Ascend 大模型推理引擎，当前主要面向 DeepSeek-R1-Distill-Qwen-7B 的单 batch decode 推理。
 
-项目目标是尽量少依赖外部推理框架，用 C++ / CUDA 手写核心推理路径，便于学习、实验和性能优化�?
+项目目标是尽量少依赖外部推理框架，用 C++ / CUDA / AscendCL / ACLNN 手写核心推理路径，便于学习、实验和性能优化。
 
 ## 特点
 
-- 不依�?PyTorch、Transformers、vLLM、llama.cpp
-- CUDA 手写 RMSNorm、RoPE、GQA Attention、SwiGLU、KV Cache、decode
+- 不依赖 PyTorch、Transformers、vLLM、llama.cpp 的直接推理路径
+- CUDA 路线手写 RMSNorm、RoPE、GQA Attention、SwiGLU、KV Cache、decode
+- Ascend 路线使用 AscendCL / ACLNN 构建 no-torch `.so` 推理路径
 - 支持 HuggingFace safetensors 权重加载
-- 提供 Python tokenizer + CUDA 动态库推理入口
-- 当前 `mma` 版本针对 A100 / A800 的单�?decode 做了多轮优化
+- 提供 Python tokenizer + 动态库推理入口
+- 当前 Ascend 路线已将 QKV、attention output projection、MLP、lm_head MatMul 搬到 ACLNN
 
-## 编译与运�?
+## CUDA 编译与运行
 
 ```bash
 make -f Makefile.cuda_lib lib A=sm_80
+
 CUDA_VISIBLE_DEVICES=4 python python_infer.py \
   --model /data3/ledi/models/DeepSeek-R1-Distill-Qwen-7B \
   --lib ./build/libllm_cuda.so \
-  --prompt "�ڸ������ѧ˼����Ը���Ϊ" \
+  --prompt "黑格尔的哲学思想可以概括为" \
   --max-new-tokens 128 \
   --max-seq 800
 ```
 
-## 当前性能
+## 当前 CUDA 性能记录
 
-测试模型�?
+测试模型：
 
 ```text
 /data3/ledi/models/DeepSeek-R1-Distill-Qwen-7B
 ```
 
-当前记录�?
+当前记录：
 
 ```text
 max_seq=800
@@ -41,7 +43,7 @@ max_new_tokens=512
 max forward_ms = 16.1768
 ```
 
-对应 tag�?
+对应 tag：
 
 ```text
 mma_max_forward_ms=16.1768_512_tokens=65.6845_tok_s
@@ -51,15 +53,13 @@ mma_max_forward_ms=16.1768_512_tokens=65.6845_tok_s
 
 ```text
 src/llm_cuda_lib.cu                  CUDA 推理核心
-python_infer.py                      Python 调用入口
+src/llm_ascend_lib.cpp               AscendCL / ACLNN 推理核心
+python_infer.py                      Python 动态库调用入口
+python_infer_ascend.py               torch_npu 参考入口
 Makefile.cuda_lib                    动态库编译入口
-llm_cuda_python_tokenizer_v2/         tokenizer 版本相关代码
+llm_cuda_python_tokenizer_v2/         tokenizer 相关代码
 log.txt                              性能记录
 ```
-
-## 说明
-
-这个项目偏研究和实验性质，重点是理解并优化单 batch decode 路径。后续如果继续提高速度，主要方向是 CUDA Graph、decode GEMV / MLP 重写、量化和 speculative decoding�?
 
 ## Model Download
 
@@ -85,9 +85,9 @@ python download_model.py \
   --local-dir ./deepseek-r1-7b
 ```
 
-## Ascend 910
+## Ascend 910 torch_npu Reference
 
-For Ascend 910 machines, use the `torch_npu` inference entry first:
+For Ascend 910 machines, the `torch_npu` entry can be used as a baseline:
 
 ```bash
 export ASCEND_VISIBLE_DEVICES=4
@@ -101,34 +101,13 @@ python python_infer_ascend.py \
   --dtype float16
 ```
 
-See `ASCEND.md` for full setup and troubleshooting notes.
-
-The `Ascend` branch also contains a first CUDA-like direct AscendCL shared library skeleton:
-
-```bash
-make -f Makefile.cuda_lib lib-ascend ASCEND_HOME=/usr/local/Ascend/cann-8.5.1
-
-export ASCEND_VISIBLE_DEVICES=4
-export ASCEND_DEVICE_ID=0
-export ASCEND_LOAD_WEIGHTS=layer0
-export ASCEND_RUN_RMSNORM=1
-export ASCEND_RUN_QPROJ=1
-export ASCEND_QPROJ_REF_TOKENS=1
-
-python python_infer.py \
-  --model ./deepseek-r1-7b \
-  --lib ./build/libllm_ascend.so \
-  --prompt "你好 deepseek 介绍一下黑格尔的思想" \
-  --max-new-tokens 1 \
-  --max-seq 800 \
-  --tokenizer-backend tokenizers \
-  --prefill-only
-```
+See `ASCEND.md` for setup and troubleshooting notes.
 
 ## Ascend Direct Decode Reference
 
-The `Ascend` branch includes a CUDA-like direct AscendCL shared library path.
-The fastest direct smoke test is `lm_head_ref`:
+The `Ascend` branch includes a CUDA-like direct AscendCL shared library path. These paths run inside `libllm_ascend.so` and do not import PyTorch.
+
+Fast lm_head smoke test:
 
 ```bash
 make -f Makefile.cuda_lib lib-ascend ASCEND_HOME=/usr/local/Ascend/cann-8.5.1
@@ -151,7 +130,7 @@ python python_infer.py \
   --tokenizer-backend tokenizers
 ```
 
-For the deeper one-layer reference path:
+One-layer reference path:
 
 ```bash
 export ASCEND_VISIBLE_DEVICES=4
@@ -176,7 +155,7 @@ python python_infer.py \
   --tokenizer-backend tokenizers
 ```
 
-For the complete no-torch `.so` reference path:
+Complete no-torch reference path:
 
 ```bash
 cd ~/LLM-inference-engine
@@ -208,14 +187,11 @@ export ASCEND_REF_PROFILE_LAYERS=0
 python python_infer.py \
   --model ./deepseek-r1-7b \
   --lib ./build/libllm_ascend.so \
-  --prompt "请直接给出最终答案，用一段完整中文介绍黑格尔的哲学思想�? \
+  --prompt "请直接给出最终答案，用一段完整中文介绍黑格尔的哲学思想。" \
   --max-new-tokens 8 \
   --max-seq 800 \
   --tokenizer-backend tokenizers
 ```
-
-`all_layers_ref` runs all 28 Transformer layers inside `libllm_ascend.so`.
-It is a correctness/reference path and does not import PyTorch.
 
 ## Ascend ACLNN Accelerated Inference
 
@@ -288,3 +264,19 @@ python python_infer.py \
   --tokenizer-backend tokenizers \
   --no-chat-template
 ```
+
+## Ascend 当前性能记录
+
+在 `ascend-fused-qkv-30tok` 版本附近，DeepSeek-R1-Distill-Qwen-7B 单 batch decode 的典型速度：
+
+```text
+短上下文峰值：约 32-34 tok/s
+128 token 平均：约 28-30 tok/s
+长输出尾段：约 25-26 tok/s
+```
+
+当前主要瓶颈是 attention 随 `seq_len` 增长带来的 CPU 侧开销。后续如果要继续追平或超过普通 `torchrun + torch_npu`，重点方向是实现真正融合的 AscendC attention kernel，而不是把 attention 拆成大量小 ACLNN op 调度。
+
+## 说明
+
+这个项目偏研究和实验性质，重点是理解并优化单 batch decode 路径。CUDA 后续方向包括 CUDA Graph、decode GEMV / MLP 重写、量化和 speculative decoding；Ascend 后续方向包括 AscendC fused attention、KV cache 常驻 NPU、减少 host-device 同步和更完整的算子融合。
