@@ -61,6 +61,10 @@ llm_cuda_python_tokenizer_v2/         tokenizer 相关代码
 log.txt                              性能记录
 ```
 
+## vLLM-Ascend 测试教程
+
+如果要用 `vllm-ascend` 做同 prompt、同 128 tokens 的对比测试，或者想把自己的 Ascend 算子接入 vLLM 执行路径，请看 [VLLM_ASCEND_TUTORIAL.md](./VLLM_ASCEND_TUTORIAL.md)。
+
 ## Model Download
 
 This repository includes `download_model.py` for downloading the HuggingFace safetensors model used by the engine. For China mainland networks, ModelScope is usually the fastest source:
@@ -402,6 +406,96 @@ grep "decode all_layers_ref finished" ascend_super_fused_128.log | tail -20
 ```
 
 Speed conversion:
+
+```text
+tok/s = 1000 / elapsed_ms
+```
+
+## Ascend-super recommended build and inference
+
+Use this command block for the current `Ascend-super` high-performance path. It includes compilation, runtime environment variables, 128-token inference, and a simple tail-latency speed check.
+
+```bash
+cd ~/LLM-inference-engine
+
+git checkout Ascend-super
+git pull --ff-only origin Ascend-super
+
+make -f Makefile.cuda_lib clean-lib
+make -f Makefile.cuda_lib lib-ascend ASCEND_HOME=/usr/local/Ascend/cann-8.5.1
+
+mkdir -p ~/ascend/log
+
+export ASCEND_VISIBLE_DEVICES=4
+export ASCEND_DEVICE_ID=0
+
+export ASCEND_LOAD_WEIGHTS=all
+export ASCEND_WEIGHT_LOAD_LOG=0
+export ASCEND_TIME_LOG_FILE=0
+export ASCEND_HOST_RAW_CACHE=0
+
+export ASCEND_RUN_EMBED=1
+export ASCEND_DIRECT_DECODE=all_layers_ref
+
+export ASCEND_REF_CACHE_WEIGHTS=1
+export ASCEND_REF_CACHE_LOG=0
+export ASCEND_REF_KV_CACHE=1
+export ASCEND_REF_U16_WEIGHTS=1
+
+export ASCEND_REF_FAST_DOT=1
+export ASCEND_REF_DOT4=0
+export ASCEND_REF_NEON_DOT=1
+
+export ASCEND_ATTN_BACKEND=cpu
+
+export ASCEND_QKV_BACKEND=aclnn
+export ASCEND_QKV_FUSE_WEIGHTS=1
+export ASCEND_QKV_FALLBACK=0
+export ASCEND_QKV_LOG=0
+
+export ASCEND_MLP_BACKEND=aclnn
+export ASCEND_MLP_FUSE_GATE_UP=1
+export ASCEND_MLP_FALLBACK=0
+export ASCEND_MLP_LOG=0
+
+export ASCEND_ATTN_PROJ_BACKEND=aclnn
+export ASCEND_ATTN_PROJ_FALLBACK=0
+export ASCEND_ATTN_PROJ_LOG=0
+
+export ASCEND_LM_HEAD_BACKEND=aclnn
+export ASCEND_LM_HEAD_FALLBACK=0
+export ASCEND_LM_HEAD_LOG=0
+
+export ASCEND_ACLNN_CUBE_MATH_TYPE=0
+
+export ASCEND_REF_LINEAR_THREADS=16
+export ASCEND_REF_ATTN_LINEAR_THREADS=16
+export ASCEND_REF_ATTN_THREADS=16
+export ASCEND_REF_ATTN_THREAD_MIN_SEQ=32
+export ASCEND_REF_MLP_THREADS=24
+export ASCEND_REF_DOWN_THREADS=24
+export ASCEND_LM_HEAD_THREADS=16
+
+export ASCEND_REF_PROFILE_LAYERS=0
+export ASCEND_REF_PROFILE_TOKEN_LIMIT=0
+
+python python_infer.py \
+  --model ./deepseek-r1-7b \
+  --lib ./build/libllm_ascend.so \
+  --prompt "黑格尔的哲学思想可以概括为" \
+  --max-new-tokens 128 \
+  --max-seq 800 \
+  --tokenizer-backend tokenizers \
+  --no-chat-template \
+  2>&1 | tee ascend_super_128.log
+```
+
+Check the final decode latency and convert it to tok/s:
+
+```bash
+grep "decode all_layers_ref finished" ascend_super_128.log | tail -20
+grep "decode all_layers_ref finished" ascend_super_128.log | tail -1
+```
 
 ```text
 tok/s = 1000 / elapsed_ms
