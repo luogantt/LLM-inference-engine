@@ -1225,6 +1225,12 @@ struct AscendEngine {
     std::unordered_map<std::string, std::vector<unsigned char>> h_weight_raw_cache;
     std::unordered_map<std::string, std::vector<float>> h_weight_cache;
     std::unordered_map<std::string, std::vector<uint16_t>> h_weight_u16_cache;
+    std::vector<unsigned char> h_vec_mm_raw_in;
+    std::vector<unsigned char> h_vec_mm_raw_out;
+    std::vector<unsigned char> h_qkv_raw_in;
+    std::vector<unsigned char> h_qkv_raw_out;
+    std::vector<unsigned char> h_mlp_raw_in;
+    std::vector<unsigned char> h_mlp_raw_out;
     std::vector<float> layer0_k_cache;
     std::vector<float> layer0_v_cache;
     int layer0_kv_cached_len = 0;
@@ -2286,9 +2292,8 @@ struct AscendEngine {
             ensure_vec_mm_buffers(dtype, in_dim, out_dim);
 
             auto t0 = Clock::now();
-            std::vector<unsigned char> raw_in;
-            fill_raw_from_float_vector(x, dtype, raw_in);
-            check_acl(aclrtMemcpy(d_vec_mm_x, vec_mm_x_bytes, raw_in.data(), raw_in.size(), ACL_MEMCPY_HOST_TO_DEVICE),
+            fill_raw_from_float_vector(x, dtype, h_vec_mm_raw_in);
+            check_acl(aclrtMemcpy(d_vec_mm_x, vec_mm_x_bytes, h_vec_mm_raw_in.data(), h_vec_mm_raw_in.size(), ACL_MEMCPY_HOST_TO_DEVICE),
                       ("aclrtMemcpy(H2D " + label + " input)").c_str());
 
             AclTensorGuard input = create_acl_tensor_2d(
@@ -2319,10 +2324,10 @@ struct AscendEngine {
             check_acl(aclrtSynchronizeStream(stream), ("aclrtSynchronizeStream(" + label + ")").c_str());
 
             const size_t out_bytes = out_dim * dtype_size_from_string(dtype);
-            std::vector<unsigned char> raw_out(out_bytes);
-            check_acl(aclrtMemcpy(raw_out.data(), raw_out.size(), d_vec_mm_out, out_bytes, ACL_MEMCPY_DEVICE_TO_HOST),
+            h_vec_mm_raw_out.resize(out_bytes);
+            check_acl(aclrtMemcpy(h_vec_mm_raw_out.data(), h_vec_mm_raw_out.size(), d_vec_mm_out, out_bytes, ACL_MEMCPY_DEVICE_TO_HOST),
                       ("aclrtMemcpy(D2H " + label + " output)").c_str());
-            out = raw_to_float_vector(raw_out, dtype, out_dim);
+            out = raw_to_float_vector(h_vec_mm_raw_out, dtype, out_dim);
             auto t1 = Clock::now();
             timing.total_ms = elapsed_ms(t0, t1);
             return true;
@@ -2400,9 +2405,8 @@ struct AscendEngine {
             ensure_qkv_buffers(dtype, hidden, kv_dim);
 
             auto t0 = Clock::now();
-            std::vector<unsigned char> raw_in;
-            fill_raw_from_float_vector(qkv_in, dtype, raw_in);
-            check_acl(aclrtMemcpy(d_qkv_x, qkv_x_bytes, raw_in.data(), raw_in.size(), ACL_MEMCPY_HOST_TO_DEVICE),
+            fill_raw_from_float_vector(qkv_in, dtype, h_qkv_raw_in);
+            check_acl(aclrtMemcpy(d_qkv_x, qkv_x_bytes, h_qkv_raw_in.data(), h_qkv_raw_in.size(), ACL_MEMCPY_HOST_TO_DEVICE),
                       "aclrtMemcpy(H2D ACLNN QKV input)");
 
             AclTensorGuard x = create_acl_tensor_2d(
@@ -2508,31 +2512,31 @@ struct AscendEngine {
             auto enqueue1 = Clock::now();
             check_acl(aclrtSynchronizeStream(stream), "aclrtSynchronizeStream(ACLNN QKV)");
 
-            std::vector<unsigned char> raw_q;
-            std::vector<unsigned char> raw_k;
-            std::vector<unsigned char> raw_v;
             if (used_fused_weight) {
-                std::vector<unsigned char> raw_all(fused_dim * dtype_bytes);
-                check_acl(aclrtMemcpy(raw_all.data(), raw_all.size(), d_qkv_out, raw_all.size(), ACL_MEMCPY_DEVICE_TO_HOST),
+                h_qkv_raw_out.resize(fused_dim * dtype_bytes);
+                check_acl(aclrtMemcpy(h_qkv_raw_out.data(), h_qkv_raw_out.size(), d_qkv_out, h_qkv_raw_out.size(), ACL_MEMCPY_DEVICE_TO_HOST),
                           "aclrtMemcpy(D2H ACLNN fused QKV)");
                 const size_t q_raw_bytes = hidden * dtype_bytes;
                 const size_t kv_raw_bytes = kv_dim * dtype_bytes;
-                q = raw_to_float_vector(raw_all.data(), q_raw_bytes, dtype, hidden);
-                k = raw_to_float_vector(raw_all.data() + q_raw_bytes, kv_raw_bytes, dtype, kv_dim);
-                v = raw_to_float_vector(raw_all.data() + q_raw_bytes + kv_raw_bytes, kv_raw_bytes, dtype, kv_dim);
+                q = raw_to_float_vector(h_qkv_raw_out.data(), q_raw_bytes, dtype, hidden);
+                k = raw_to_float_vector(h_qkv_raw_out.data() + q_raw_bytes, kv_raw_bytes, dtype, kv_dim);
+                v = raw_to_float_vector(h_qkv_raw_out.data() + q_raw_bytes + kv_raw_bytes, kv_raw_bytes, dtype, kv_dim);
             } else {
-                raw_q.resize(hidden * dtype_bytes);
-                raw_k.resize(kv_dim * dtype_bytes);
-                raw_v.resize(kv_dim * dtype_bytes);
-                check_acl(aclrtMemcpy(raw_q.data(), raw_q.size(), d_qkv_q, raw_q.size(), ACL_MEMCPY_DEVICE_TO_HOST),
+                const size_t q_raw_bytes = hidden * dtype_bytes;
+                const size_t kv_raw_bytes = kv_dim * dtype_bytes;
+                h_qkv_raw_out.resize(q_raw_bytes + kv_raw_bytes + kv_raw_bytes);
+                unsigned char* raw_q = h_qkv_raw_out.data();
+                unsigned char* raw_k = raw_q + q_raw_bytes;
+                unsigned char* raw_v = raw_k + kv_raw_bytes;
+                check_acl(aclrtMemcpy(raw_q, q_raw_bytes, d_qkv_q, q_raw_bytes, ACL_MEMCPY_DEVICE_TO_HOST),
                           "aclrtMemcpy(D2H ACLNN QKV q)");
-                check_acl(aclrtMemcpy(raw_k.data(), raw_k.size(), d_qkv_k, raw_k.size(), ACL_MEMCPY_DEVICE_TO_HOST),
+                check_acl(aclrtMemcpy(raw_k, kv_raw_bytes, d_qkv_k, kv_raw_bytes, ACL_MEMCPY_DEVICE_TO_HOST),
                           "aclrtMemcpy(D2H ACLNN QKV k)");
-                check_acl(aclrtMemcpy(raw_v.data(), raw_v.size(), d_qkv_v, raw_v.size(), ACL_MEMCPY_DEVICE_TO_HOST),
+                check_acl(aclrtMemcpy(raw_v, kv_raw_bytes, d_qkv_v, kv_raw_bytes, ACL_MEMCPY_DEVICE_TO_HOST),
                           "aclrtMemcpy(D2H ACLNN QKV v)");
-                q = raw_to_float_vector(raw_q, dtype, hidden);
-                k = raw_to_float_vector(raw_k, dtype, kv_dim);
-                v = raw_to_float_vector(raw_v, dtype, kv_dim);
+                q = raw_to_float_vector(raw_q, q_raw_bytes, dtype, hidden);
+                k = raw_to_float_vector(raw_k, kv_raw_bytes, dtype, kv_dim);
+                v = raw_to_float_vector(raw_v, kv_raw_bytes, dtype, kv_dim);
             }
             if (q_bias) {
                 for (size_t i = 0; i < hidden; ++i) q[i] += (*q_bias)[i];
@@ -2790,9 +2794,8 @@ struct AscendEngine {
             ensure_mlp_buffers(dtype);
 
             auto gate0 = Clock::now();
-            std::vector<unsigned char> raw_in;
-            fill_raw_from_float_vector(mlp_in, dtype, raw_in);
-            check_acl(aclrtMemcpy(d_mlp_x, mlp_hidden_bytes, raw_in.data(), raw_in.size(), ACL_MEMCPY_HOST_TO_DEVICE),
+            fill_raw_from_float_vector(mlp_in, dtype, h_mlp_raw_in);
+            check_acl(aclrtMemcpy(d_mlp_x, mlp_hidden_bytes, h_mlp_raw_in.data(), h_mlp_raw_in.size(), ACL_MEMCPY_HOST_TO_DEVICE),
                       "aclrtMemcpy(H2D ACLNN MLP input)");
 
             AclTensorGuard x = create_acl_tensor_2d(d_mlp_x, 1, static_cast<int64_t>(hidden), acl_dtype, "MLP input");
@@ -2895,11 +2898,11 @@ struct AscendEngine {
             launch_aclnn_mm(api, gate_out.get(), down_w_t.get(), out.get(), workspaces, "ACLNN MLP down mm");
             check_acl(aclrtSynchronizeStream(stream), "aclrtSynchronizeStream(ACLNN MLP)");
 
-            std::vector<unsigned char> raw_out(mlp_hidden_bytes);
-            check_acl(aclrtMemcpy(raw_out.data(), raw_out.size(), d_mlp_out, mlp_hidden_bytes, ACL_MEMCPY_DEVICE_TO_HOST),
+            h_mlp_raw_out.resize(mlp_hidden_bytes);
+            check_acl(aclrtMemcpy(h_mlp_raw_out.data(), h_mlp_raw_out.size(), d_mlp_out, mlp_hidden_bytes, ACL_MEMCPY_DEVICE_TO_HOST),
                       "aclrtMemcpy(D2H ACLNN MLP output)");
             auto down1 = Clock::now();
-            mlp_out = raw_to_float_vector(raw_out, dtype, hidden);
+            mlp_out = raw_to_float_vector(h_mlp_raw_out, dtype, hidden);
             timing.gate_up_ms = elapsed_ms(gate0, gate1);
             timing.down_ms = elapsed_ms(down0, down1);
 
@@ -3290,7 +3293,14 @@ struct AscendEngine {
         auto compute_heads = [&](int tid) {
             const int h_begin = (config.n_heads * tid) / n_threads;
             const int h_end = (config.n_heads * (tid + 1)) / n_threads;
-            std::vector<float> scores(static_cast<size_t>(seq_len));
+            constexpr int kStackScoreMax = 4096;
+            float stack_scores[kStackScoreMax];
+            std::vector<float> heap_scores;
+            float* scores = stack_scores;
+            if (seq_len > kStackScoreMax) {
+                heap_scores.resize(static_cast<size_t>(seq_len));
+                scores = heap_scores.data();
+            }
 
             for (int h = h_begin; h < h_end; ++h) {
                 const int kh = h / group;
@@ -3303,13 +3313,13 @@ struct AscendEngine {
                         static_cast<size_t>(kh) * static_cast<size_t>(head_dim);
                     const float score =
                         dot_product_reference(qh, kk, static_cast<size_t>(head_dim)) * attn_scale;
-                    scores[static_cast<size_t>(tok)] = score;
+                    scores[tok] = score;
                     max_score = std::max(max_score, score);
                 }
 
                 float denom = 0.0f;
                 for (int tok = 0; tok < seq_len; ++tok) {
-                    float& s = scores[static_cast<size_t>(tok)];
+                    float& s = scores[tok];
                     s = std::exp(s - max_score);
                     denom += s;
                 }
@@ -3318,7 +3328,7 @@ struct AscendEngine {
                 float* out = ctx.data() + static_cast<size_t>(h) * static_cast<size_t>(head_dim);
                 std::fill(out, out + head_dim, 0.0f);
                 for (int tok = 0; tok < seq_len; ++tok) {
-                    const float prob = scores[static_cast<size_t>(tok)] * inv_denom;
+                    const float prob = scores[tok] * inv_denom;
                     const float* vv =
                         v_cache.data() +
                         static_cast<size_t>(tok) * static_cast<size_t>(kv_dim) +
@@ -4362,41 +4372,107 @@ struct AscendEngine {
         float& best_out,
         double& elapsed_out,
         std::string& reason) {
-        std::vector<float> logits;
-        DeviceLinearTiming timing;
-        if (!vector_mm_aclnn_forward(
-                x,
-                head,
-                vocab,
-                hidden,
-                logits,
-                timing,
-                "ACLNN lm_head",
-                reason)) {
+        try {
+            AclnnApi& api = global_aclnn_api();
+            if (!api.load(reason)) return -1;
+            AclRuntimeTensorApi& tensor_api = global_acl_tensor_api();
+            if (!tensor_api.load(api.handle, reason)) return -1;
+
+            if (x.size() != hidden) {
+                reason = "ACLNN lm_head input dim mismatch";
+                return -1;
+            }
+            if (head.meta.shape.size() != 2 ||
+                head.meta.shape[0] != vocab ||
+                head.meta.shape[1] != hidden) {
+                reason = "ACLNN lm_head weight shape mismatch: " + shape_string(head.meta.shape);
+                return -1;
+            }
+            if (head.meta.dtype != "BF16" && head.meta.dtype != "F16") {
+                reason = "ACLNN lm_head currently supports BF16/F16 weights only, got " + head.meta.dtype;
+                return -1;
+            }
+
+            const std::string dtype = head.meta.dtype;
+            const aclDataType acl_dtype = acl_dtype_from_string(dtype);
+            const size_t dtype_bytes = dtype_size_from_string(dtype);
+            ensure_vec_mm_buffers(dtype, hidden, vocab);
+
+            auto t0 = Clock::now();
+            fill_raw_from_float_vector(x, dtype, h_vec_mm_raw_in);
+            check_acl(aclrtMemcpy(d_vec_mm_x, vec_mm_x_bytes, h_vec_mm_raw_in.data(), h_vec_mm_raw_in.size(), ACL_MEMCPY_HOST_TO_DEVICE),
+                      "aclrtMemcpy(H2D ACLNN lm_head input)");
+
+            AclTensorGuard input = create_acl_tensor_2d(
+                d_vec_mm_x,
+                1,
+                static_cast<int64_t>(hidden),
+                acl_dtype,
+                "ACLNN lm_head input");
+            AclTensorGuard weight_t = create_acl_tensor_2d_strided(
+                head.data,
+                static_cast<int64_t>(hidden),
+                static_cast<int64_t>(vocab),
+                1,
+                static_cast<int64_t>(hidden),
+                static_cast<int64_t>(vocab),
+                static_cast<int64_t>(hidden),
+                acl_dtype,
+                "ACLNN lm_head weight transposed view");
+            AclTensorGuard output = create_acl_tensor_2d(
+                d_vec_mm_out,
+                1,
+                static_cast<int64_t>(vocab),
+                acl_dtype,
+                "ACLNN lm_head output");
+
+            DeviceWorkspaceGuard workspaces;
+            launch_aclnn_mm(api, input.get(), weight_t.get(), output.get(), workspaces, "ACLNN lm_head mm");
+            check_acl(aclrtSynchronizeStream(stream), "aclrtSynchronizeStream(ACLNN lm_head)");
+
+            const size_t out_bytes = vocab * dtype_bytes;
+            h_vec_mm_raw_out.resize(out_bytes);
+            check_acl(aclrtMemcpy(h_vec_mm_raw_out.data(), h_vec_mm_raw_out.size(), d_vec_mm_out, out_bytes, ACL_MEMCPY_DEVICE_TO_HOST),
+                      "aclrtMemcpy(D2H ACLNN lm_head output)");
+
+            float best = -std::numeric_limits<float>::infinity();
+            int best_id = 0;
+            if (dtype == "BF16") {
+                const uint16_t* raw = reinterpret_cast<const uint16_t*>(h_vec_mm_raw_out.data());
+                for (size_t tok = 0; tok < vocab_limit; ++tok) {
+                    if (suppress_special && tok >= 151000) continue;
+                    float logit = bf16_to_float(raw[tok]);
+                    if (tok < seen_tokens.size() && seen_tokens[tok] && repetition_penalty > 1.0f) {
+                        logit = logit >= 0.0f ? logit / repetition_penalty : logit * repetition_penalty;
+                    }
+                    if (logit > best || (logit == best && static_cast<int>(tok) < best_id)) {
+                        best = logit;
+                        best_id = static_cast<int>(tok);
+                    }
+                }
+            } else {
+                const uint16_t* raw = reinterpret_cast<const uint16_t*>(h_vec_mm_raw_out.data());
+                for (size_t tok = 0; tok < vocab_limit; ++tok) {
+                    if (suppress_special && tok >= 151000) continue;
+                    float logit = f16_to_float(raw[tok]);
+                    if (tok < seen_tokens.size() && seen_tokens[tok] && repetition_penalty > 1.0f) {
+                        logit = logit >= 0.0f ? logit / repetition_penalty : logit * repetition_penalty;
+                    }
+                    if (logit > best || (logit == best && static_cast<int>(tok) < best_id)) {
+                        best = logit;
+                        best_id = static_cast<int>(tok);
+                    }
+                }
+            }
+
+            auto t1 = Clock::now();
+            best_out = best;
+            elapsed_out = elapsed_ms(t0, t1);
+            return best_id;
+        } catch (const std::exception& e) {
+            reason = e.what();
             return -1;
         }
-        if (logits.size() != vocab) {
-            reason = "ACLNN lm_head logits size mismatch";
-            return -1;
-        }
-
-        float best = -std::numeric_limits<float>::infinity();
-        int best_id = 0;
-        for (size_t tok = 0; tok < vocab_limit; ++tok) {
-            if (suppress_special && tok >= 151000) continue;
-            float logit = logits[tok];
-            if (tok < seen_tokens.size() && seen_tokens[tok] && repetition_penalty > 1.0f) {
-                logit = logit >= 0.0f ? logit / repetition_penalty : logit * repetition_penalty;
-            }
-            if (logit > best || (logit == best && static_cast<int>(tok) < best_id)) {
-                best = logit;
-                best_id = static_cast<int>(tok);
-            }
-        }
-
-        best_out = best;
-        elapsed_out = timing.total_ms;
-        return best_id;
     }
 
     int lm_head_argmax_reference(const std::vector<float>& x) {
