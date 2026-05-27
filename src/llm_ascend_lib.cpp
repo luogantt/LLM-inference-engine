@@ -41,13 +41,23 @@ static double elapsed_ms(Clock::time_point start, Clock::time_point end) {
     return std::chrono::duration<double, std::milli>(end - start).count();
 }
 
+static bool time_log_file_enabled() {
+    const char* s = std::getenv("ASCEND_TIME_LOG_FILE");
+    if (!s || !*s) return false;
+    return std::strcmp(s, "0") != 0 &&
+           std::strcmp(s, "false") != 0 &&
+           std::strcmp(s, "False") != 0;
+}
+
 static void reset_time_log() {
+    if (!time_log_file_enabled()) return;
     std::ofstream f("log.txt", std::ios::trunc);
     if (f) f << "[Ascend][time] log reset\n";
 }
 
 static void time_log(const std::string& line) {
     std::cout << line << "\n";
+    if (!time_log_file_enabled()) return;
     std::ofstream f("log.txt", std::ios::app);
     if (f) f << line << "\n";
 }
@@ -324,7 +334,11 @@ static bool ref_dot4_enabled() {
 }
 
 static bool ref_neon_dot_enabled() {
+#if ASCEND_REF_HAVE_NEON
+    static const bool enabled = env_flag_enabled("ASCEND_REF_NEON_DOT", true);
+#else
     static const bool enabled = env_flag_enabled("ASCEND_REF_NEON_DOT", false);
+#endif
     return enabled;
 }
 
@@ -1964,24 +1978,58 @@ struct AscendEngine {
         std::vector<unsigned char>& raw) {
         const size_t dtype_bytes = dtype_size_from_string(dtype);
         raw.resize(x.size() * dtype_bytes);
-        for (size_t i = 0; i < x.size(); ++i) {
-            store_scalar(raw.data() + i * dtype_bytes, dtype, x[i]);
+        if (dtype == "BF16") {
+            uint16_t* out = reinterpret_cast<uint16_t*>(raw.data());
+            for (size_t i = 0; i < x.size(); ++i) out[i] = float_to_bf16(x[i]);
+            return;
         }
+        if (dtype == "F16") {
+            uint16_t* out = reinterpret_cast<uint16_t*>(raw.data());
+            for (size_t i = 0; i < x.size(); ++i) out[i] = float_to_f16(x[i]);
+            return;
+        }
+        if (dtype == "F32") {
+            std::memcpy(raw.data(), x.data(), raw.size());
+            return;
+        }
+        for (size_t i = 0; i < x.size(); ++i) store_scalar(raw.data() + i * dtype_bytes, dtype, x[i]);
+    }
+
+    static std::vector<float> raw_to_float_vector(
+        const unsigned char* raw,
+        size_t raw_bytes,
+        const std::string& dtype,
+        size_t elements) {
+        const size_t dtype_bytes = dtype_size_from_string(dtype);
+        if (raw_bytes != elements * dtype_bytes) {
+            throw std::runtime_error("raw_to_float_vector byte size mismatch");
+        }
+        std::vector<float> out(elements);
+        if (dtype == "BF16") {
+            const uint16_t* in = reinterpret_cast<const uint16_t*>(raw);
+            for (size_t i = 0; i < elements; ++i) out[i] = bf16_to_float(in[i]);
+            return out;
+        }
+        if (dtype == "F16") {
+            const uint16_t* in = reinterpret_cast<const uint16_t*>(raw);
+            for (size_t i = 0; i < elements; ++i) out[i] = f16_to_float(in[i]);
+            return out;
+        }
+        if (dtype == "F32") {
+            std::memcpy(out.data(), raw, raw_bytes);
+            return out;
+        }
+        for (size_t i = 0; i < elements; ++i) {
+            out[i] = load_scalar(raw + i * dtype_bytes, dtype);
+        }
+        return out;
     }
 
     static std::vector<float> raw_to_float_vector(
         const std::vector<unsigned char>& raw,
         const std::string& dtype,
         size_t elements) {
-        const size_t dtype_bytes = dtype_size_from_string(dtype);
-        if (raw.size() != elements * dtype_bytes) {
-            throw std::runtime_error("raw_to_float_vector byte size mismatch");
-        }
-        std::vector<float> out(elements);
-        for (size_t i = 0; i < elements; ++i) {
-            out[i] = load_scalar(raw.data() + i * dtype_bytes, dtype);
-        }
-        return out;
+        return raw_to_float_vector(raw.data(), raw.size(), dtype, elements);
     }
 
     static void check_aclnn_status(int ret, const std::string& label) {
@@ -2469,9 +2517,9 @@ struct AscendEngine {
                           "aclrtMemcpy(D2H ACLNN fused QKV)");
                 const size_t q_raw_bytes = hidden * dtype_bytes;
                 const size_t kv_raw_bytes = kv_dim * dtype_bytes;
-                raw_q.assign(raw_all.data(), raw_all.data() + q_raw_bytes);
-                raw_k.assign(raw_all.data() + q_raw_bytes, raw_all.data() + q_raw_bytes + kv_raw_bytes);
-                raw_v.assign(raw_all.data() + q_raw_bytes + kv_raw_bytes, raw_all.data() + raw_all.size());
+                q = raw_to_float_vector(raw_all.data(), q_raw_bytes, dtype, hidden);
+                k = raw_to_float_vector(raw_all.data() + q_raw_bytes, kv_raw_bytes, dtype, kv_dim);
+                v = raw_to_float_vector(raw_all.data() + q_raw_bytes + kv_raw_bytes, kv_raw_bytes, dtype, kv_dim);
             } else {
                 raw_q.resize(hidden * dtype_bytes);
                 raw_k.resize(kv_dim * dtype_bytes);
@@ -2482,10 +2530,10 @@ struct AscendEngine {
                           "aclrtMemcpy(D2H ACLNN QKV k)");
                 check_acl(aclrtMemcpy(raw_v.data(), raw_v.size(), d_qkv_v, raw_v.size(), ACL_MEMCPY_DEVICE_TO_HOST),
                           "aclrtMemcpy(D2H ACLNN QKV v)");
+                q = raw_to_float_vector(raw_q, dtype, hidden);
+                k = raw_to_float_vector(raw_k, dtype, kv_dim);
+                v = raw_to_float_vector(raw_v, dtype, kv_dim);
             }
-            q = raw_to_float_vector(raw_q, dtype, hidden);
-            k = raw_to_float_vector(raw_k, dtype, kv_dim);
-            v = raw_to_float_vector(raw_v, dtype, kv_dim);
             if (q_bias) {
                 for (size_t i = 0; i < hidden; ++i) q[i] += (*q_bias)[i];
             }
@@ -2976,12 +3024,12 @@ struct AscendEngine {
         float first_after = 0.0f;
         for (int tok = 0; tok < len; ++tok) {
             unsigned char* row = h_hidden.data() + static_cast<size_t>(tok) * hidden_row_bytes;
-            double sum_sq = 0.0;
+            float sum_sq = 0.0f;
             for (size_t j = 0; j < hidden; ++j) {
                 const float x = load_scalar(row + j * hidden_dtype_bytes, hidden_meta.dtype);
-                sum_sq += static_cast<double>(x) * static_cast<double>(x);
+                sum_sq += x * x;
             }
-            const float scale = 1.0f / std::sqrt(static_cast<float>(sum_sq / hidden) + config.rms_norm_eps);
+            const float scale = 1.0f / std::sqrt(sum_sq / static_cast<float>(hidden) + config.rms_norm_eps);
             for (size_t j = 0; j < hidden; ++j) {
                 const float x = load_scalar(row + j * hidden_dtype_bytes, hidden_meta.dtype);
                 const float w = load_scalar(h_norm.data() + j * norm_dtype_bytes, norm->meta.dtype);
@@ -3259,13 +3307,13 @@ struct AscendEngine {
                     max_score = std::max(max_score, score);
                 }
 
-                double denom = 0.0;
+                float denom = 0.0f;
                 for (int tok = 0; tok < seq_len; ++tok) {
                     float& s = scores[static_cast<size_t>(tok)];
                     s = std::exp(s - max_score);
                     denom += s;
                 }
-                const float inv_denom = denom > 0.0 ? static_cast<float>(1.0 / denom) : 0.0f;
+                const float inv_denom = denom > 0.0f ? 1.0f / denom : 0.0f;
 
                 float* out = ctx.data() + static_cast<size_t>(h) * static_cast<size_t>(head_dim);
                 std::fill(out, out + head_dim, 0.0f);
@@ -3471,9 +3519,9 @@ struct AscendEngine {
 
     void rms_norm_inplace(std::vector<float>& x, const std::vector<float>& weight) const {
         if (x.size() != weight.size()) throw std::runtime_error("RMSNorm vector size mismatch");
-        double sum_sq = 0.0;
-        for (float v : x) sum_sq += static_cast<double>(v) * static_cast<double>(v);
-        const float scale = 1.0f / std::sqrt(static_cast<float>(sum_sq / x.size()) + config.rms_norm_eps);
+        float sum_sq = 0.0f;
+        for (float v : x) sum_sq += v * v;
+        const float scale = 1.0f / std::sqrt(sum_sq / static_cast<float>(x.size()) + config.rms_norm_eps);
         for (size_t i = 0; i < x.size(); ++i) x[i] = x[i] * scale * weight[i];
     }
 
@@ -3886,7 +3934,7 @@ struct AscendEngine {
         const std::vector<float>* bv = optional_cached_weight_float_ref(bv_name);
 
         std::vector<float> residual = x;
-        std::vector<float> qkv_in = x;
+        std::vector<float> qkv_in = std::move(x);
         auto norm1_0 = Clock::now();
         rms_norm_inplace(qkv_in, ln1);
         auto norm1_1 = Clock::now();
@@ -4289,14 +4337,14 @@ struct AscendEngine {
                   "aclrtMemcpy(D2H final norm for decode)");
 
         std::vector<float> x(hidden);
-        double sum_sq = 0.0;
+        float sum_sq = 0.0f;
         for (size_t j = 0; j < hidden; ++j) {
             const float v = load_scalar(h_hidden.data() + j * hidden_dtype_bytes, hidden_meta.dtype);
             x[j] = v;
-            sum_sq += static_cast<double>(v) * static_cast<double>(v);
+            sum_sq += v * v;
         }
 
-        const float scale = 1.0f / std::sqrt(static_cast<float>(sum_sq / hidden) + config.rms_norm_eps);
+        const float scale = 1.0f / std::sqrt(sum_sq / static_cast<float>(hidden) + config.rms_norm_eps);
         for (size_t j = 0; j < hidden; ++j) {
             const float w = load_scalar(h_norm.data() + j * norm_dtype_bytes, norm.meta.dtype);
             x[j] = x[j] * scale * w;

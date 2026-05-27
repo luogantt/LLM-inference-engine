@@ -4,7 +4,8 @@ ASCEND_CXX ?= g++
 ASCEND_HOME ?= /usr/local/Ascend/ascend-toolkit/latest
 
 COMMON_FLAGS = -O3 -std=c++17 -lineinfo
-ASCEND_FLAGS = -O3 -std=c++17 -fPIC -pthread
+ASCEND_OPT_FLAGS ?= -O3 -march=native -ffast-math -funroll-loops
+ASCEND_FLAGS = $(ASCEND_OPT_FLAGS) -std=c++17 -fPIC -pthread
 
 .RECIPEPREFIX := >
 
