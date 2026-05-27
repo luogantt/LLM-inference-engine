@@ -282,3 +282,125 @@ python python_infer.py \
 ## 说明
 
 这个项目偏研究和实验性质，重点是理解并优化单 batch decode 路径。CUDA 后续方向包括 CUDA Graph、decode GEMV / MLP 重写、量化和 speculative decoding；Ascend 后续方向包括 AscendC fused attention、KV cache 常驻 NPU、减少 host-device 同步和更完整的算子融合。
+## Ascend-super complete inference command
+
+This is the recommended command for the `Ascend-super` branch and the
+`ascend-super-38tok` performance path. It enables the current fused QKV and
+fused MLP gate/up paths.
+
+```bash
+cd ~/LLM-inference-engine
+
+git fetch origin --tags
+git checkout Ascend-super
+git pull --ff-only origin Ascend-super
+
+make -f Makefile.cuda_lib clean-lib
+make -f Makefile.cuda_lib lib-ascend ASCEND_HOME=/usr/local/Ascend/cann-8.5.1
+
+mkdir -p ~/ascend/log
+
+export ASCEND_VISIBLE_DEVICES=4
+export ASCEND_DEVICE_ID=0
+
+export ASCEND_LOAD_WEIGHTS=all
+export ASCEND_WEIGHT_LOAD_LOG=0
+export ASCEND_HOST_RAW_CACHE=0
+
+export ASCEND_RUN_EMBED=1
+export ASCEND_DIRECT_DECODE=all_layers_ref
+
+export ASCEND_REF_CACHE_WEIGHTS=1
+export ASCEND_REF_CACHE_LOG=0
+export ASCEND_REF_KV_CACHE=1
+export ASCEND_REF_U16_WEIGHTS=1
+
+export ASCEND_REF_FAST_DOT=1
+export ASCEND_REF_DOT4=0
+export ASCEND_REF_NEON_DOT=0
+
+export ASCEND_ATTN_BACKEND=cpu
+
+export ASCEND_QKV_BACKEND=aclnn
+export ASCEND_QKV_FUSE_WEIGHTS=1
+export ASCEND_QKV_FALLBACK=0
+export ASCEND_QKV_LOG=0
+
+export ASCEND_MLP_BACKEND=aclnn
+export ASCEND_MLP_FUSE_GATE_UP=1
+export ASCEND_MLP_FALLBACK=0
+export ASCEND_MLP_LOG=0
+
+export ASCEND_ATTN_PROJ_BACKEND=aclnn
+export ASCEND_ATTN_PROJ_FALLBACK=0
+export ASCEND_ATTN_PROJ_LOG=0
+
+export ASCEND_LM_HEAD_BACKEND=aclnn
+export ASCEND_LM_HEAD_FALLBACK=0
+export ASCEND_LM_HEAD_LOG=0
+
+export ASCEND_ACLNN_CUBE_MATH_TYPE=0
+
+export ASCEND_REF_LINEAR_THREADS=16
+export ASCEND_REF_ATTN_LINEAR_THREADS=16
+export ASCEND_REF_ATTN_THREADS=16
+export ASCEND_REF_ATTN_THREAD_MIN_SEQ=32
+export ASCEND_REF_MLP_THREADS=24
+export ASCEND_REF_DOWN_THREADS=24
+export ASCEND_LM_HEAD_THREADS=16
+
+export ASCEND_REF_PROFILE_LAYERS=0
+export ASCEND_REF_PROFILE_TOKEN_LIMIT=0
+
+python python_infer.py \
+  --model ./deepseek-r1-7b \
+  --lib ./build/libllm_ascend.so \
+  --prompt "黑格尔的哲学思想可以概括为" \
+  --max-new-tokens 128 \
+  --max-seq 800 \
+  --tokenizer-backend tokenizers \
+  --no-chat-template \
+  2>&1 | tee ascend_super_fused_128.log
+```
+
+To verify that the fused paths are active, run a short check with logs enabled:
+
+```bash
+export ASCEND_QKV_LOG=1
+export ASCEND_MLP_LOG=1
+
+python python_infer.py \
+  --model ./deepseek-r1-7b \
+  --lib ./build/libllm_ascend.so \
+  --prompt "黑格尔的哲学思想可以概括为" \
+  --max-new-tokens 16 \
+  --max-seq 800 \
+  --tokenizer-backend tokenizers \
+  --no-chat-template \
+  2>&1 | tee ascend_super_fused_check.log
+
+grep "ACLNN fused QKV path active" ascend_super_fused_check.log | head
+grep "ACLNN MLP path active" ascend_super_fused_check.log | head
+```
+
+Expected log markers:
+
+```text
+weight_fusion=1, mm_ops=1
+gate_up_fusion=1, gate_up_mm_ops=1
+```
+
+For performance testing, turn the logs back off:
+
+```bash
+export ASCEND_QKV_LOG=0
+export ASCEND_MLP_LOG=0
+
+grep "decode all_layers_ref finished" ascend_super_fused_128.log | tail -20
+```
+
+Speed conversion:
+
+```text
+tok/s = 1000 / elapsed_ms
+```
