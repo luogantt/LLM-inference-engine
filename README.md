@@ -16,12 +16,14 @@
 
 ```bash
 make -f Makefile.cuda_lib lib A=sm_80
+
 CUDA_VISIBLE_DEVICES=4 python python_infer.py \
   --model /data3/ledi/models/DeepSeek-R1-Distill-Qwen-7B \
   --lib ./build/libllm_cuda.so \
   --prompt "你好 deepseek 介绍一下黑格尔的思想" \
   --max-new-tokens 512 \
-  --max-seq 800
+  --max-seq 800 \
+  --no-chat-template
 ```
 
 ## 当前性能
@@ -60,6 +62,12 @@ log.txt                              性能记录
 ## 说明
 
 这个项目偏研究和实验性质，重点是理解并优化单 batch decode 路径。后续如果继续提高速度，主要方向是 CUDA Graph、decode GEMV / MLP 重写、量化和 speculative decoding。
+
+## DeepSeek-V4-Flash A800 适配
+
+`cuda_A800_deepseekv4` 分支新增 DeepSeek-V4-Flash 官方 PyTorch/CUDA 推理入口 [python_infer_deepseek_v4_flash.py](./python_infer_deepseek_v4_flash.py)，用于权重转换、A800 多卡 `torchrun` 推理和性能测速。
+
+完整说明见 [DEEPSEEK_V4_FLASH_ADAPTATION.md](./DEEPSEEK_V4_FLASH_ADAPTATION.md)。
 
 ## Model Download
 
