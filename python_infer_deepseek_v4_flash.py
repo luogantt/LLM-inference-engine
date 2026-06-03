@@ -112,6 +112,12 @@ def run_inference(args: argparse.Namespace) -> None:
         if a800_fast_decode_moe_value == ""
         else a800_fast_decode_moe_value in {"1", "true", "yes", "on"}
     )
+    a800_bf16_moe_reduce_value = os.getenv("A800_BF16_MOE_REDUCE", "").strip().lower()
+    a800_bf16_moe_reduce = (
+        a800_force_dequant
+        if a800_bf16_moe_reduce_value == ""
+        else a800_bf16_moe_reduce_value in {"1", "true", "yes", "on"}
+    )
 
     if model_args.scale_dtype == "fp32" or a800_force_dequant:
         import torch.nn as nn
@@ -148,6 +154,11 @@ def run_inference(args: argparse.Namespace) -> None:
         print(
             "[A800 compat] A800_FAST_DECODE_MOE=1, "
             "single-token decode scans selected top-k experts only"
+        )
+    if a800_bf16_moe_reduce:
+        print(
+            "[A800 compat] A800_BF16_MOE_REDUCE=1, "
+            "MoE routed output accumulates and all-reduces in BF16"
         )
 
     torch.set_default_device("cuda")

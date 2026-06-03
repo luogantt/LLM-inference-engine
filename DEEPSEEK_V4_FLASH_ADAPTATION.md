@@ -384,6 +384,14 @@ export A800_FAST_DECODE_MOE=1
 
 If `A800_FAST_DECODE_MOE` is unset, it is enabled automatically when `A800_FORCE_DEQUANT_GEMM=1`. Use `A800_FAST_DECODE_MOE=0` for A/B comparison.
 
+MoE routed output can also accumulate and all-reduce in BF16 instead of FP32. This cuts the per-layer routed all-reduce bandwidth in half on A800. It changes accumulation precision, so keep it as an A/B switch:
+
+```bash
+export A800_BF16_MOE_REDUCE=1
+```
+
+If `A800_BF16_MOE_REDUCE` is unset, it is enabled automatically when `A800_FORCE_DEQUANT_GEMM=1`. Use `A800_BF16_MOE_REDUCE=0` if you want the original FP32 routed MoE accumulation.
+
 建议先单独测试 FFN 开关，不要同时打开 FP4 LRU cache，避免性能归因混在一起：
 
 ```bash
@@ -395,5 +403,6 @@ export A800_DEQUANT_DTYPE=bf16
 export A800_USE_CUDA_FP4_GEMM=1
 export A800_USE_CUDA_FP4_FFN=1
 export A800_FAST_DECODE_MOE=1
+export A800_BF16_MOE_REDUCE=1
 export A800_CUDA_LIB=./build/libdeepseek_v4_a800.so
 ```

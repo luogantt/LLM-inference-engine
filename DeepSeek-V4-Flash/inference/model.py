@@ -61,6 +61,13 @@ def _a800_fast_decode_moe() -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _a800_bf16_moe_reduce() -> bool:
+    value = os.getenv("A800_BF16_MOE_REDUCE")
+    if value is None or value.strip() == "":
+        return _a800_force_dequant_gemm()
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _a800_fp4_cache_limit_bytes() -> int:
     if not _a800_cache_fp4_weight():
         return 0
@@ -1134,7 +1141,8 @@ class MoE(nn.Module):
         shape = x.size()
         x = x.view(-1, self.dim)
         weights, indices = self.gate(x, input_ids.flatten())
-        y = torch.zeros_like(x, dtype=torch.float32)
+        moe_accum_dtype = x.dtype if _a800_bf16_moe_reduce() else torch.float32
+        y = torch.zeros_like(x, dtype=moe_accum_dtype)
 
         if _a800_fast_decode_moe() and x.size(0) == 1:
             for top, expert_id in enumerate(indices[0].tolist()):
