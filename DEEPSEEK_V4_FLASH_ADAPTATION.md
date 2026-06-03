@@ -260,6 +260,9 @@ export A800_DEQUANT_DTYPE=bf16
 ```text
 FP8 dense linear: FP8 weight + block scale -> BF16/FP16 dequant -> F.linear/cuBLAS
 FP4 expert linear: FP4 packed weight + per-32 scale -> BF16/FP16 dequant -> F.linear/cuBLAS
+HC split/sinkhorn: TileLang kernel -> PyTorch fallback
+Sparse attention: TileLang kernel -> PyTorch fallback
+Activation quant simulation: skipped by default on A800 fallback
 ```
 
 这个路径的目标是先让 A800 跑通 DeepSeek-V4-Flash，不追求官方 Flash kernel 的速度。真正要快，需要把 FP8/FP4 unpack、scale 和 GEMM 融合成 A800(sm80) 专用 CUDA kernel。
@@ -297,3 +300,11 @@ export A800_DEQUANT_CACHE=1
 ```
 
 注意：这个缓存会显著增加显存占用，建议先用 `--max-new-tokens 1` 验证通过后再测试。
+
+如果需要保留 attention/indexer 里的 activation quant simulation，可以额外开启：
+
+```bash
+export A800_KEEP_ACT_QUANT=1
+```
+
+默认不建议开启，因为它会重新进入 TileLang FP8/FP4 quant kernel。

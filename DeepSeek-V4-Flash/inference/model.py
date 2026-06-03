@@ -35,6 +35,10 @@ def _a800_cache_dequant_weight() -> bool:
     return _env_flag("A800_DEQUANT_CACHE")
 
 
+def _a800_keep_act_quant() -> bool:
+    return _env_flag("A800_KEEP_ACT_QUANT")
+
+
 def _a800_dequant_dtype() -> torch.dtype:
     value = os.getenv("A800_DEQUANT_DTYPE", "bf16").strip().lower()
     if value in {"fp16", "float16", "half"}:
@@ -94,6 +98,58 @@ def _dequantize_fp8_weight(weight: torch.Tensor) -> torch.Tensor:
     if _a800_cache_dequant_weight():
         weight._a800_dequant_cache = dequant
     return dequant
+
+
+def _torch_hc_split_sinkhorn(
+    mixes: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    hc_mult: int = 4,
+    sinkhorn_iters: int = 20,
+    eps: float = 1e-6,
+):
+    pre_logits = mixes[..., :hc_mult]
+    post_logits = mixes[..., hc_mult:2 * hc_mult]
+    comb_logits = mixes[..., 2 * hc_mult:].view(*mixes.shape[:-1], hc_mult, hc_mult)
+    comb_base = hc_base[2 * hc_mult:].view(hc_mult, hc_mult)
+
+    pre = torch.sigmoid(pre_logits * hc_scale[0] + hc_base[:hc_mult]) + eps
+    post = 2 * torch.sigmoid(post_logits * hc_scale[1] + hc_base[hc_mult:2 * hc_mult])
+    comb = (comb_logits * hc_scale[2] + comb_base).softmax(dim=-1) + eps
+    comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
+    for _ in range(max(sinkhorn_iters - 1, 0)):
+        comb = comb / (comb.sum(dim=-1, keepdim=True) + eps)
+        comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
+    return pre, post, comb
+
+
+def _torch_sparse_attn(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    attn_sink: torch.Tensor,
+    topk_idxs: torch.Tensor,
+    softmax_scale: float,
+) -> torch.Tensor:
+    bsz, seqlen, n_heads, _ = q.shape
+    out = torch.empty_like(q)
+    qf = q.float()
+    kvf = kv.float()
+    sink = attn_sink.float()
+    for b_idx in range(bsz):
+        for s_idx in range(seqlen):
+            idx = topk_idxs[b_idx, s_idx]
+            idx = idx[idx >= 0]
+            if idx.numel() == 0:
+                out[b_idx, s_idx].zero_()
+                continue
+            kv_sel = kvf[b_idx, idx]
+            scores = torch.matmul(qf[b_idx, s_idx], kv_sel.transpose(0, 1)) * softmax_scale
+            max_score = torch.maximum(scores.max(dim=-1, keepdim=True).values, sink[:, None])
+            score_exp = torch.exp(scores - max_score)
+            sink_exp = torch.exp(sink[:, None] - max_score)
+            denom = score_exp.sum(dim=-1, keepdim=True) + sink_exp
+            out[b_idx, s_idx] = torch.matmul(score_exp / denom, kv_sel).to(q.dtype)
+    return out
 
 
 def _dequantize_fp4_weight(weight: torch.Tensor) -> torch.Tensor:
@@ -464,7 +520,9 @@ class Compressor(nn.Module):
         else:
             freqs_cis = self.freqs_cis[start_pos + 1 - self.compress_ratio].unsqueeze(0)
         apply_rotary_emb(kv[..., -rd:], freqs_cis)
-        if self.rotate:
+        if _a800_force_dequant_gemm() and not _a800_keep_act_quant():
+            pass
+        elif self.rotate:
             kv = rotate_activation(kv)
             fp4_act_quant(kv, fp4_block_size, True)
         else:
@@ -512,7 +570,8 @@ class Indexer(torch.nn.Module):
         apply_rotary_emb(q[..., -rd:], freqs_cis)
         q = rotate_activation(q)
         # use fp4 simulation for q and kv in indexer
-        fp4_act_quant(q, fp4_block_size, True)
+        if not (_a800_force_dequant_gemm() and not _a800_keep_act_quant()):
+            fp4_act_quant(q, fp4_block_size, True)
         self.compressor(x, start_pos)
         weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads ** -0.5)
         # We performed QAT here, kv could also use fp8 format, though current implementation uses bf16
@@ -602,7 +661,8 @@ class Attention(nn.Module):
         kv = self.kv_norm(kv)
         apply_rotary_emb(kv[..., -rd:], freqs_cis)
         # FP8-simulate non-rope dims to match QAT; rope dims stay bf16 for positional precision
-        act_quant(kv[..., :-rd], 64, scale_fmt, scale_dtype, True)
+        if not (_a800_force_dequant_gemm() and not _a800_keep_act_quant()):
+            act_quant(kv[..., :-rd], 64, scale_fmt, scale_dtype, True)
         topk_idxs = get_window_topk_idxs(win, bsz, seqlen, start_pos)
         if self.compress_ratio:
             offset = kv.size(1) if start_pos == 0 else win
@@ -624,12 +684,18 @@ class Attention(nn.Module):
                 if (kv_compress := self.compressor(x, start_pos)) is not None:
                     kv = torch.cat([kv, kv_compress], dim=1)
             # We performed QAT here, kv could also use fp8 format, though current implementation uses bf16
-            o = sparse_attn(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
+            if _a800_force_dequant_gemm():
+                o = _torch_sparse_attn(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
+            else:
+                o = sparse_attn(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
         else:
             self.kv_cache[:bsz, start_pos % win] = kv.squeeze(1)
             if self.compress_ratio:
                 self.compressor(x, start_pos)
-            o = sparse_attn(q, self.kv_cache[:bsz], self.attn_sink, topk_idxs, self.softmax_scale)
+            if _a800_force_dequant_gemm():
+                o = _torch_sparse_attn(q, self.kv_cache[:bsz], self.attn_sink, topk_idxs, self.softmax_scale)
+            else:
+                o = sparse_attn(q, self.kv_cache[:bsz], self.attn_sink, topk_idxs, self.softmax_scale)
         apply_rotary_emb(o[..., -rd:], freqs_cis, True)
 
         # o
@@ -775,7 +841,10 @@ class Block(nn.Module):
         x = x.flatten(2).float()
         rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)
         mixes = F.linear(x, hc_fn) * rsqrt
-        pre, post, comb = hc_split_sinkhorn(mixes, hc_scale, hc_base, self.hc_mult, self.hc_sinkhorn_iters, self.hc_eps)
+        if _a800_force_dequant_gemm():
+            pre, post, comb = _torch_hc_split_sinkhorn(mixes, hc_scale, hc_base, self.hc_mult, self.hc_sinkhorn_iters, self.hc_eps)
+        else:
+            pre, post, comb = hc_split_sinkhorn(mixes, hc_scale, hc_base, self.hc_mult, self.hc_sinkhorn_iters, self.hc_eps)
         y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=2)
         return y.to(dtype), post, comb
 
