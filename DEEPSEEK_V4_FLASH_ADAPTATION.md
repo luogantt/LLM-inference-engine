@@ -376,6 +376,8 @@ kernel 2: w2 FP4 unpack/scale/dot -> BF16 output
 
 `gate_f32` is no longer materialized on the Python side; the legacy C ABI slot is passed as null for compatibility.
 
+Newer `.so` builds also expose `ds_v4_fp4_expert_ffn_accum_f32`. In single-token fast MoE decode, this lets the `w2` kernel accumulate directly into the FP32 MoE output buffer and skips the temporary BF16 expert output tensor plus the Python `y += expert(...)` add. Rebuild `build/libdeepseek_v4_a800.so` after pulling this change; older `.so` files automatically fall back to the previous path. Use `A800_USE_CUDA_FP4_ACCUM=0` to disable this direct-accum path for A/B testing.
+
 Decode MoE dispatch can also skip the full local expert scan. DeepSeek-V4-Flash routes only top-k experts per token (`n_activated_experts=6`), while each A800 rank owns 64 local experts under 4-way tensor parallelism. For single-token decode, the A800 path can iterate only the selected top-k expert ids:
 
 ```bash
@@ -412,6 +414,7 @@ export A800_FORCE_DEQUANT_GEMM=1
 export A800_DEQUANT_DTYPE=bf16
 export A800_USE_CUDA_FP4_GEMM=1
 export A800_USE_CUDA_FP4_FFN=1
+export A800_USE_CUDA_FP4_ACCUM=1
 export A800_FAST_DECODE_MOE=1
 export A800_BF16_MOE_REDUCE=0
 export A800_CUDA_LIB=./build/libdeepseek_v4_a800.so

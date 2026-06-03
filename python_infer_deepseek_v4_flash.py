@@ -106,6 +106,12 @@ def run_inference(args: argparse.Namespace) -> None:
     a800_force_dequant = os.getenv("A800_FORCE_DEQUANT_GEMM", "").strip().lower() in {"1", "true", "yes", "on"}
     a800_cuda_fp4 = os.getenv("A800_USE_CUDA_FP4_GEMM", "").strip().lower() in {"1", "true", "yes", "on"}
     a800_cuda_fp4_ffn = os.getenv("A800_USE_CUDA_FP4_FFN", "").strip().lower() in {"1", "true", "yes", "on"}
+    a800_cuda_fp4_accum_value = os.getenv("A800_USE_CUDA_FP4_ACCUM", "").strip().lower()
+    a800_cuda_fp4_accum = (
+        True
+        if a800_cuda_fp4_accum_value == ""
+        else a800_cuda_fp4_accum_value in {"1", "true", "yes", "on"}
+    )
     a800_fast_decode_moe_value = os.getenv("A800_FAST_DECODE_MOE", "").strip().lower()
     a800_fast_decode_moe = (
         a800_force_dequant
@@ -148,8 +154,10 @@ def run_inference(args: argparse.Namespace) -> None:
         print(
             "[A800 compat] A800_USE_CUDA_FP4_FFN=1, "
             "trying CUDA .so two-kernel FP4 expert FFN path "
-            f"(fused w1+w3, then w2): {os.getenv('A800_CUDA_LIB', './build/libdeepseek_v4_a800.so')}"
+            f"(fused w1+w3, then w2; direct FP32 MoE accum if available): {os.getenv('A800_CUDA_LIB', './build/libdeepseek_v4_a800.so')}"
         )
+    if a800_cuda_fp4_ffn and a800_cuda_fp4_accum:
+        print("[A800 compat] A800_USE_CUDA_FP4_ACCUM=1, direct FP32 MoE accumulation is enabled")
     if a800_fast_decode_moe:
         print(
             "[A800 compat] A800_FAST_DECODE_MOE=1, "

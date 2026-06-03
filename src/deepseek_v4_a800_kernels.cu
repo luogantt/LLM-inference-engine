@@ -96,6 +96,63 @@ __global__ void fp4_dequant_gemm_bf16_kernel(
     }
 }
 
+__global__ void fp4_dequant_gemm_accum_f32_kernel(
+    const __nv_bfloat16* __restrict__ x,
+    const uint8_t* __restrict__ packed_w,
+    const float* __restrict__ scales,
+    float* __restrict__ y_accum,
+    int tokens,
+    int in_dim,
+    int out_dim,
+    int scale_rows,
+    int scale_cols,
+    int group_size
+) {
+    int out_idx = blockIdx.x;
+    int token_idx = blockIdx.y;
+    int tid = threadIdx.x;
+
+    extern __shared__ float smem[];
+    float acc = 0.0f;
+
+    const __nv_bfloat16* x_row = x + token_idx * in_dim;
+    const uint8_t* w_row = packed_w + out_idx * (in_dim / 2);
+
+    int scale_row = out_idx;
+    if (scale_rows != out_dim) {
+        scale_row = out_idx / group_size;
+        if (scale_row >= scale_rows) {
+            scale_row = scale_rows - 1;
+        }
+    }
+
+    for (int k = tid; k < in_dim; k += blockDim.x) {
+        uint8_t packed = w_row[k >> 1];
+        uint8_t nibble = (k & 1) ? ((packed >> 4) & 0x0F) : (packed & 0x0F);
+        int scale_col = k / group_size;
+        if (scale_col >= scale_cols) {
+            scale_col = scale_cols - 1;
+        }
+        float w = fp4_e2m1_to_float(nibble) * scales[scale_row * scale_cols + scale_col];
+        acc += __bfloat162float(x_row[k]) * w;
+    }
+
+    smem[tid] = acc;
+    __syncthreads();
+
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            smem[tid] += smem[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        float out = __bfloat162float(__float2bfloat16(smem[0]));
+        y_accum[token_idx * out_dim + out_idx] += out;
+    }
+}
+
 __global__ void fp4_expert_gate_up_fused_kernel(
     const __nv_bfloat16* __restrict__ x,
     const float* __restrict__ route,
@@ -318,6 +375,97 @@ extern "C" int ds_v4_fp4_expert_ffn_bf16(
         reinterpret_cast<const uint8_t*>(w2_fp4),
         reinterpret_cast<const float*>(s2_fp32),
         reinterpret_cast<__nv_bfloat16*>(y_bf16),
+        tokens,
+        inter_dim,
+        dim,
+        s2_rows,
+        s2_cols,
+        group_size
+    );
+
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        set_last_cuda_error(err);
+        return 5;
+    }
+    return 0;
+}
+
+extern "C" int ds_v4_fp4_expert_ffn_accum_f32(
+    const void* x_bf16,
+    const void* route_fp32,
+    const void* w1_fp4,
+    const void* s1_fp32,
+    const void* w2_fp4,
+    const void* s2_fp32,
+    const void* w3_fp4,
+    const void* s3_fp32,
+    void* hidden_bf16,
+    void* y_accum_f32,
+    int tokens,
+    int dim,
+    int inter_dim,
+    int s1_rows,
+    int s1_cols,
+    int s2_rows,
+    int s2_cols,
+    int s3_rows,
+    int s3_cols,
+    int group_size,
+    float swiglu_limit,
+    void* stream_ptr
+) {
+    set_last_error("");
+
+    if (!x_bf16 || !route_fp32 || !w1_fp4 || !s1_fp32 || !w2_fp4 || !s2_fp32 ||
+        !w3_fp4 || !s3_fp32 || !hidden_bf16 || !y_accum_f32) {
+        set_last_error("null pointer");
+        return 1;
+    }
+    if (tokens <= 0 || dim <= 0 || inter_dim <= 0 || group_size <= 0) {
+        set_last_error("invalid shape");
+        return 2;
+    }
+    if ((dim & 1) != 0 || (inter_dim & 1) != 0) {
+        set_last_error("dim and inter_dim must be even for packed fp4");
+        return 3;
+    }
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    constexpr int threads = 256;
+    size_t shared_bytes = threads * sizeof(float);
+    size_t shared_pair_bytes = threads * 2 * sizeof(float);
+
+    fp4_expert_gate_up_fused_kernel<<<dim3(inter_dim, tokens), threads, shared_pair_bytes, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x_bf16),
+        reinterpret_cast<const float*>(route_fp32),
+        reinterpret_cast<const uint8_t*>(w1_fp4),
+        reinterpret_cast<const float*>(s1_fp32),
+        reinterpret_cast<const uint8_t*>(w3_fp4),
+        reinterpret_cast<const float*>(s3_fp32),
+        reinterpret_cast<__nv_bfloat16*>(hidden_bf16),
+        tokens,
+        dim,
+        inter_dim,
+        s1_rows,
+        s1_cols,
+        s3_rows,
+        s3_cols,
+        group_size,
+        swiglu_limit
+    );
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        set_last_cuda_error(err);
+        return 4;
+    }
+
+    fp4_dequant_gemm_accum_f32_kernel<<<dim3(dim, tokens), threads, shared_bytes, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(hidden_bf16),
+        reinterpret_cast<const uint8_t*>(w2_fp4),
+        reinterpret_cast<const float*>(s2_fp32),
+        reinterpret_cast<float*>(y_accum_f32),
         tokens,
         inter_dim,
         dim,
