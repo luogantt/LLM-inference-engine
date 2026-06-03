@@ -1,4 +1,5 @@
 import math
+import os
 from dataclasses import dataclass
 from typing import Tuple, Optional, Literal
 from functools import lru_cache
@@ -19,6 +20,100 @@ fp4_block_size = 32
 default_dtype = torch.bfloat16
 scale_fmt = None
 scale_dtype = torch.float32
+_FP4_TABLE = None
+
+
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _a800_force_dequant_gemm() -> bool:
+    return _env_flag("A800_FORCE_DEQUANT_GEMM")
+
+
+def _a800_cache_dequant_weight() -> bool:
+    return _env_flag("A800_DEQUANT_CACHE")
+
+
+def _a800_dequant_dtype() -> torch.dtype:
+    value = os.getenv("A800_DEQUANT_DTYPE", "bf16").strip().lower()
+    if value in {"fp16", "float16", "half"}:
+        return torch.float16
+    if value in {"fp32", "float32"}:
+        return torch.float32
+    return torch.bfloat16
+
+
+def _to_dequant_dtype(x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    try:
+        return x.to(dtype)
+    except RuntimeError:
+        return x.float().to(dtype)
+
+
+def _get_fp4_table(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    global _FP4_TABLE
+    if _FP4_TABLE is None or _FP4_TABLE.device != device or _FP4_TABLE.dtype != dtype:
+        _FP4_TABLE = torch.tensor(
+            [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+             0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+            device=device,
+            dtype=dtype,
+        )
+    return _FP4_TABLE
+
+
+def _apply_k_block_scales(
+    weight: torch.Tensor,
+    scales: torch.Tensor,
+    group_size: int,
+) -> torch.Tensor:
+    out_features, in_features = weight.shape
+    for k_block in range(scales.size(1)):
+        start = k_block * group_size
+        end = min(start + group_size, in_features)
+        if start >= end:
+            break
+        block_scale = scales[:, k_block]
+        if block_scale.numel() != out_features:
+            block_scale = block_scale.repeat_interleave(group_size)[:out_features]
+        weight[:, start:end].mul_(block_scale[:, None])
+    return weight
+
+
+def _dequantize_fp8_weight(weight: torch.Tensor) -> torch.Tensor:
+    cache = getattr(weight, "_a800_dequant_cache", None)
+    if _a800_cache_dequant_weight() and cache is not None:
+        return cache
+
+    dtype = _a800_dequant_dtype()
+    dequant = _to_dequant_dtype(weight, dtype).contiguous()
+    scales = _to_dequant_dtype(weight.scale, dtype).contiguous()
+    dequant = _apply_k_block_scales(dequant, scales, block_size)
+
+    if _a800_cache_dequant_weight():
+        weight._a800_dequant_cache = dequant
+    return dequant
+
+
+def _dequantize_fp4_weight(weight: torch.Tensor) -> torch.Tensor:
+    cache = getattr(weight, "_a800_dequant_cache", None)
+    if _a800_cache_dequant_weight() and cache is not None:
+        return cache
+
+    dtype = _a800_dequant_dtype()
+    packed = weight.view(torch.uint8)
+    table = _get_fp4_table(weight.device, dtype)
+    low = packed & 0x0F
+    high = (packed >> 4) & 0x0F
+    dequant = torch.stack((table[low.long()], table[high.long()]), dim=-1)
+    dequant = dequant.reshape(weight.size(0), -1).contiguous()
+    scales = _to_dequant_dtype(weight.scale, dtype).contiguous()
+    dequant = _apply_k_block_scales(dequant, scales, fp4_block_size)
+
+    if _a800_cache_dequant_weight():
+        weight._a800_dequant_cache = dequant
+    return dequant
 
 
 @contextmanager
@@ -111,9 +206,13 @@ def linear(x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] =
     assert bias is None
 
     if weight.dtype == torch.float4_e2m1fn_x2:
+        if _a800_force_dequant_gemm():
+            return F.linear(x.to(_a800_dequant_dtype()), _dequantize_fp4_weight(weight)).type_as(x)
         x, s = act_quant(x, block_size, scale_fmt, scale_dtype)
         return fp4_gemm(x, s, weight, weight.scale, scale_dtype)
     elif weight.dtype == torch.float8_e4m3fn:
+        if _a800_force_dequant_gemm():
+            return F.linear(x.to(_a800_dequant_dtype()), _dequantize_fp8_weight(weight)).type_as(x)
         x, s = act_quant(x, block_size, scale_fmt, scale_dtype)
         return fp8_gemm(x, s, weight, weight.scale, scale_dtype)
     else:

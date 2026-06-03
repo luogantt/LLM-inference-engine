@@ -238,3 +238,62 @@ torchrun --nproc-per-node 4 python_infer_deepseek_v4_flash.py \
 10. Tokenizer：接入 `encoding_dsv4.py` 的 chat / thinking prompt 格式。
 
 第一阶段先用官方推理路径跑通 A800 多卡 baseline；第二阶段再逐个把热路径迁移到自研 CUDA kernel。
+
+## A800 FP8/FP4 fallback
+
+DeepSeek-V4-Flash 官方 TileLang FP8 GEMM 在 A800(sm80) 上会触发 SM89 FP8 MMA 路径断言，因此不能直接运行官方 Flash kernel：
+
+```text
+Attempting to use SM89_16x8x32_F32E4M3E4M3F32_TN without CUTE_ARCH_MMA_F32_SM89_ENABLED
+RuntimeError: CUDALaunch CUDA_ERROR_ASSERT
+```
+
+A800 需要单独实现 BF16/FP16 fallback 或自研 CUDA kernel。本分支新增一个保守兼容开关：
+
+```bash
+export A800_FORCE_DEQUANT_GEMM=1
+export A800_DEQUANT_DTYPE=bf16
+```
+
+开启后，`DeepSeek-V4-Flash/inference/model.py` 的 `linear()` 会绕过 TileLang `fp8_gemm/fp4_gemm`：
+
+```text
+FP8 dense linear: FP8 weight + block scale -> BF16/FP16 dequant -> F.linear/cuBLAS
+FP4 expert linear: FP4 packed weight + per-32 scale -> BF16/FP16 dequant -> F.linear/cuBLAS
+```
+
+这个路径的目标是先让 A800 跑通 DeepSeek-V4-Flash，不追求官方 Flash kernel 的速度。真正要快，需要把 FP8/FP4 unpack、scale 和 GEMM 融合成 A800(sm80) 专用 CUDA kernel。
+
+最小验证命令：
+
+```bash
+cd /data3/ledi/deepseekv4_engin/LLM-inference-engine
+
+export CUDA_HOME=/usr/local/cuda-12.4
+export PATH=$CUDA_HOME/bin:$PATH
+export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
+export TORCH_CUDA_ARCH_LIST="8.0"
+export A800_FORCE_DEQUANT_GEMM=1
+export A800_DEQUANT_DTYPE=bf16
+
+CUDA_VISIBLE_DEVICES=2,3,4,5 python -m torch.distributed.run \
+  --standalone \
+  --nproc-per-node 4 \
+  python_infer_deepseek_v4_flash.py \
+  --ckpt-path ../models/DeepSeek-V4-Flash-converted \
+  --config ../models/DeepSeek-V4-Flash/inference/config_a800_fp32scale.json \
+  --prompt "hello" \
+  --max-new-tokens 1 \
+  --max-seq-len 4096 \
+  --max-batch-size 1 \
+  --temperature 0 \
+  2>&1 | tee deepseek_v4_flash_a800_fallback_1tok.log
+```
+
+如果需要缓存反量化后的权重来减少重复开销，可以额外开启：
+
+```bash
+export A800_DEQUANT_CACHE=1
+```
+
+注意：这个缓存会显著增加显存占用，建议先用 `--max-new-tokens 1` 验证通过后再测试。

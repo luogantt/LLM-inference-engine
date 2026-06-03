@@ -71,6 +71,29 @@ log.txt                              性能记录
 
 ## Model Download
 
+## DeepSeek-V4-Flash A800 fallback
+
+A800(sm80) 不能直接运行 DeepSeek-V4-Flash 官方 TileLang SM89 FP8 GEMM kernel。本分支提供临时兼容路径：
+
+```bash
+export A800_FORCE_DEQUANT_GEMM=1
+export A800_DEQUANT_DTYPE=bf16
+
+CUDA_VISIBLE_DEVICES=2,3,4,5 python -m torch.distributed.run \
+  --standalone \
+  --nproc-per-node 4 \
+  python_infer_deepseek_v4_flash.py \
+  --ckpt-path ../models/DeepSeek-V4-Flash-converted \
+  --config ../models/DeepSeek-V4-Flash/inference/config_a800_fp32scale.json \
+  --prompt "hello" \
+  --max-new-tokens 1 \
+  --max-seq-len 4096 \
+  --max-batch-size 1 \
+  --temperature 0
+```
+
+该路径会把 FP8/FP4 权重按 block scale 反量化到 BF16/FP16，再走 `F.linear/cuBLAS`。它用于先跑通 A800，不等同于官方 Flash kernel 的速度。
+
 This repository includes `download_model.py` for downloading the HuggingFace safetensors model used by the engine. For China mainland networks, ModelScope is usually the fastest source:
 
 ```bash

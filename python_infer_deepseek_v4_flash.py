@@ -102,6 +102,30 @@ def run_inference(args: argparse.Namespace) -> None:
     tokenizer = AutoTokenizer.from_pretrained(ckpt_path)
     print("========== loading model ==========")
     load_model(model, str(shard), strict=False)
+
+    a800_force_dequant = os.getenv("A800_FORCE_DEQUANT_GEMM", "").strip().lower() in {"1", "true", "yes", "on"}
+
+    if model_args.scale_dtype == "fp32" or a800_force_dequant:
+        import torch.nn as nn
+
+        converted = 0
+        for module in model.modules():
+            scale = getattr(module, "scale", None)
+            weight = getattr(module, "weight", None)
+            if isinstance(scale, nn.Parameter) and scale.dtype != torch.float32:
+                new_scale = nn.Parameter(scale.detach().float(), requires_grad=False)
+                module.scale = new_scale
+                if weight is not None and hasattr(weight, "scale"):
+                    weight.scale = new_scale
+                converted += 1
+        print(f"[A800 compat] converted quant scales to fp32: {converted}")
+
+    if a800_force_dequant:
+        print(
+            "[A800 compat] A800_FORCE_DEQUANT_GEMM=1, "
+            "using BF16/FP16 dequantized F.linear fallback instead of TileLang FP8/FP4 GEMM"
+        )
+
     torch.set_default_device("cuda")
 
     prompts = load_prompts(args)
