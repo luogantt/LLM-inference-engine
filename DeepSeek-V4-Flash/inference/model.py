@@ -54,6 +54,13 @@ def _a800_use_cuda_fp4_ffn() -> bool:
     return _env_flag("A800_USE_CUDA_FP4_FFN")
 
 
+def _a800_fast_decode_moe() -> bool:
+    value = os.getenv("A800_FAST_DECODE_MOE")
+    if value is None or value.strip() == "":
+        return _a800_force_dequant_gemm()
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _a800_fp4_cache_limit_bytes() -> int:
     if not _a800_cache_fp4_weight():
         return 0
@@ -1128,6 +1135,17 @@ class MoE(nn.Module):
         x = x.view(-1, self.dim)
         weights, indices = self.gate(x, input_ids.flatten())
         y = torch.zeros_like(x, dtype=torch.float32)
+
+        if _a800_fast_decode_moe() and x.size(0) == 1:
+            for top, expert_id in enumerate(indices[0].tolist()):
+                if self.experts_start_idx <= expert_id < self.experts_end_idx:
+                    expert = self.experts[expert_id]
+                    y += expert(x, weights[:, top : top + 1])
+            if world_size > 1:
+                dist.all_reduce(y)
+            y += self.shared_experts(x)
+            return y.type_as(x).view(shape)
+
         counts = torch.bincount(indices.flatten(), minlength=self.n_routed_experts).tolist()
         for i in range(self.experts_start_idx, self.experts_end_idx):
             if counts[i] == 0:

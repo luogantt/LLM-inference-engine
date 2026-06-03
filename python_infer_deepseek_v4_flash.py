@@ -106,6 +106,12 @@ def run_inference(args: argparse.Namespace) -> None:
     a800_force_dequant = os.getenv("A800_FORCE_DEQUANT_GEMM", "").strip().lower() in {"1", "true", "yes", "on"}
     a800_cuda_fp4 = os.getenv("A800_USE_CUDA_FP4_GEMM", "").strip().lower() in {"1", "true", "yes", "on"}
     a800_cuda_fp4_ffn = os.getenv("A800_USE_CUDA_FP4_FFN", "").strip().lower() in {"1", "true", "yes", "on"}
+    a800_fast_decode_moe_value = os.getenv("A800_FAST_DECODE_MOE", "").strip().lower()
+    a800_fast_decode_moe = (
+        a800_force_dequant
+        if a800_fast_decode_moe_value == ""
+        else a800_fast_decode_moe_value in {"1", "true", "yes", "on"}
+    )
 
     if model_args.scale_dtype == "fp32" or a800_force_dequant:
         import torch.nn as nn
@@ -137,6 +143,11 @@ def run_inference(args: argparse.Namespace) -> None:
             "[A800 compat] A800_USE_CUDA_FP4_FFN=1, "
             "trying CUDA .so two-kernel FP4 expert FFN path "
             f"(fused w1+w3, then w2): {os.getenv('A800_CUDA_LIB', './build/libdeepseek_v4_a800.so')}"
+        )
+    if a800_fast_decode_moe:
+        print(
+            "[A800 compat] A800_FAST_DECODE_MOE=1, "
+            "single-token decode scans selected top-k experts only"
         )
 
     torch.set_default_device("cuda")
