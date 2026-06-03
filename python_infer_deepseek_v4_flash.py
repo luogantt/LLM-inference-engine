@@ -108,7 +108,7 @@ def run_inference(args: argparse.Namespace) -> None:
     a800_cuda_fp4_ffn = os.getenv("A800_USE_CUDA_FP4_FFN", "").strip().lower() in {"1", "true", "yes", "on"}
     a800_cuda_fp4_accum_value = os.getenv("A800_USE_CUDA_FP4_ACCUM", "").strip().lower()
     a800_cuda_fp4_accum = (
-        True
+        False
         if a800_cuda_fp4_accum_value == ""
         else a800_cuda_fp4_accum_value in {"1", "true", "yes", "on"}
     )

@@ -57,7 +57,7 @@ def _a800_use_cuda_fp4_ffn() -> bool:
 def _a800_use_cuda_fp4_accum() -> bool:
     value = os.getenv("A800_USE_CUDA_FP4_ACCUM")
     if value is None or value.strip() == "":
-        return True
+        return False
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
