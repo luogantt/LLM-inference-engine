@@ -64,7 +64,7 @@ def _a800_fast_decode_moe() -> bool:
 def _a800_bf16_moe_reduce() -> bool:
     value = os.getenv("A800_BF16_MOE_REDUCE")
     if value is None or value.strip() == "":
-        return _a800_force_dequant_gemm()
+        return False
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 

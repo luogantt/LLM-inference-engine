@@ -114,7 +114,7 @@ def run_inference(args: argparse.Namespace) -> None:
     )
     a800_bf16_moe_reduce_value = os.getenv("A800_BF16_MOE_REDUCE", "").strip().lower()
     a800_bf16_moe_reduce = (
-        a800_force_dequant
+        False
         if a800_bf16_moe_reduce_value == ""
         else a800_bf16_moe_reduce_value in {"1", "true", "yes", "on"}
     )
