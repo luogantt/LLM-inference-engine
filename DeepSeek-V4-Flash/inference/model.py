@@ -1,5 +1,6 @@
 import math
 import os
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Tuple, Optional, Literal
 from functools import lru_cache
@@ -21,6 +22,8 @@ default_dtype = torch.bfloat16
 scale_fmt = None
 scale_dtype = torch.float32
 _FP4_TABLE = None
+_A800_FP4_DEQUANT_CACHE = OrderedDict()
+_A800_FP4_DEQUANT_CACHE_BYTES = 0
 
 
 def _env_flag(name: str) -> bool:
@@ -37,6 +40,17 @@ def _a800_cache_dequant_weight() -> bool:
 
 def _a800_cache_fp4_weight() -> bool:
     return _env_flag("A800_DEQUANT_CACHE_FP4")
+
+
+def _a800_fp4_cache_limit_bytes() -> int:
+    if not _a800_cache_fp4_weight():
+        return 0
+    value = os.getenv("A800_DEQUANT_CACHE_FP4_MB", "4096").strip()
+    try:
+        mb = int(value)
+    except ValueError:
+        mb = 4096
+    return max(mb, 0) * 1024 * 1024
 
 
 def _a800_keep_act_quant() -> bool:
@@ -73,6 +87,45 @@ def _get_fp4_table(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
             dtype=dtype,
         )
     return _FP4_TABLE
+
+
+def _tensor_nbytes(x: torch.Tensor) -> int:
+    return x.numel() * x.element_size()
+
+
+def _a800_fp4_cache_get(weight: torch.Tensor) -> Optional[torch.Tensor]:
+    if _a800_fp4_cache_limit_bytes() <= 0:
+        return None
+    key = id(weight)
+    item = _A800_FP4_DEQUANT_CACHE.get(key)
+    if item is None:
+        return None
+    _A800_FP4_DEQUANT_CACHE.move_to_end(key)
+    return item[0]
+
+
+def _a800_fp4_cache_put(weight: torch.Tensor, dequant: torch.Tensor) -> None:
+    global _A800_FP4_DEQUANT_CACHE_BYTES
+
+    limit = _a800_fp4_cache_limit_bytes()
+    if limit <= 0:
+        return
+
+    nbytes = _tensor_nbytes(dequant)
+    if nbytes > limit:
+        return
+
+    key = id(weight)
+    old = _A800_FP4_DEQUANT_CACHE.pop(key, None)
+    if old is not None:
+        _A800_FP4_DEQUANT_CACHE_BYTES -= old[1]
+
+    _A800_FP4_DEQUANT_CACHE[key] = (dequant, nbytes)
+    _A800_FP4_DEQUANT_CACHE_BYTES += nbytes
+
+    while _A800_FP4_DEQUANT_CACHE_BYTES > limit and _A800_FP4_DEQUANT_CACHE:
+        _, (_, evicted_bytes) = _A800_FP4_DEQUANT_CACHE.popitem(last=False)
+        _A800_FP4_DEQUANT_CACHE_BYTES -= evicted_bytes
 
 
 def _apply_k_block_scales(
@@ -161,8 +214,8 @@ def _torch_sparse_attn(
 
 
 def _dequantize_fp4_weight(weight: torch.Tensor) -> torch.Tensor:
-    cache = getattr(weight, "_a800_dequant_cache", None)
-    if _a800_cache_fp4_weight() and cache is not None:
+    cache = _a800_fp4_cache_get(weight)
+    if cache is not None:
         return cache
 
     dtype = _a800_dequant_dtype()
@@ -175,8 +228,7 @@ def _dequantize_fp4_weight(weight: torch.Tensor) -> torch.Tensor:
     scales = _to_dequant_dtype(weight.scale, dtype).contiguous()
     dequant = _apply_k_block_scales(dequant, scales, fp4_block_size)
 
-    if _a800_cache_fp4_weight():
-        weight._a800_dequant_cache = dequant
+    _a800_fp4_cache_put(weight, dequant)
     return dequant
 
 

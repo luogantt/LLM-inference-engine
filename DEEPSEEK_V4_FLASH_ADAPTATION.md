@@ -302,13 +302,14 @@ export A800_DEQUANT_CACHE=1
 
 注意：这个缓存只缓存 dense FP8 权重，不缓存 FP4 expert 权重。FP4 expert 数量多，缓存成 BF16/FP16 后很容易把 A800 80GB 显存打满。
 
-如果明确想尝试缓存 FP4 expert 权重，可以额外开启：
+如果明确想尝试缓存 FP4 expert 权重，可以额外开启。该缓存是 LRU，有显存上限，默认 4096MB：
 
 ```bash
 export A800_DEQUANT_CACHE_FP4=1
+export A800_DEQUANT_CACHE_FP4_MB=4096
 ```
 
-默认不建议开启。先用 `--max-new-tokens 1` 验证通过，再做 128 token 性能测试。
+如果还有空闲显存，可以尝试 8192；如果出现 OOM，降到 2048 或直接关闭。先用 `--max-new-tokens 1` 验证通过，再做 128 token 性能测试。
 
 如果需要保留 attention/indexer 里的 activation quant simulation，可以额外开启：
 
