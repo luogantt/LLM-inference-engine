@@ -263,6 +263,7 @@ FP4 expert linear: FP4 packed weight + per-32 scale -> BF16/FP16 dequant -> F.li
 HC split/sinkhorn: TileLang kernel -> PyTorch fallback
 Sparse attention: TileLang kernel -> PyTorch fallback
 Activation quant simulation: skipped by default on A800 fallback
+Hadamard rotation: skipped by default on A800 fallback to avoid requiring fast_hadamard_transform
 ```
 
 这个路径的目标是先让 A800 跑通 DeepSeek-V4-Flash，不追求官方 Flash kernel 的速度。真正要快，需要把 FP8/FP4 unpack、scale 和 GEMM 融合成 A800(sm80) 专用 CUDA kernel。
@@ -308,3 +309,11 @@ export A800_KEEP_ACT_QUANT=1
 ```
 
 默认不建议开启，因为它会重新进入 TileLang FP8/FP4 quant kernel。
+
+如果已经装好了 `fast_hadamard_transform`，并且需要保留原始 Hadamard rotation 路径，可以额外开启：
+
+```bash
+export A800_KEEP_ROTATE=1
+```
+
+A800 fallback 默认跳过这一步，目的是先绕开额外编译依赖，把 DeepSeek-V4-Flash 的推理链路跑通。

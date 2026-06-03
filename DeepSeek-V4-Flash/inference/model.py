@@ -39,6 +39,10 @@ def _a800_keep_act_quant() -> bool:
     return _env_flag("A800_KEEP_ACT_QUANT")
 
 
+def _a800_keep_rotate() -> bool:
+    return _env_flag("A800_KEEP_ROTATE")
+
+
 def _a800_dequant_dtype() -> torch.dtype:
     value = os.getenv("A800_DEQUANT_DTYPE", "bf16").strip().lower()
     if value in {"fp16", "float16", "half"}:
@@ -402,6 +406,8 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = F
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     """Applies randomized Hadamard rotation to spread information across dims before FP8 quant."""
     assert x.dtype == torch.bfloat16
+    if _a800_force_dequant_gemm() and not _a800_keep_rotate():
+        return x
     from fast_hadamard_transform import hadamard_transform
     return hadamard_transform(x, scale=x.size(-1) ** -0.5)
 
