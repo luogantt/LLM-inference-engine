@@ -400,6 +400,12 @@ The FP32 fast-decode MoE path now reuses one accumulation buffer per MoE layer i
 export A800_REUSE_DECODE_MOE_Y=0
 ```
 
+MoE gate score computation keeps FP32 math, but the per-layer gate weight can be cached in FP32 after warmup to avoid repeated BF16 -> FP32 casts during decode. This is enabled automatically when `A800_FORCE_DEQUANT_GEMM=1`; disable it only for A/B checks:
+
+```bash
+export A800_CACHE_GATE_WEIGHT_F32=0
+```
+
 Current A800 4-GPU 128-token measurements:
 
 ```text
@@ -425,5 +431,6 @@ export A800_USE_CUDA_FP4_ACCUM=0
 export A800_FAST_DECODE_MOE=1
 export A800_BF16_MOE_REDUCE=0
 export A800_REUSE_DECODE_MOE_Y=1
+export A800_CACHE_GATE_WEIGHT_F32=1
 export A800_CUDA_LIB=./build/libdeepseek_v4_a800.so
 ```

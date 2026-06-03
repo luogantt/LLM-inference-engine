@@ -130,6 +130,12 @@ def run_inference(args: argparse.Namespace) -> None:
         if a800_reuse_decode_moe_y_value == ""
         else a800_reuse_decode_moe_y_value in {"1", "true", "yes", "on"}
     )
+    a800_cache_gate_weight_value = os.getenv("A800_CACHE_GATE_WEIGHT_F32", "").strip().lower()
+    a800_cache_gate_weight = (
+        a800_force_dequant
+        if a800_cache_gate_weight_value == ""
+        else a800_cache_gate_weight_value in {"1", "true", "yes", "on"}
+    )
 
     if model_args.scale_dtype == "fp32" or a800_force_dequant:
         import torch.nn as nn
@@ -178,6 +184,11 @@ def run_inference(args: argparse.Namespace) -> None:
         print(
             "[A800 compat] A800_REUSE_DECODE_MOE_Y=1, "
             "reuse per-layer FP32 MoE decode accumulation buffers"
+        )
+    if a800_cache_gate_weight:
+        print(
+            "[A800 compat] A800_CACHE_GATE_WEIGHT_F32=1, "
+            "cache per-layer FP32 MoE gate weights after warmup"
         )
 
     torch.set_default_device("cuda")

@@ -82,6 +82,13 @@ def _a800_reuse_decode_moe_y() -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _a800_cache_gate_weight_f32() -> bool:
+    value = os.getenv("A800_CACHE_GATE_WEIGHT_F32")
+    if value is None or value.strip() == "":
+        return _a800_force_dequant_gemm()
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _a800_fp4_cache_limit_bytes() -> int:
     if not _a800_cache_fp4_weight():
         return 0
@@ -1209,9 +1216,19 @@ class Gate(nn.Module):
             self.bias = None
         else:
             self.bias = nn.Parameter(torch.empty(args.n_routed_experts, dtype=torch.float32))
+        self._a800_weight_f32: Optional[torch.Tensor] = None
+
+    def _gate_weight_f32(self) -> torch.Tensor:
+        if not _a800_cache_gate_weight_f32() or self.weight.dtype == torch.float32:
+            return self.weight.float()
+        weight = self._a800_weight_f32
+        if weight is None or weight.shape != self.weight.shape or weight.device != self.weight.device:
+            weight = self.weight.detach().float().contiguous()
+            self._a800_weight_f32 = weight
+        return weight
 
     def forward(self, x: torch.Tensor, input_ids: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
-        scores = linear(x.float(), self.weight.float())
+        scores = linear(x.float(), self._gate_weight_f32())
         if self.score_func == "softmax":
             scores = scores.softmax(dim=-1)
         elif self.score_func == "sigmoid":
