@@ -134,6 +134,17 @@ def _apply_k_block_scales(
     group_size: int,
 ) -> torch.Tensor:
     out_features, in_features = weight.shape
+    n_k_blocks = (in_features + group_size - 1) // group_size
+
+    if in_features % group_size == 0 and scales.ndim == 2 and scales.size(1) >= n_k_blocks:
+        row_scales = scales[:, :n_k_blocks]
+        if row_scales.size(0) != out_features:
+            row_scales = row_scales.repeat_interleave(group_size, dim=0)[:out_features]
+        if row_scales.size(0) == out_features:
+            weight = weight.view(out_features, n_k_blocks, group_size)
+            weight.mul_(row_scales[:, :, None])
+            return weight.view(out_features, in_features)
+
     for k_block in range(scales.size(1)):
         start = k_block * group_size
         end = min(start + group_size, in_features)

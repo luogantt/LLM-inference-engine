@@ -264,6 +264,7 @@ HC split/sinkhorn: TileLang kernel -> PyTorch fallback
 Sparse attention: TileLang kernel -> PyTorch fallback
 Activation quant simulation: skipped by default on A800 fallback
 Hadamard rotation: skipped by default on A800 fallback to avoid requiring fast_hadamard_transform
+Block scales: vectorized broadcast on common full-block shapes, with Python-loop fallback for unusual scale layouts
 ```
 
 这个路径的目标是先让 A800 跑通 DeepSeek-V4-Flash，不追求官方 Flash kernel 的速度。真正要快，需要把 FP8/FP4 unpack、scale 和 GEMM 融合成 A800(sm80) 专用 CUDA kernel。
