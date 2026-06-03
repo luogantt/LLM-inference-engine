@@ -395,10 +395,12 @@ If `A800_BF16_MOE_REDUCE` is unset, the original FP32 routed MoE accumulation is
 Current A800 4-GPU 128-token measurements:
 
 ```text
-FP4 .so + fused FFN + fast MoE + FP32 MoE reduce: 2.556 tok/s
+FP4 .so + fused FFN + fast MoE + FP32 MoE reduce: 2.578 tok/s
 FP4 .so + fused FFN + fast MoE + BF16 MoE reduce: 2.533 tok/s
 FP4 .so + fast MoE + BF16 MoE reduce, FFN fused off: 2.387 tok/s
 ```
+
+Best log so far: `deepseek_v4_flash_a800_best_ffn_fastmoe_fp32reduce_128.log`
 
 建议先单独测试 FFN 开关，不要同时打开 FP4 LRU cache，避免性能归因混在一起：
 
