@@ -104,6 +104,7 @@ def run_inference(args: argparse.Namespace) -> None:
     load_model(model, str(shard), strict=False)
 
     a800_force_dequant = os.getenv("A800_FORCE_DEQUANT_GEMM", "").strip().lower() in {"1", "true", "yes", "on"}
+    a800_cuda_fp4 = os.getenv("A800_USE_CUDA_FP4_GEMM", "").strip().lower() in {"1", "true", "yes", "on"}
 
     if model_args.scale_dtype == "fp32" or a800_force_dequant:
         import torch.nn as nn
@@ -124,6 +125,11 @@ def run_inference(args: argparse.Namespace) -> None:
         print(
             "[A800 compat] A800_FORCE_DEQUANT_GEMM=1, "
             "using BF16/FP16 dequantized F.linear fallback instead of TileLang FP8/FP4 GEMM"
+        )
+    if a800_cuda_fp4:
+        print(
+            "[A800 compat] A800_USE_CUDA_FP4_GEMM=1, "
+            f"trying CUDA .so FP4 expert path: {os.getenv('A800_CUDA_LIB', './build/libdeepseek_v4_a800.so')}"
         )
 
     torch.set_default_device("cuda")

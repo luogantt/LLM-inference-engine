@@ -265,6 +265,7 @@ Sparse attention: TileLang kernel -> PyTorch fallback
 Activation quant simulation: skipped by default on A800 fallback
 Hadamard rotation: skipped by default on A800 fallback to avoid requiring fast_hadamard_transform
 Block scales: vectorized broadcast on common full-block shapes, with Python-loop fallback for unusual scale layouts
+Optional CUDA .so: FP4 expert unpack + scale + GEMM fused path through libdeepseek_v4_a800.so
 ```
 
 这个路径的目标是先让 A800 跑通 DeepSeek-V4-Flash，不追求官方 Flash kernel 的速度。真正要快，需要把 FP8/FP4 unpack、scale 和 GEMM 融合成 A800(sm80) 专用 CUDA kernel。
@@ -327,3 +328,34 @@ export A800_KEEP_ROTATE=1
 ```
 
 A800 fallback 默认跳过这一步，目的是先绕开额外编译依赖，把 DeepSeek-V4-Flash 的推理链路跑通。
+
+## A800 CUDA .so FP4 expert path
+
+第一阶段动态库优化只替换 FP4 expert linear 热路径，仍然保留 Python / torch 负责 tokenizer、加载、调度和分布式。这个路径不会生成完整 BF16 expert 权重矩阵，而是在 CUDA kernel 内完成：
+
+```text
+FP4 packed weight -> nibble unpack -> per-block scale -> dot product -> BF16 output
+```
+
+编译：
+
+```bash
+cd /data3/ledi/deepseekv4_engin/LLM-inference-engine
+
+export CUDA_HOME=/usr/local/cuda-12.4
+export PATH=$CUDA_HOME/bin:$PATH
+export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
+
+make -f Makefile.cuda_lib deepseek-v4-a800 A=sm_80
+```
+
+运行时开启：
+
+```bash
+export A800_FORCE_DEQUANT_GEMM=1
+export A800_DEQUANT_DTYPE=bf16
+export A800_USE_CUDA_FP4_GEMM=1
+export A800_CUDA_LIB=./build/libdeepseek_v4_a800.so
+```
+
+如果动态库不存在、scale 不是 fp32、输入不是 bf16，代码会自动回退到 PyTorch fallback。

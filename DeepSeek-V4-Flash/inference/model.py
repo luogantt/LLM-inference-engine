@@ -1,5 +1,6 @@
 import math
 import os
+import ctypes
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Tuple, Optional, Literal
@@ -24,6 +25,9 @@ scale_dtype = torch.float32
 _FP4_TABLE = None
 _A800_FP4_DEQUANT_CACHE = OrderedDict()
 _A800_FP4_DEQUANT_CACHE_BYTES = 0
+_A800_CUDA_LIB = None
+_A800_CUDA_LIB_FAILED = False
+_A800_CUDA_FP4_WARNED = False
 
 
 def _env_flag(name: str) -> bool:
@@ -40,6 +44,10 @@ def _a800_cache_dequant_weight() -> bool:
 
 def _a800_cache_fp4_weight() -> bool:
     return _env_flag("A800_DEQUANT_CACHE_FP4")
+
+
+def _a800_use_cuda_fp4_gemm() -> bool:
+    return _env_flag("A800_USE_CUDA_FP4_GEMM")
 
 
 def _a800_fp4_cache_limit_bytes() -> int:
@@ -75,6 +83,58 @@ def _to_dequant_dtype(x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
         return x.to(dtype)
     except RuntimeError:
         return x.float().to(dtype)
+
+
+def _a800_cuda_lib_path() -> str:
+    return os.getenv(
+        "A800_CUDA_LIB",
+        os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "build", "libdeepseek_v4_a800.so")),
+    )
+
+
+def _a800_load_cuda_lib():
+    global _A800_CUDA_LIB, _A800_CUDA_LIB_FAILED
+
+    if _A800_CUDA_LIB is not None:
+        return _A800_CUDA_LIB
+    if _A800_CUDA_LIB_FAILED:
+        return None
+
+    path = _a800_cuda_lib_path()
+    try:
+        lib = ctypes.CDLL(path)
+        lib.ds_v4_fp4_dequant_gemm_bf16.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_void_p,
+        ]
+        lib.ds_v4_fp4_dequant_gemm_bf16.restype = ctypes.c_int
+        lib.ds_v4_a800_last_error.argtypes = []
+        lib.ds_v4_a800_last_error.restype = ctypes.c_char_p
+        _A800_CUDA_LIB = lib
+        if rank == 0:
+            print(f"[A800 compat] loaded CUDA fp4 gemm lib: {path}")
+        return lib
+    except OSError as exc:
+        _A800_CUDA_LIB_FAILED = True
+        if rank == 0:
+            print(f"[A800 compat] CUDA fp4 gemm lib unavailable: {path} ({exc})")
+        return None
+
+
+def _a800_warn_cuda_fp4_fallback(message: str) -> None:
+    global _A800_CUDA_FP4_WARNED
+    if not _A800_CUDA_FP4_WARNED and rank == 0:
+        print(f"[A800 compat] CUDA fp4 gemm fallback to PyTorch: {message}")
+        _A800_CUDA_FP4_WARNED = True
 
 
 def _get_fp4_table(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -243,6 +303,66 @@ def _dequantize_fp4_weight(weight: torch.Tensor) -> torch.Tensor:
     return dequant
 
 
+def _a800_cuda_fp4_linear(x: torch.Tensor, weight: torch.Tensor) -> Optional[torch.Tensor]:
+    if not _a800_use_cuda_fp4_gemm():
+        return None
+    if _a800_dequant_dtype() != torch.bfloat16:
+        _a800_warn_cuda_fp4_fallback("A800_DEQUANT_DTYPE must be bf16")
+        return None
+    if x.dtype != torch.bfloat16 or not x.is_cuda:
+        _a800_warn_cuda_fp4_fallback("input must be CUDA bf16")
+        return None
+    if weight.dtype != torch.float4_e2m1fn_x2 or not weight.is_cuda:
+        _a800_warn_cuda_fp4_fallback("weight must be CUDA fp4")
+        return None
+
+    scale = getattr(weight, "scale", None)
+    if scale is None or scale.dtype != torch.float32 or not scale.is_cuda:
+        _a800_warn_cuda_fp4_fallback("weight.scale must be CUDA fp32")
+        return None
+    if scale.ndim != 2:
+        _a800_warn_cuda_fp4_fallback("weight.scale must be 2D")
+        return None
+
+    lib = _a800_load_cuda_lib()
+    if lib is None:
+        return None
+
+    in_dim = x.size(-1)
+    out_dim = weight.size(0)
+    packed_cols = weight.size(1)
+    if packed_cols * 2 != in_dim:
+        _a800_warn_cuda_fp4_fallback("packed weight shape does not match input dim")
+        return None
+
+    x_2d = x.reshape(-1, in_dim).contiguous()
+    weight_c = weight.contiguous()
+    scale_c = scale.contiguous()
+    y_2d = torch.empty((x_2d.size(0), out_dim), device=x.device, dtype=x.dtype)
+    stream = torch.cuda.current_stream(x.device).cuda_stream
+
+    ret = lib.ds_v4_fp4_dequant_gemm_bf16(
+        ctypes.c_void_p(x_2d.data_ptr()),
+        ctypes.c_void_p(weight_c.data_ptr()),
+        ctypes.c_void_p(scale_c.data_ptr()),
+        ctypes.c_void_p(y_2d.data_ptr()),
+        ctypes.c_int(x_2d.size(0)),
+        ctypes.c_int(in_dim),
+        ctypes.c_int(out_dim),
+        ctypes.c_int(scale_c.size(0)),
+        ctypes.c_int(scale_c.size(1)),
+        ctypes.c_int(fp4_block_size),
+        ctypes.c_void_p(stream),
+    )
+    if ret != 0:
+        err = lib.ds_v4_a800_last_error()
+        err_text = err.decode("utf-8", errors="replace") if err else f"ret={ret}"
+        _a800_warn_cuda_fp4_fallback(err_text)
+        return None
+
+    return y_2d.view(*x.shape[:-1], out_dim)
+
+
 @contextmanager
 def set_dtype(dtype):
     """Temporarily override torch default dtype, restoring it on exit (even if an exception occurs)."""
@@ -334,6 +454,9 @@ def linear(x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] =
 
     if weight.dtype == torch.float4_e2m1fn_x2:
         if _a800_force_dequant_gemm():
+            y = _a800_cuda_fp4_linear(x, weight)
+            if y is not None:
+                return y
             return F.linear(x.to(_a800_dequant_dtype()), _dequantize_fp4_weight(weight)).type_as(x)
         x, s = act_quant(x, block_size, scale_fmt, scale_dtype)
         return fp4_gemm(x, s, weight, weight.scale, scale_dtype)
