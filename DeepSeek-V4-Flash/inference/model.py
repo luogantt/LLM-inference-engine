@@ -35,6 +35,10 @@ def _a800_cache_dequant_weight() -> bool:
     return _env_flag("A800_DEQUANT_CACHE")
 
 
+def _a800_cache_fp4_weight() -> bool:
+    return _env_flag("A800_DEQUANT_CACHE_FP4")
+
+
 def _a800_keep_act_quant() -> bool:
     return _env_flag("A800_KEEP_ACT_QUANT")
 
@@ -158,7 +162,7 @@ def _torch_sparse_attn(
 
 def _dequantize_fp4_weight(weight: torch.Tensor) -> torch.Tensor:
     cache = getattr(weight, "_a800_dequant_cache", None)
-    if _a800_cache_dequant_weight() and cache is not None:
+    if _a800_cache_fp4_weight() and cache is not None:
         return cache
 
     dtype = _a800_dequant_dtype()
@@ -171,7 +175,7 @@ def _dequantize_fp4_weight(weight: torch.Tensor) -> torch.Tensor:
     scales = _to_dequant_dtype(weight.scale, dtype).contiguous()
     dequant = _apply_k_block_scales(dequant, scales, fp4_block_size)
 
-    if _a800_cache_dequant_weight():
+    if _a800_cache_fp4_weight():
         weight._a800_dequant_cache = dequant
     return dequant
 

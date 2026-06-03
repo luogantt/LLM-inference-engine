@@ -300,7 +300,15 @@ CUDA_VISIBLE_DEVICES=2,3,4,5 python -m torch.distributed.run \
 export A800_DEQUANT_CACHE=1
 ```
 
-注意：这个缓存会显著增加显存占用，建议先用 `--max-new-tokens 1` 验证通过后再测试。
+注意：这个缓存只缓存 dense FP8 权重，不缓存 FP4 expert 权重。FP4 expert 数量多，缓存成 BF16/FP16 后很容易把 A800 80GB 显存打满。
+
+如果明确想尝试缓存 FP4 expert 权重，可以额外开启：
+
+```bash
+export A800_DEQUANT_CACHE_FP4=1
+```
+
+默认不建议开启。先用 `--max-new-tokens 1` 验证通过，再做 128 token 性能测试。
 
 如果需要保留 attention/indexer 里的 activation quant simulation，可以额外开启：
 
