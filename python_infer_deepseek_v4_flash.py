@@ -124,6 +124,12 @@ def run_inference(args: argparse.Namespace) -> None:
         if a800_bf16_moe_reduce_value == ""
         else a800_bf16_moe_reduce_value in {"1", "true", "yes", "on"}
     )
+    a800_reuse_decode_moe_y_value = os.getenv("A800_REUSE_DECODE_MOE_Y", "").strip().lower()
+    a800_reuse_decode_moe_y = (
+        True
+        if a800_reuse_decode_moe_y_value == ""
+        else a800_reuse_decode_moe_y_value in {"1", "true", "yes", "on"}
+    )
 
     if model_args.scale_dtype == "fp32" or a800_force_dequant:
         import torch.nn as nn
@@ -167,6 +173,11 @@ def run_inference(args: argparse.Namespace) -> None:
         print(
             "[A800 compat] A800_BF16_MOE_REDUCE=1, "
             "MoE routed output accumulates and all-reduces in BF16"
+        )
+    if a800_fast_decode_moe and not a800_bf16_moe_reduce and a800_reuse_decode_moe_y:
+        print(
+            "[A800 compat] A800_REUSE_DECODE_MOE_Y=1, "
+            "reuse per-layer FP32 MoE decode accumulation buffers"
         )
 
     torch.set_default_device("cuda")

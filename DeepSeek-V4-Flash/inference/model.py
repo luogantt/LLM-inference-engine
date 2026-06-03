@@ -75,6 +75,13 @@ def _a800_bf16_moe_reduce() -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _a800_reuse_decode_moe_y() -> bool:
+    value = os.getenv("A800_REUSE_DECODE_MOE_Y")
+    if value is None or value.strip() == "":
+        return True
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _a800_fp4_cache_limit_bytes() -> int:
     if not _a800_cache_fp4_weight():
         return 0
@@ -1271,15 +1278,26 @@ class MoE(nn.Module):
                                        for i in range(self.n_routed_experts)])
         assert args.n_shared_experts == 1
         self.shared_experts = Expert(args.dim, args.moe_inter_dim, swiglu_limit=args.swiglu_limit)
+        self._a800_decode_y: Optional[torch.Tensor] = None
+
+    def _a800_decode_accum_buffer(self, x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        if dtype != torch.float32 or not _a800_reuse_decode_moe_y():
+            return torch.zeros_like(x, dtype=dtype)
+        y = self._a800_decode_y
+        if y is None or y.shape != x.shape or y.dtype != dtype or y.device != x.device:
+            y = torch.empty_like(x, dtype=dtype)
+            self._a800_decode_y = y
+        y.zero_()
+        return y
 
     def forward(self, x: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
         shape = x.size()
         x = x.view(-1, self.dim)
         weights, indices = self.gate(x, input_ids.flatten())
         moe_accum_dtype = x.dtype if _a800_bf16_moe_reduce() else torch.float32
-        y = torch.zeros_like(x, dtype=moe_accum_dtype)
 
         if _a800_fast_decode_moe() and x.size(0) == 1:
+            y = self._a800_decode_accum_buffer(x, moe_accum_dtype)
             for top, expert_id in enumerate(indices[0].tolist()):
                 if self.experts_start_idx <= expert_id < self.experts_end_idx:
                     expert = self.experts[expert_id]
@@ -1293,6 +1311,7 @@ class MoE(nn.Module):
             y += self.shared_experts(x)
             return y.type_as(x).view(shape)
 
+        y = torch.zeros_like(x, dtype=moe_accum_dtype)
         counts = torch.bincount(indices.flatten(), minlength=self.n_routed_experts).tolist()
         for i in range(self.experts_start_idx, self.experts_end_idx):
             if counts[i] == 0:

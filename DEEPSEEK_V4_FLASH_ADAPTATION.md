@@ -394,6 +394,12 @@ export A800_BF16_MOE_REDUCE=1
 
 If `A800_BF16_MOE_REDUCE` is unset, the original FP32 routed MoE accumulation is used.
 
+The FP32 fast-decode MoE path now reuses one accumulation buffer per MoE layer instead of allocating a fresh `zeros_like` tensor for every layer and token. This is enabled by default and does not require rebuilding the CUDA `.so`. Disable it only for A/B checks:
+
+```bash
+export A800_REUSE_DECODE_MOE_Y=0
+```
+
 Current A800 4-GPU 128-token measurements:
 
 ```text
@@ -418,5 +424,6 @@ export A800_USE_CUDA_FP4_FFN=1
 export A800_USE_CUDA_FP4_ACCUM=0
 export A800_FAST_DECODE_MOE=1
 export A800_BF16_MOE_REDUCE=0
+export A800_REUSE_DECODE_MOE_Y=1
 export A800_CUDA_LIB=./build/libdeepseek_v4_a800.so
 ```
