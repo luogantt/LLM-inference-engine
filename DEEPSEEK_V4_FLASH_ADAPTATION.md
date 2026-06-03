@@ -367,6 +367,15 @@ export A800_CUDA_LIB=./build/libdeepseek_v4_a800.so
 export A800_USE_CUDA_FP4_FFN=1
 ```
 
+Current FFN `.so` path keeps the ABI as one call, but internally reduces the expert hot path to two CUDA kernels:
+
+```text
+kernel 1: fused w1 + w3 FP4 unpack/scale/dot + SwiGLU + route -> BF16 hidden
+kernel 2: w2 FP4 unpack/scale/dot -> BF16 output
+```
+
+`gate_f32` is no longer materialized on the Python side; the legacy C ABI slot is passed as null for compatibility.
+
 建议先单独测试 FFN 开关，不要同时打开 FP4 LRU cache，避免性能归因混在一起：
 
 ```bash

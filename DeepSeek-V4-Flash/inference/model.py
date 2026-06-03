@@ -446,14 +446,17 @@ def _a800_cuda_fp4_expert_ffn(
         return None
 
     x_2d = x.reshape(-1, dim).contiguous()
-    route = route_weights.reshape(-1).float().contiguous()
+    route = route_weights.reshape(-1)
+    if route.dtype != torch.float32:
+        route = route.float()
+    if not route.is_contiguous():
+        route = route.contiguous()
     if route.numel() != x_2d.size(0):
         _a800_warn_cuda_fp4_fallback("route weight count does not match tokens")
         return None
 
     w1_c, w2_c, w3_c = (weight.contiguous() for weight in weights)
     s1_c, s2_c, s3_c = (scale.contiguous() for scale in scales)
-    gate = torch.empty((x_2d.size(0), inter_dim), device=x.device, dtype=torch.float32)
     hidden = torch.empty((x_2d.size(0), inter_dim), device=x.device, dtype=x.dtype)
     y_2d = torch.empty((x_2d.size(0), dim), device=x.device, dtype=x.dtype)
     stream = torch.cuda.current_stream(x.device).cuda_stream
@@ -467,7 +470,7 @@ def _a800_cuda_fp4_expert_ffn(
         ctypes.c_void_p(s2_c.data_ptr()),
         ctypes.c_void_p(w3_c.data_ptr()),
         ctypes.c_void_p(s3_c.data_ptr()),
-        ctypes.c_void_p(gate.data_ptr()),
+        ctypes.c_void_p(0),
         ctypes.c_void_p(hidden.data_ptr()),
         ctypes.c_void_p(y_2d.data_ptr()),
         ctypes.c_int(x_2d.size(0)),

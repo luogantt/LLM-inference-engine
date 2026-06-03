@@ -135,7 +135,8 @@ def run_inference(args: argparse.Namespace) -> None:
     if a800_cuda_fp4_ffn:
         print(
             "[A800 compat] A800_USE_CUDA_FP4_FFN=1, "
-            f"trying CUDA .so fused FP4 expert FFN path: {os.getenv('A800_CUDA_LIB', './build/libdeepseek_v4_a800.so')}"
+            "trying CUDA .so two-kernel FP4 expert FFN path "
+            f"(fused w1+w3, then w2): {os.getenv('A800_CUDA_LIB', './build/libdeepseek_v4_a800.so')}"
         )
 
     torch.set_default_device("cuda")
