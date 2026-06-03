@@ -50,6 +50,10 @@ def _a800_use_cuda_fp4_gemm() -> bool:
     return _env_flag("A800_USE_CUDA_FP4_GEMM")
 
 
+def _a800_use_cuda_fp4_ffn() -> bool:
+    return _env_flag("A800_USE_CUDA_FP4_FFN")
+
+
 def _a800_fp4_cache_limit_bytes() -> int:
     if not _a800_cache_fp4_weight():
         return 0
@@ -117,6 +121,36 @@ def _a800_load_cuda_lib():
             ctypes.c_void_p,
         ]
         lib.ds_v4_fp4_dequant_gemm_bf16.restype = ctypes.c_int
+        try:
+            lib.ds_v4_fp4_expert_ffn_bf16.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_float,
+                ctypes.c_void_p,
+            ]
+            lib.ds_v4_fp4_expert_ffn_bf16.restype = ctypes.c_int
+        except AttributeError:
+            if rank == 0:
+                print("[A800 compat] CUDA fp4 expert FFN symbol unavailable in .so")
         lib.ds_v4_a800_last_error.argtypes = []
         lib.ds_v4_a800_last_error.restype = ctypes.c_char_p
         _A800_CUDA_LIB = lib
@@ -361,6 +395,101 @@ def _a800_cuda_fp4_linear(x: torch.Tensor, weight: torch.Tensor) -> Optional[tor
         return None
 
     return y_2d.view(*x.shape[:-1], out_dim)
+
+
+def _a800_cuda_fp4_expert_ffn(
+    x: torch.Tensor,
+    route_weights: Optional[torch.Tensor],
+    w1: "Linear",
+    w2: "Linear",
+    w3: "Linear",
+    swiglu_limit: float,
+) -> Optional[torch.Tensor]:
+    if not _a800_use_cuda_fp4_ffn():
+        return None
+    if not _a800_force_dequant_gemm():
+        return None
+    if route_weights is None:
+        return None
+    if _a800_dequant_dtype() != torch.bfloat16:
+        _a800_warn_cuda_fp4_fallback("A800_DEQUANT_DTYPE must be bf16 for fused FFN")
+        return None
+    if x.dtype != torch.bfloat16 or not x.is_cuda:
+        _a800_warn_cuda_fp4_fallback("fused FFN input must be CUDA bf16")
+        return None
+
+    weights = (w1.weight, w2.weight, w3.weight)
+    scales = tuple(getattr(weight, "scale", None) for weight in weights)
+    if any(weight.dtype != torch.float4_e2m1fn_x2 or not weight.is_cuda for weight in weights):
+        _a800_warn_cuda_fp4_fallback("fused FFN requires fp4 CUDA weights")
+        return None
+    if any(scale is None or scale.dtype != torch.float32 or not scale.is_cuda or scale.ndim != 2 for scale in scales):
+        _a800_warn_cuda_fp4_fallback("fused FFN requires CUDA fp32 2D scales")
+        return None
+
+    dim = x.size(-1)
+    inter_dim = w1.weight.size(0)
+    if w3.weight.size(0) != inter_dim or w2.weight.size(0) != dim:
+        _a800_warn_cuda_fp4_fallback("fused FFN weight output shapes do not match")
+        return None
+    if w1.weight.size(1) * 2 != dim or w3.weight.size(1) * 2 != dim or w2.weight.size(1) * 2 != inter_dim:
+        _a800_warn_cuda_fp4_fallback("fused FFN packed weight shapes do not match")
+        return None
+
+    lib = _a800_load_cuda_lib()
+    if lib is None:
+        return None
+    try:
+        ffn = lib.ds_v4_fp4_expert_ffn_bf16
+    except AttributeError:
+        _a800_warn_cuda_fp4_fallback("fused FFN symbol missing")
+        return None
+
+    x_2d = x.reshape(-1, dim).contiguous()
+    route = route_weights.reshape(-1).float().contiguous()
+    if route.numel() != x_2d.size(0):
+        _a800_warn_cuda_fp4_fallback("route weight count does not match tokens")
+        return None
+
+    w1_c, w2_c, w3_c = (weight.contiguous() for weight in weights)
+    s1_c, s2_c, s3_c = (scale.contiguous() for scale in scales)
+    gate = torch.empty((x_2d.size(0), inter_dim), device=x.device, dtype=torch.float32)
+    hidden = torch.empty((x_2d.size(0), inter_dim), device=x.device, dtype=x.dtype)
+    y_2d = torch.empty((x_2d.size(0), dim), device=x.device, dtype=x.dtype)
+    stream = torch.cuda.current_stream(x.device).cuda_stream
+
+    ret = ffn(
+        ctypes.c_void_p(x_2d.data_ptr()),
+        ctypes.c_void_p(route.data_ptr()),
+        ctypes.c_void_p(w1_c.data_ptr()),
+        ctypes.c_void_p(s1_c.data_ptr()),
+        ctypes.c_void_p(w2_c.data_ptr()),
+        ctypes.c_void_p(s2_c.data_ptr()),
+        ctypes.c_void_p(w3_c.data_ptr()),
+        ctypes.c_void_p(s3_c.data_ptr()),
+        ctypes.c_void_p(gate.data_ptr()),
+        ctypes.c_void_p(hidden.data_ptr()),
+        ctypes.c_void_p(y_2d.data_ptr()),
+        ctypes.c_int(x_2d.size(0)),
+        ctypes.c_int(dim),
+        ctypes.c_int(inter_dim),
+        ctypes.c_int(s1_c.size(0)),
+        ctypes.c_int(s1_c.size(1)),
+        ctypes.c_int(s2_c.size(0)),
+        ctypes.c_int(s2_c.size(1)),
+        ctypes.c_int(s3_c.size(0)),
+        ctypes.c_int(s3_c.size(1)),
+        ctypes.c_int(fp4_block_size),
+        ctypes.c_float(float(swiglu_limit)),
+        ctypes.c_void_p(stream),
+    )
+    if ret != 0:
+        err = lib.ds_v4_a800_last_error()
+        err_text = err.decode("utf-8", errors="replace") if err else f"ret={ret}"
+        _a800_warn_cuda_fp4_fallback(f"fused FFN {err_text}")
+        return None
+
+    return y_2d.view(*x.shape[:-1], dim)
 
 
 @contextmanager
@@ -955,6 +1084,10 @@ class Expert(nn.Module):
         self.swiglu_limit = swiglu_limit
 
     def forward(self, x: torch.Tensor, weights: Optional[torch.Tensor] = None) -> torch.Tensor:
+        y = _a800_cuda_fp4_expert_ffn(x, weights, self.w1, self.w2, self.w3, self.swiglu_limit)
+        if y is not None:
+            return y
+
         dtype = x.dtype
         gate = self.w1(x).float()
         up = self.w3(x).float()

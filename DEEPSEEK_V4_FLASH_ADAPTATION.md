@@ -266,6 +266,7 @@ Activation quant simulation: skipped by default on A800 fallback
 Hadamard rotation: skipped by default on A800 fallback to avoid requiring fast_hadamard_transform
 Block scales: vectorized broadcast on common full-block shapes, with Python-loop fallback for unusual scale layouts
 Optional CUDA .so: FP4 expert unpack + scale + GEMM fused path through libdeepseek_v4_a800.so
+Optional CUDA .so fused expert: w1 + w3 + silu + route + w2 through one C ABI call
 ```
 
 这个路径的目标是先让 A800 跑通 DeepSeek-V4-Flash，不追求官方 Flash kernel 的速度。真正要快，需要把 FP8/FP4 unpack、scale 和 GEMM 融合成 A800(sm80) 专用 CUDA kernel。
@@ -359,3 +360,22 @@ export A800_CUDA_LIB=./build/libdeepseek_v4_a800.so
 ```
 
 如果动态库不存在、scale 不是 fp32、输入不是 bf16，代码会自动回退到 PyTorch fallback。
+
+第二阶段可以进一步打开 fused FP4 expert FFN。这个路径把单个 routed expert 的 `w1 + w3 + silu + route weight + w2` 放进一次 `.so` 调用，减少 Python/Torch 在 expert 内部的调度：
+
+```bash
+export A800_USE_CUDA_FP4_FFN=1
+```
+
+建议先单独测试 FFN 开关，不要同时打开 FP4 LRU cache，避免性能归因混在一起：
+
+```bash
+unset A800_DEQUANT_CACHE_FP4
+unset A800_DEQUANT_CACHE_FP4_MB
+
+export A800_FORCE_DEQUANT_GEMM=1
+export A800_DEQUANT_DTYPE=bf16
+export A800_USE_CUDA_FP4_GEMM=1
+export A800_USE_CUDA_FP4_FFN=1
+export A800_CUDA_LIB=./build/libdeepseek_v4_a800.so
+```
