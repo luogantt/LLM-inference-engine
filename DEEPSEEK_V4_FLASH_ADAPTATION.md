@@ -493,3 +493,9 @@ export A800_CUDA_LIB=./build/libdeepseek_v4_a800.so
 ```bash
 export A800_DISTRIBUTED_ARGMAX=0
 ```
+
+For stable throughput numbers, run several timed generations after the warmup without reloading the model:
+
+```bash
+--bench-iters 3
+```

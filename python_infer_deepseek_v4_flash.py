@@ -270,18 +270,22 @@ def run_inference(args: argparse.Namespace) -> None:
         if torch.cuda.is_available():
             torch.cuda.synchronize()
 
-    t0 = time.perf_counter()
-    token_result = generate(
-        model,
-        prompt_tokens,
-        args.max_new_tokens,
-        eos_id,
-        args.temperature,
-        return_tensor=a800_defer_token_decode,
-    )
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-    t1 = time.perf_counter()
+    bench_iters = max(1, args.bench_iters)
+    elapsed_runs = []
+    token_result = None
+    for _ in range(bench_iters):
+        t0 = time.perf_counter()
+        token_result = generate(
+            model,
+            prompt_tokens,
+            args.max_new_tokens,
+            eos_id,
+            args.temperature,
+            return_tensor=a800_defer_token_decode,
+        )
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        elapsed_runs.append(time.perf_counter() - t0)
 
     if rank == 0:
         if a800_defer_token_decode:
@@ -291,7 +295,8 @@ def run_inference(args: argparse.Namespace) -> None:
             completion_tokens = token_result
         completions = tokenizer.batch_decode(completion_tokens)
         new_tokens = sum(len(t) for t in completion_tokens)
-        elapsed = t1 - t0
+        elapsed_best = min(elapsed_runs)
+        elapsed_avg = sum(elapsed_runs) / len(elapsed_runs)
 
         print("========== generated text ==========")
         for i, completion in enumerate(completions):
@@ -302,8 +307,14 @@ def run_inference(args: argparse.Namespace) -> None:
 
         print("========== performance ==========")
         print(f"generated_tokens={new_tokens}")
-        print(f"elapsed_s={elapsed:.6f}")
-        print(f"tokens_per_s={new_tokens / elapsed:.3f}")
+        print(f"elapsed_s={elapsed_best:.6f}")
+        print(f"tokens_per_s={new_tokens / elapsed_best:.3f}")
+        if bench_iters > 1:
+            elapsed_text = ",".join(f"{x:.6f}" for x in elapsed_runs)
+            print(f"bench_iters={bench_iters}")
+            print(f"elapsed_avg_s={elapsed_avg:.6f}")
+            print(f"tokens_per_s_avg={new_tokens / elapsed_avg:.3f}")
+            print(f"elapsed_runs_s={elapsed_text}")
 
     if world_size > 1:
         dist.destroy_process_group()
@@ -323,6 +334,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--thinking-mode", default="chat", choices=["chat", "thinking"])
     p.add_argument("--warmup", action="store_true", help="run one warmup generation before timing")
+    p.add_argument("--bench-iters", type=int, default=1, help="repeat timed generation after warmup and report best/avg")
     p.add_argument("--torch-threads", type=int, default=8)
     p.add_argument("--seed", type=int, default=33377335)
 
