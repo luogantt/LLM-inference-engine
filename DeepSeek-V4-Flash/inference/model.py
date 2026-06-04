@@ -42,6 +42,10 @@ def _a800_cache_dequant_weight() -> bool:
     return _env_flag("A800_DEQUANT_CACHE")
 
 
+def _a800_cache_shared_fp8_weight() -> bool:
+    return _env_flag("A800_CACHE_SHARED_FP8")
+
+
 def _a800_cache_fp4_weight() -> bool:
     return _env_flag("A800_DEQUANT_CACHE_FP4")
 
@@ -85,7 +89,7 @@ def _a800_reuse_decode_moe_y() -> bool:
 def _a800_cache_gate_weight_f32() -> bool:
     value = os.getenv("A800_CACHE_GATE_WEIGHT_F32")
     if value is None or value.strip() == "":
-        return _a800_force_dequant_gemm()
+        return False
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
@@ -317,8 +321,12 @@ def _apply_k_block_scales(
 
 
 def _dequantize_fp8_weight(weight: torch.Tensor) -> torch.Tensor:
+    should_cache = _a800_cache_dequant_weight() or (
+        _a800_cache_shared_fp8_weight()
+        and bool(getattr(weight, "_a800_shared_fp8", False))
+    )
     cache = getattr(weight, "_a800_dequant_cache", None)
-    if _a800_cache_dequant_weight() and cache is not None:
+    if should_cache and cache is not None:
         return cache
 
     dtype = _a800_dequant_dtype()
@@ -326,7 +334,7 @@ def _dequantize_fp8_weight(weight: torch.Tensor) -> torch.Tensor:
     scales = _to_dequant_dtype(weight.scale, dtype).contiguous()
     dequant = _apply_k_block_scales(dequant, scales, block_size)
 
-    if _a800_cache_dequant_weight():
+    if should_cache:
         weight._a800_dequant_cache = dequant
     return dequant
 
@@ -1295,6 +1303,8 @@ class MoE(nn.Module):
                                        for i in range(self.n_routed_experts)])
         assert args.n_shared_experts == 1
         self.shared_experts = Expert(args.dim, args.moe_inter_dim, swiglu_limit=args.swiglu_limit)
+        for linear in (self.shared_experts.w1, self.shared_experts.w2, self.shared_experts.w3):
+            linear.weight._a800_shared_fp8 = True
         self._a800_decode_y: Optional[torch.Tensor] = None
 
     def _a800_decode_accum_buffer(self, x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:

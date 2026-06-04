@@ -400,16 +400,24 @@ The FP32 fast-decode MoE path now reuses one accumulation buffer per MoE layer i
 export A800_REUSE_DECODE_MOE_Y=0
 ```
 
-MoE gate score computation keeps FP32 math, but the per-layer gate weight can be cached in FP32 after warmup to avoid repeated BF16 -> FP32 casts during decode. This is enabled automatically when `A800_FORCE_DEQUANT_GEMM=1`; disable it only for A/B checks:
+MoE gate score computation keeps FP32 math. Caching the per-layer gate weight in FP32 after warmup was tested, but it is slower on A800 so it is disabled by default. Enable it only for A/B checks:
 
 ```bash
-export A800_CACHE_GATE_WEIGHT_F32=0
+export A800_CACHE_GATE_WEIGHT_F32=1
+```
+
+Shared expert weights are FP8 dense weights and are used once per MoE layer on every decode token. Full `A800_DEQUANT_CACHE=1` can consume a lot of memory because it caches all dense FP8 weights. The narrower A800 path caches only shared-expert FP8 weights, which is safer on 80GB A800 and avoids repeated shared-expert dequantization:
+
+```bash
+export A800_CACHE_SHARED_FP8=1
 ```
 
 Current A800 4-GPU 128-token measurements:
 
 ```text
 FP4 .so + fused FFN + fast MoE + FP32 MoE reduce: 2.578 tok/s
+FP4 .so + fused FFN + fast MoE + FP32 MoE reduce + reused MoE y: 2.584 tok/s
+FP4 .so + fused FFN + fast MoE + FP32 MoE reduce + reused MoE y + cached gate f32: 2.506 tok/s
 FP4 .so + fused FFN + fast MoE + FP32 MoE reduce + direct accum: 2.513 tok/s
 FP4 .so + fused FFN + fast MoE + BF16 MoE reduce: 2.533 tok/s
 FP4 .so + fast MoE + BF16 MoE reduce, FFN fused off: 2.387 tok/s
@@ -431,6 +439,7 @@ export A800_USE_CUDA_FP4_ACCUM=0
 export A800_FAST_DECODE_MOE=1
 export A800_BF16_MOE_REDUCE=0
 export A800_REUSE_DECODE_MOE_Y=1
-export A800_CACHE_GATE_WEIGHT_F32=1
+export A800_CACHE_GATE_WEIGHT_F32=0
+export A800_CACHE_SHARED_FP8=1
 export A800_CUDA_LIB=./build/libdeepseek_v4_a800.so
 ```

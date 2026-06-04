@@ -132,10 +132,11 @@ def run_inference(args: argparse.Namespace) -> None:
     )
     a800_cache_gate_weight_value = os.getenv("A800_CACHE_GATE_WEIGHT_F32", "").strip().lower()
     a800_cache_gate_weight = (
-        a800_force_dequant
+        False
         if a800_cache_gate_weight_value == ""
         else a800_cache_gate_weight_value in {"1", "true", "yes", "on"}
     )
+    a800_cache_shared_fp8 = os.getenv("A800_CACHE_SHARED_FP8", "").strip().lower() in {"1", "true", "yes", "on"}
 
     if model_args.scale_dtype == "fp32" or a800_force_dequant:
         import torch.nn as nn
@@ -189,6 +190,11 @@ def run_inference(args: argparse.Namespace) -> None:
         print(
             "[A800 compat] A800_CACHE_GATE_WEIGHT_F32=1, "
             "cache per-layer FP32 MoE gate weights after warmup"
+        )
+    if a800_cache_shared_fp8:
+        print(
+            "[A800 compat] A800_CACHE_SHARED_FP8=1, "
+            "cache BF16 dequantized FP8 shared-expert weights only"
         )
 
     torch.set_default_device("cuda")
