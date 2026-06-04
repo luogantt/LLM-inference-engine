@@ -463,12 +463,13 @@ FP4 .so + fused FFN + fast MoE + shared/attention FP8 cache + EOS sync off + def
 FP4 .so + fused FFN + fast MoE + shared/attention FP8 cache + EOS sync off + deferred decode + single prompt fast path: 2.794 tok/s
 FP4 .so + fused FFN + fast MoE + single prompt fast path + distributed argmax list gather: 2.796 tok/s
 FP4 .so + fused FFN + fast MoE + single prompt fast path + distributed argmax all_gather_into_tensor: 2.784 tok/s
+FP4 .so + A800 auto defaults + distributed argmax list gather, 3-run benchmark: best 2.882 tok/s, avg 2.877 tok/s
 FP4 .so + fused FFN + fast MoE + FP32 MoE reduce + direct accum: 2.513 tok/s
 FP4 .so + fused FFN + fast MoE + BF16 MoE reduce: 2.533 tok/s
 FP4 .so + fast MoE + BF16 MoE reduce, FFN fused off: 2.387 tok/s
 ```
 
-Best log so far: `deepseek_v4_flash_a800_distargmax_128.log`
+Best log so far: `deepseek_v4_flash_a800_auto_bench3_128.log`
 
 建议先单独测试 FFN 开关，不要同时打开 FP4 LRU cache，避免性能归因混在一起：
 
