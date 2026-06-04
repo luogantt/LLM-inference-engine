@@ -46,6 +46,10 @@ def _a800_cache_shared_fp8_weight() -> bool:
     return _env_flag("A800_CACHE_SHARED_FP8")
 
 
+def _a800_cache_attn_fp8_weight() -> bool:
+    return _env_flag("A800_CACHE_ATTN_FP8")
+
+
 def _a800_cache_fp4_weight() -> bool:
     return _env_flag("A800_DEQUANT_CACHE_FP4")
 
@@ -96,7 +100,7 @@ def _a800_cache_gate_weight_f32() -> bool:
 def _a800_hash_gate_topk_only() -> bool:
     value = os.getenv("A800_HASH_GATE_TOPK_ONLY")
     if value is None or value.strip() == "":
-        return _a800_force_dequant_gemm()
+        return False
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
@@ -331,6 +335,9 @@ def _dequantize_fp8_weight(weight: torch.Tensor) -> torch.Tensor:
     should_cache = _a800_cache_dequant_weight() or (
         _a800_cache_shared_fp8_weight()
         and bool(getattr(weight, "_a800_shared_fp8", False))
+    ) or (
+        _a800_cache_attn_fp8_weight()
+        and bool(getattr(weight, "_a800_attn_fp8", False))
     )
     cache = getattr(weight, "_a800_dequant_cache", None)
     if should_cache and cache is not None:
@@ -1126,11 +1133,14 @@ class Attention(nn.Module):
         self.wo_a = ColumnParallelLinear(self.n_heads * self.head_dim // self.n_groups, self.n_groups * args.o_lora_rank, dtype=torch.bfloat16)
         self.wo_b = RowParallelLinear(self.n_groups * args.o_lora_rank, self.dim)
         self.softmax_scale = self.head_dim ** -0.5
+        for linear in (self.wq_a, self.wq_b, self.wkv, self.wo_b):
+            linear.weight._a800_attn_fp8 = True
 
         if self.compress_ratio:
             self.compressor = Compressor(args, self.compress_ratio, self.head_dim)
             if self.compress_ratio == 4:
                 self.indexer = Indexer(args, self.compress_ratio)
+                self.indexer.wq_b.weight._a800_attn_fp8 = True
             else:
                 self.indexer = None
 

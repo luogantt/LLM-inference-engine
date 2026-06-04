@@ -16,6 +16,16 @@ sys.path.insert(0, os.path.abspath(encoding_dir))
 from encoding_dsv4 import encode_messages, parse_message_from_completion_text
 
 
+def _eos_check_interval() -> int:
+    value = os.getenv("A800_EOS_CHECK_INTERVAL", "").strip()
+    if value == "":
+        return 1
+    try:
+        return max(0, int(value))
+    except ValueError:
+        return 1
+
+
 def sample(logits, temperature: float = 1.0):
     """Gumbel-max trick: equivalent to multinomial sampling but faster on GPU,
     since it avoids the GPU-to-CPU sync in torch.multinomial."""
@@ -47,6 +57,8 @@ def generate(
     prev_pos = 0
     finished = torch.tensor([False] * len(prompt_tokens))
     prompt_mask = tokens != -1
+    eos_check_interval = _eos_check_interval()
+    decode_steps = 0
     for cur_pos in range(min(prompt_lens), total_len):
         logits = model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
         if temperature > 0:
@@ -55,10 +67,12 @@ def generate(
             next_token = logits.argmax(dim=-1)
         next_token = torch.where(prompt_mask[:, cur_pos], tokens[:, cur_pos], next_token)
         tokens[:, cur_pos] = next_token
-        finished |= torch.logical_and(~prompt_mask[:, cur_pos], next_token == eos_id)
+        decode_steps += 1
         prev_pos = cur_pos
-        if finished.all():
-            break
+        if eos_check_interval:
+            finished |= torch.logical_and(~prompt_mask[:, cur_pos], next_token == eos_id)
+            if decode_steps % eos_check_interval == 0 and finished.all():
+                break
     completion_tokens = []
     for i, toks in enumerate(tokens.tolist()):
         toks = toks[prompt_lens[i]:prompt_lens[i]+max_new_tokens]
