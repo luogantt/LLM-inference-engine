@@ -34,8 +34,8 @@ def _distributed_argmax() -> bool:
     return os.getenv("A800_DISTRIBUTED_ARGMAX", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _greedy_next_token(model: Transformer, input_ids: torch.Tensor, start_pos: int) -> torch.Tensor:
-    if _distributed_argmax() and hasattr(model, "forward_argmax"):
+def _greedy_next_token(model: Transformer, input_ids: torch.Tensor, start_pos: int, use_distributed_argmax: bool) -> torch.Tensor:
+    if use_distributed_argmax:
         return model.forward_argmax(input_ids, start_pos)
     return model.forward(input_ids, start_pos).argmax(dim=-1)
 
@@ -80,6 +80,7 @@ def generate(
     tokens = torch.full((len(prompt_tokens), total_len), -1, dtype=torch.long)
     for i, t in enumerate(prompt_tokens):
         tokens[i, :len(t)] = torch.tensor(t, dtype=torch.long)
+    use_distributed_argmax = temperature <= 0 and _distributed_argmax() and hasattr(model, "forward_argmax")
     if _single_prompt_fast_generate() and len(prompt_tokens) == 1:
         prev_pos = 0
         prompt_len = prompt_lens[0]
@@ -90,7 +91,7 @@ def generate(
                 logits = model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
                 next_token = sample(logits, temperature)
             else:
-                next_token = _greedy_next_token(model, tokens[:, prev_pos:cur_pos], prev_pos)
+                next_token = _greedy_next_token(model, tokens[:, prev_pos:cur_pos], prev_pos, use_distributed_argmax)
             tokens[:, cur_pos] = next_token
             decode_steps += 1
             prev_pos = cur_pos
@@ -110,7 +111,7 @@ def generate(
             logits = model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
             next_token = sample(logits, temperature)
         else:
-            next_token = _greedy_next_token(model, tokens[:, prev_pos:cur_pos], prev_pos)
+            next_token = _greedy_next_token(model, tokens[:, prev_pos:cur_pos], prev_pos, use_distributed_argmax)
         next_token = torch.where(prompt_mask[:, cur_pos], tokens[:, cur_pos], next_token)
         tokens[:, cur_pos] = next_token
         decode_steps += 1

@@ -104,8 +104,11 @@ def _a800_hash_gate_topk_only() -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _a800_distributed_argmax() -> bool:
-    return _env_flag("A800_DISTRIBUTED_ARGMAX")
+def _a800_argmax_gather_into_tensor() -> bool:
+    value = os.getenv("A800_ARGMAX_GATHER_INTO_TENSOR")
+    if value is None or value.strip() == "":
+        return True
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _a800_fp4_cache_limit_bytes() -> int:
@@ -1455,6 +1458,8 @@ class ParallelHead(nn.Module):
         self.part_vocab_size = (vocab_size // world_size)
         # lm_head in the checkpoint is stored in bf16, while the parameter here is stored in fp32 for easier computation of logits later.
         self.weight = nn.Parameter(torch.empty(self.part_vocab_size, self.dim, dtype=torch.float32))
+        self._a800_argmax_local_pack = None
+        self._a800_argmax_gather_pack = None
 
     def get_logits(self, x):
         return F.linear(x[:, -1].float(), self.weight)
@@ -1477,10 +1482,33 @@ class ParallelHead(nn.Module):
         if world_size <= 1:
             return local_indices
 
-        local_pack = torch.stack((local_values, local_indices.to(local_values.dtype)), dim=-1).contiguous()
-        all_packs = [torch.empty_like(local_pack) for _ in range(world_size)]
-        dist.all_gather(all_packs, local_pack)
-        packs = torch.stack(all_packs, dim=0)
+        if _a800_argmax_gather_into_tensor() and hasattr(dist, "all_gather_into_tensor"):
+            bsz = local_values.numel()
+            local_shape = (bsz, 2)
+            gather_shape = (world_size * bsz, 2)
+            if (
+                self._a800_argmax_local_pack is None
+                or self._a800_argmax_local_pack.shape != local_shape
+                or self._a800_argmax_local_pack.device != local_values.device
+                or self._a800_argmax_local_pack.dtype != local_values.dtype
+            ):
+                self._a800_argmax_local_pack = torch.empty(local_shape, device=local_values.device, dtype=local_values.dtype)
+            if (
+                self._a800_argmax_gather_pack is None
+                or self._a800_argmax_gather_pack.shape != gather_shape
+                or self._a800_argmax_gather_pack.device != local_values.device
+                or self._a800_argmax_gather_pack.dtype != local_values.dtype
+            ):
+                self._a800_argmax_gather_pack = torch.empty(gather_shape, device=local_values.device, dtype=local_values.dtype)
+            self._a800_argmax_local_pack[:, 0].copy_(local_values)
+            self._a800_argmax_local_pack[:, 1].copy_(local_indices.to(local_values.dtype))
+            dist.all_gather_into_tensor(self._a800_argmax_gather_pack, self._a800_argmax_local_pack)
+            packs = self._a800_argmax_gather_pack.view(world_size, bsz, 2)
+        else:
+            local_pack = torch.stack((local_values, local_indices.to(local_values.dtype)), dim=-1).contiguous()
+            all_packs = [torch.empty_like(local_pack) for _ in range(world_size)]
+            dist.all_gather(all_packs, local_pack)
+            packs = torch.stack(all_packs, dim=0)
         best_rank = packs[:, :, 0].argmax(dim=0)
         best_local = packs[:, :, 1].gather(0, best_rank.unsqueeze(0)).squeeze(0).to(local_indices.dtype)
         return best_local + best_rank.to(best_local.dtype) * self.part_vocab_size
@@ -1570,8 +1598,6 @@ class Transformer(nn.Module):
 
     @torch.inference_mode()
     def forward_argmax(self, input_ids: torch.Tensor, start_pos: int = 0):
-        if not _a800_distributed_argmax():
-            return self.forward(input_ids, start_pos).argmax(dim=-1)
         h = self.embed(input_ids)
         h = h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
         for layer in self.layers:
