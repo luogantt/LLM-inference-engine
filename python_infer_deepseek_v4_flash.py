@@ -147,6 +147,7 @@ def run_inference(args: argparse.Namespace) -> None:
     a800_eos_check_interval = os.getenv("A800_EOS_CHECK_INTERVAL", "").strip()
     a800_defer_token_decode = os.getenv("A800_DEFER_TOKEN_DECODE", "").strip().lower() in {"1", "true", "yes", "on"}
     a800_single_prompt_fast = os.getenv("A800_SINGLE_PROMPT_FAST_GENERATE", "").strip().lower() in {"1", "true", "yes", "on"}
+    a800_distributed_argmax = os.getenv("A800_DISTRIBUTED_ARGMAX", "").strip().lower() in {"1", "true", "yes", "on"}
 
     if model_args.scale_dtype == "fp32" or a800_force_dequant:
         import torch.nn as nn
@@ -230,6 +231,11 @@ def run_inference(args: argparse.Namespace) -> None:
         print(
             "[A800 compat] A800_SINGLE_PROMPT_FAST_GENERATE=1, "
             "skip generic batch prompt-mask path for batch=1 throughput tests"
+        )
+    if a800_distributed_argmax:
+        print(
+            "[A800 compat] A800_DISTRIBUTED_ARGMAX=1, "
+            "greedy decode gathers per-rank max logits instead of full vocab logits"
         )
 
     torch.set_default_device("cuda")

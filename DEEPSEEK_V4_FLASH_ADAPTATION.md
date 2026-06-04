@@ -452,12 +452,13 @@ FP4 .so + fused FFN + fast MoE + reused MoE y + shared FP8 cache: 2.652 tok/s
 FP4 .so + fused FFN + fast MoE + shared FP8 cache + hash gate top-k-only: 2.629 tok/s
 FP4 .so + fused FFN + fast MoE + shared/attention FP8 cache + EOS sync off: 2.751 tok/s
 FP4 .so + fused FFN + fast MoE + shared/attention FP8 cache + EOS sync off + deferred decode: 2.776 tok/s
+FP4 .so + fused FFN + fast MoE + shared/attention FP8 cache + EOS sync off + deferred decode + single prompt fast path: 2.794 tok/s
 FP4 .so + fused FFN + fast MoE + FP32 MoE reduce + direct accum: 2.513 tok/s
 FP4 .so + fused FFN + fast MoE + BF16 MoE reduce: 2.533 tok/s
 FP4 .so + fast MoE + BF16 MoE reduce, FFN fused off: 2.387 tok/s
 ```
 
-Best log so far: `deepseek_v4_flash_a800_best_ffn_fastmoe_fp32reduce_128.log`
+Best log so far: `deepseek_v4_flash_a800_singlefast_128.log`
 
 建议先单独测试 FFN 开关，不要同时打开 FP4 LRU cache，避免性能归因混在一起：
 
@@ -480,5 +481,12 @@ export A800_CACHE_ATTN_FP8=1
 export A800_EOS_CHECK_INTERVAL=0
 export A800_DEFER_TOKEN_DECODE=1
 export A800_SINGLE_PROMPT_FAST_GENERATE=1
+export A800_DISTRIBUTED_ARGMAX=1
 export A800_CUDA_LIB=./build/libdeepseek_v4_a800.so
+```
+
+`A800_DISTRIBUTED_ARGMAX=1` is a greedy-decode-only optimization. It avoids `all_gather` of full vocab logits across tensor-parallel ranks and gathers only each rank's local max logit and token id. Disable it for sampling runs or if you need to compare exact full-logits behavior:
+
+```bash
+export A800_DISTRIBUTED_ARGMAX=0
 ```

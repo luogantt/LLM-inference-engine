@@ -30,6 +30,16 @@ def _single_prompt_fast_generate() -> bool:
     return os.getenv("A800_SINGLE_PROMPT_FAST_GENERATE", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _distributed_argmax() -> bool:
+    return os.getenv("A800_DISTRIBUTED_ARGMAX", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _greedy_next_token(model: Transformer, input_ids: torch.Tensor, start_pos: int) -> torch.Tensor:
+    if _distributed_argmax() and hasattr(model, "forward_argmax"):
+        return model.forward_argmax(input_ids, start_pos)
+    return model.forward(input_ids, start_pos).argmax(dim=-1)
+
+
 def sample(logits, temperature: float = 1.0):
     """Gumbel-max trick: equivalent to multinomial sampling but faster on GPU,
     since it avoids the GPU-to-CPU sync in torch.multinomial."""
@@ -76,11 +86,11 @@ def generate(
         eos_check_interval = _eos_check_interval()
         decode_steps = 0
         for cur_pos in range(prompt_len, total_len):
-            logits = model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
             if temperature > 0:
+                logits = model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
                 next_token = sample(logits, temperature)
             else:
-                next_token = logits.argmax(dim=-1)
+                next_token = _greedy_next_token(model, tokens[:, prev_pos:cur_pos], prev_pos)
             tokens[:, cur_pos] = next_token
             decode_steps += 1
             prev_pos = cur_pos
@@ -96,11 +106,11 @@ def generate(
     eos_check_interval = _eos_check_interval()
     decode_steps = 0
     for cur_pos in range(min(prompt_lens), total_len):
-        logits = model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
         if temperature > 0:
+            logits = model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
             next_token = sample(logits, temperature)
         else:
-            next_token = logits.argmax(dim=-1)
+            next_token = _greedy_next_token(model, tokens[:, prev_pos:cur_pos], prev_pos)
         next_token = torch.where(prompt_mask[:, cur_pos], tokens[:, cur_pos], next_token)
         tokens[:, cur_pos] = next_token
         decode_steps += 1

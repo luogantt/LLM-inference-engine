@@ -104,6 +104,10 @@ def _a800_hash_gate_topk_only() -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _a800_distributed_argmax() -> bool:
+    return _env_flag("A800_DISTRIBUTED_ARGMAX")
+
+
 def _a800_fp4_cache_limit_bytes() -> int:
     if not _a800_cache_fp4_weight():
         return 0
@@ -1465,6 +1469,22 @@ class ParallelHead(nn.Module):
             logits = torch.cat(all_logits, dim=-1)
         return logits
 
+    def argmax(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor, norm: RMSNorm):
+        # Greedy decode only needs the global max token. Avoid all-gathering full vocab logits.
+        x = self.hc_head(x, hc_fn, hc_scale, hc_base)
+        logits = self.get_logits(norm(x))
+        local_values, local_indices = logits.max(dim=-1)
+        if world_size <= 1:
+            return local_indices
+
+        local_pack = torch.stack((local_values, local_indices.to(local_values.dtype)), dim=-1).contiguous()
+        all_packs = [torch.empty_like(local_pack) for _ in range(world_size)]
+        dist.all_gather(all_packs, local_pack)
+        packs = torch.stack(all_packs, dim=0)
+        best_rank = packs[:, :, 0].argmax(dim=0)
+        best_local = packs[:, :, 1].gather(0, best_rank.unsqueeze(0)).squeeze(0).to(local_indices.dtype)
+        return best_local + best_rank.to(best_local.dtype) * self.part_vocab_size
+
     def hc_head(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor):
         shape, dtype = x.size(), x.dtype
         x = x.flatten(2).float()
@@ -1547,6 +1567,16 @@ class Transformer(nn.Module):
             h = layer(h, start_pos, input_ids)
         logits = self.head(h, self.hc_head_fn, self.hc_head_scale, self.hc_head_base, self.norm)
         return logits
+
+    @torch.inference_mode()
+    def forward_argmax(self, input_ids: torch.Tensor, start_pos: int = 0):
+        if not _a800_distributed_argmax():
+            return self.forward(input_ids, start_pos).argmax(dim=-1)
+        h = self.embed(input_ids)
+        h = h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
+        for layer in self.layers:
+            h = layer(h, start_pos, input_ids)
+        return self.head.argmax(h, self.hc_head_fn, self.hc_head_scale, self.hc_head_base, self.norm)
 
 
 if __name__ == "__main__":
