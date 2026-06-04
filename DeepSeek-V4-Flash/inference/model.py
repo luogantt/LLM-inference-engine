@@ -93,6 +93,13 @@ def _a800_cache_gate_weight_f32() -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _a800_hash_gate_topk_only() -> bool:
+    value = os.getenv("A800_HASH_GATE_TOPK_ONLY")
+    if value is None or value.strip() == "":
+        return _a800_force_dequant_gemm()
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _a800_fp4_cache_limit_bytes() -> int:
     if not _a800_cache_fp4_weight():
         return 0
@@ -1236,6 +1243,18 @@ class Gate(nn.Module):
         return weight
 
     def forward(self, x: torch.Tensor, input_ids: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.hash and self.score_func != "softmax" and _a800_hash_gate_topk_only():
+            indices = self.tid2eid[input_ids].long()
+            selected_weight = self.weight[indices].float()
+            scores = torch.bmm(selected_weight, x.float().unsqueeze(-1)).squeeze(-1)
+            if self.score_func == "sigmoid":
+                weights = scores.sigmoid()
+            else:
+                weights = F.softplus(scores).sqrt()
+            weights /= weights.sum(dim=-1, keepdim=True)
+            weights *= self.route_scale
+            return weights, indices
+
         scores = linear(x.float(), self._gate_weight_f32())
         if self.score_func == "softmax":
             scores = scores.softmax(dim=-1)

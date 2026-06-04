@@ -137,6 +137,12 @@ def run_inference(args: argparse.Namespace) -> None:
         else a800_cache_gate_weight_value in {"1", "true", "yes", "on"}
     )
     a800_cache_shared_fp8 = os.getenv("A800_CACHE_SHARED_FP8", "").strip().lower() in {"1", "true", "yes", "on"}
+    a800_hash_gate_topk_value = os.getenv("A800_HASH_GATE_TOPK_ONLY", "").strip().lower()
+    a800_hash_gate_topk = (
+        a800_force_dequant
+        if a800_hash_gate_topk_value == ""
+        else a800_hash_gate_topk_value in {"1", "true", "yes", "on"}
+    )
 
     if model_args.scale_dtype == "fp32" or a800_force_dequant:
         import torch.nn as nn
@@ -195,6 +201,11 @@ def run_inference(args: argparse.Namespace) -> None:
         print(
             "[A800 compat] A800_CACHE_SHARED_FP8=1, "
             "cache BF16 dequantized FP8 shared-expert weights only"
+        )
+    if a800_hash_gate_topk:
+        print(
+            "[A800 compat] A800_HASH_GATE_TOPK_ONLY=1, "
+            "hash-routed MoE layers score selected experts only"
         )
 
     torch.set_default_device("cuda")

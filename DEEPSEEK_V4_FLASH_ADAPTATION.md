@@ -412,12 +412,19 @@ Shared expert weights are FP8 dense weights and are used once per MoE layer on e
 export A800_CACHE_SHARED_FP8=1
 ```
 
+The first hash-routed MoE layers already know their selected expert ids from the token id. For non-softmax gate scores, A800 can score only those selected experts instead of doing a full 256-expert gate matmul:
+
+```bash
+export A800_HASH_GATE_TOPK_ONLY=1
+```
+
 Current A800 4-GPU 128-token measurements:
 
 ```text
 FP4 .so + fused FFN + fast MoE + FP32 MoE reduce: 2.578 tok/s
 FP4 .so + fused FFN + fast MoE + FP32 MoE reduce + reused MoE y: 2.584 tok/s
 FP4 .so + fused FFN + fast MoE + FP32 MoE reduce + reused MoE y + cached gate f32: 2.506 tok/s
+FP4 .so + fused FFN + fast MoE + reused MoE y + shared FP8 cache: 2.652 tok/s
 FP4 .so + fused FFN + fast MoE + FP32 MoE reduce + direct accum: 2.513 tok/s
 FP4 .so + fused FFN + fast MoE + BF16 MoE reduce: 2.533 tok/s
 FP4 .so + fast MoE + BF16 MoE reduce, FFN fused off: 2.387 tok/s
@@ -441,5 +448,6 @@ export A800_BF16_MOE_REDUCE=0
 export A800_REUSE_DECODE_MOE_Y=1
 export A800_CACHE_GATE_WEIGHT_F32=0
 export A800_CACHE_SHARED_FP8=1
+export A800_HASH_GATE_TOPK_ONLY=1
 export A800_CUDA_LIB=./build/libdeepseek_v4_a800.so
 ```
