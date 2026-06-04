@@ -148,7 +148,7 @@ def run_inference(args: argparse.Namespace) -> None:
     a800_defer_token_decode = os.getenv("A800_DEFER_TOKEN_DECODE", "").strip().lower() in {"1", "true", "yes", "on"}
     a800_single_prompt_fast = os.getenv("A800_SINGLE_PROMPT_FAST_GENERATE", "").strip().lower() in {"1", "true", "yes", "on"}
     a800_distributed_argmax = os.getenv("A800_DISTRIBUTED_ARGMAX", "").strip().lower() in {"1", "true", "yes", "on"}
-    a800_argmax_gather_tensor_value = os.getenv("A800_ARGMAX_GATHER_INTO_TENSOR", "").strip()
+    a800_argmax_gather_tensor = os.getenv("A800_ARGMAX_GATHER_INTO_TENSOR", "").strip().lower() in {"1", "true", "yes", "on"}
 
     if model_args.scale_dtype == "fp32" or a800_force_dequant:
         import torch.nn as nn
@@ -238,7 +238,7 @@ def run_inference(args: argparse.Namespace) -> None:
             "[A800 compat] A800_DISTRIBUTED_ARGMAX=1, "
             "greedy decode gathers per-rank max logits instead of full vocab logits"
         )
-        if a800_argmax_gather_tensor_value != "0":
+        if a800_argmax_gather_tensor:
             print(
                 "[A800 compat] A800_ARGMAX_GATHER_INTO_TENSOR=1, "
                 "reuse a tiny preallocated all_gather_into_tensor buffer for greedy decode"

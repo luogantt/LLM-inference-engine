@@ -107,7 +107,7 @@ def _a800_hash_gate_topk_only() -> bool:
 def _a800_argmax_gather_into_tensor() -> bool:
     value = os.getenv("A800_ARGMAX_GATHER_INTO_TENSOR")
     if value is None or value.strip() == "":
-        return True
+        return False
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
