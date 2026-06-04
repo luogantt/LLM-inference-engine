@@ -48,6 +48,45 @@ def load_prompts(args: argparse.Namespace) -> List[str]:
     return [args.prompt]
 
 
+def configure_a800_compat(args: argparse.Namespace, torch, local_rank: int) -> List[str]:
+    if args.a800_compat == "off":
+        return []
+
+    capability = torch.cuda.get_device_capability(local_rank) if torch.cuda.is_available() else None
+    config_name = Path(args.config).name.lower()
+    auto_enable = capability == (8, 0) or "a800" in config_name
+    if args.a800_compat != "on" and not auto_enable:
+        return []
+
+    defaults = {
+        "A800_FORCE_DEQUANT_GEMM": "1",
+        "A800_DEQUANT_DTYPE": "bf16",
+        "A800_USE_CUDA_FP4_GEMM": "1",
+        "A800_USE_CUDA_FP4_FFN": "1",
+        "A800_USE_CUDA_FP4_ACCUM": "0",
+        "A800_FAST_DECODE_MOE": "1",
+        "A800_BF16_MOE_REDUCE": "0",
+        "A800_REUSE_DECODE_MOE_Y": "1",
+        "A800_CACHE_GATE_WEIGHT_F32": "0",
+        "A800_CACHE_SHARED_FP8": "1",
+        "A800_HASH_GATE_TOPK_ONLY": "0",
+        "A800_CACHE_ATTN_FP8": "1",
+        "A800_EOS_CHECK_INTERVAL": "0",
+        "A800_DEFER_TOKEN_DECODE": "1",
+        "A800_SINGLE_PROMPT_FAST_GENERATE": "1",
+        "A800_DISTRIBUTED_ARGMAX": "1",
+        "A800_ARGMAX_GATHER_INTO_TENSOR": "0",
+        "A800_CUDA_LIB": "./build/libdeepseek_v4_a800.so",
+    }
+
+    applied = []
+    for name, value in defaults.items():
+        if os.getenv(name, "").strip() == "":
+            os.environ[name] = value
+            applied.append(name)
+    return applied
+
+
 def run_inference(args: argparse.Namespace) -> None:
     import torch
     import torch.distributed as dist
@@ -75,6 +114,7 @@ def run_inference(args: argparse.Namespace) -> None:
     torch.set_default_dtype(torch.bfloat16)
     torch.set_num_threads(args.torch_threads)
     torch.manual_seed(args.seed)
+    a800_defaults = configure_a800_compat(args, torch, local_rank)
 
     with open(args.config, encoding="utf-8") as f:
         model_args = ModelArgs(**json.load(f))
@@ -95,6 +135,8 @@ def run_inference(args: argparse.Namespace) -> None:
     print(f"config={args.config}")
     print(f"world_size={world_size}, rank={rank}, local_rank={local_rank}")
     print(f"max_seq_len={model_args.max_seq_len}, max_batch_size={model_args.max_batch_size}")
+    if a800_defaults:
+        print(f"[A800 compat] auto defaults applied: {','.join(a800_defaults)}")
 
     with torch.device("cuda"):
         model = Transformer(model_args)
@@ -335,6 +377,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--thinking-mode", default="chat", choices=["chat", "thinking"])
     p.add_argument("--warmup", action="store_true", help="run one warmup generation before timing")
     p.add_argument("--bench-iters", type=int, default=1, help="repeat timed generation after warmup and report best/avg")
+    p.add_argument(
+        "--a800-compat",
+        default="auto",
+        choices=["auto", "on", "off"],
+        help="auto-fill safe A800(sm80) fallback env defaults; use off for official TileLang paths",
+    )
     p.add_argument("--torch-threads", type=int, default=8)
     p.add_argument("--seed", type=int, default=33377335)
 

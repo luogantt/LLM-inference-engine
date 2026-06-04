@@ -255,6 +255,12 @@ export A800_FORCE_DEQUANT_GEMM=1
 export A800_DEQUANT_DTYPE=bf16
 ```
 
+The root wrapper now applies the recommended A800 fallback defaults automatically when it detects a CUDA `sm80` device or an A800 config filename. This prevents accidental fallback into the official TileLang SM89 FP8 path after opening a fresh shell. To force the official path for debugging, pass:
+
+```bash
+--a800-compat off
+```
+
 开启后，`DeepSeek-V4-Flash/inference/model.py` 的 `linear()` 会绕过 TileLang `fp8_gemm/fp4_gemm`：
 
 ```text
@@ -358,6 +364,8 @@ export A800_DEQUANT_DTYPE=bf16
 export A800_USE_CUDA_FP4_GEMM=1
 export A800_CUDA_LIB=./build/libdeepseek_v4_a800.so
 ```
+
+These variables are still useful for explicit A/B tests. For normal A800 runs, the wrapper's default `--a800-compat auto` will fill any missing variables with the values above.
 
 如果动态库不存在、scale 不是 fp32、输入不是 bf16，代码会自动回退到 PyTorch fallback。
 
