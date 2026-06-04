@@ -26,6 +26,10 @@ def _eos_check_interval() -> int:
         return 1
 
 
+def _single_prompt_fast_generate() -> bool:
+    return os.getenv("A800_SINGLE_PROMPT_FAST_GENERATE", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def sample(logits, temperature: float = 1.0):
     """Gumbel-max trick: equivalent to multinomial sampling but faster on GPU,
     since it avoids the GPU-to-CPU sync in torch.multinomial."""
@@ -66,6 +70,26 @@ def generate(
     tokens = torch.full((len(prompt_tokens), total_len), -1, dtype=torch.long)
     for i, t in enumerate(prompt_tokens):
         tokens[i, :len(t)] = torch.tensor(t, dtype=torch.long)
+    if _single_prompt_fast_generate() and len(prompt_tokens) == 1:
+        prev_pos = 0
+        prompt_len = prompt_lens[0]
+        eos_check_interval = _eos_check_interval()
+        decode_steps = 0
+        for cur_pos in range(prompt_len, total_len):
+            logits = model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
+            if temperature > 0:
+                next_token = sample(logits, temperature)
+            else:
+                next_token = logits.argmax(dim=-1)
+            tokens[:, cur_pos] = next_token
+            decode_steps += 1
+            prev_pos = cur_pos
+            if eos_check_interval and decode_steps % eos_check_interval == 0 and (next_token == eos_id).all():
+                break
+        if return_tensor:
+            return tokens, prompt_lens
+        return finalize_completion_tokens(tokens, prompt_lens, max_new_tokens, eos_id)
+
     prev_pos = 0
     finished = torch.tensor([False] * len(prompt_tokens))
     prompt_mask = tokens != -1

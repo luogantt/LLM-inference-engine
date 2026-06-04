@@ -436,6 +436,12 @@ The default `generate()` return path converts the CUDA token tensor to a Python 
 export A800_DEFER_TOKEN_DECODE=1
 ```
 
+The benchmark command uses a single prompt with `max_batch_size=1`. A narrow generation path can skip the generic batch prompt-mask logic for that case:
+
+```bash
+export A800_SINGLE_PROMPT_FAST_GENERATE=1
+```
+
 Current A800 4-GPU 128-token measurements:
 
 ```text
@@ -445,6 +451,7 @@ FP4 .so + fused FFN + fast MoE + FP32 MoE reduce + reused MoE y + cached gate f3
 FP4 .so + fused FFN + fast MoE + reused MoE y + shared FP8 cache: 2.652 tok/s
 FP4 .so + fused FFN + fast MoE + shared FP8 cache + hash gate top-k-only: 2.629 tok/s
 FP4 .so + fused FFN + fast MoE + shared/attention FP8 cache + EOS sync off: 2.751 tok/s
+FP4 .so + fused FFN + fast MoE + shared/attention FP8 cache + EOS sync off + deferred decode: 2.776 tok/s
 FP4 .so + fused FFN + fast MoE + FP32 MoE reduce + direct accum: 2.513 tok/s
 FP4 .so + fused FFN + fast MoE + BF16 MoE reduce: 2.533 tok/s
 FP4 .so + fast MoE + BF16 MoE reduce, FFN fused off: 2.387 tok/s
@@ -472,5 +479,6 @@ export A800_HASH_GATE_TOPK_ONLY=0
 export A800_CACHE_ATTN_FP8=1
 export A800_EOS_CHECK_INTERVAL=0
 export A800_DEFER_TOKEN_DECODE=1
+export A800_SINGLE_PROMPT_FAST_GENERATE=1
 export A800_CUDA_LIB=./build/libdeepseek_v4_a800.so
 ```

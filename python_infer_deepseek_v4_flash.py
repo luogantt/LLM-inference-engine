@@ -146,6 +146,7 @@ def run_inference(args: argparse.Namespace) -> None:
     a800_cache_attn_fp8 = os.getenv("A800_CACHE_ATTN_FP8", "").strip().lower() in {"1", "true", "yes", "on"}
     a800_eos_check_interval = os.getenv("A800_EOS_CHECK_INTERVAL", "").strip()
     a800_defer_token_decode = os.getenv("A800_DEFER_TOKEN_DECODE", "").strip().lower() in {"1", "true", "yes", "on"}
+    a800_single_prompt_fast = os.getenv("A800_SINGLE_PROMPT_FAST_GENERATE", "").strip().lower() in {"1", "true", "yes", "on"}
 
     if model_args.scale_dtype == "fp32" or a800_force_dequant:
         import torch.nn as nn
@@ -224,6 +225,11 @@ def run_inference(args: argparse.Namespace) -> None:
         print(
             "[A800 compat] A800_DEFER_TOKEN_DECODE=1, "
             "move token tensor CPU conversion and tokenizer decode outside timed region"
+        )
+    if a800_single_prompt_fast:
+        print(
+            "[A800 compat] A800_SINGLE_PROMPT_FAST_GENERATE=1, "
+            "skip generic batch prompt-mask path for batch=1 throughput tests"
         )
 
     torch.set_default_device("cuda")
