@@ -1,5 +1,7 @@
 # Ascend 47-50 tok/s 优化原因总结
 
+项目地址：[https://github.com/luogantt/LLM-inference-engine](https://github.com/luogantt/LLM-inference-engine)
+
 本文总结此前在 Ascend 芯片上把 DeepSeek-R1-Distill-Qwen-7B 推理速度优化到约 47-50 tok/s 的主要原因。
 
 ## 一句话结论
