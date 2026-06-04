@@ -34,14 +34,26 @@ def sample(logits, temperature: float = 1.0):
     return probs.div_(torch.empty_like(probs).exponential_(1)).argmax(dim=-1)
 
 
+def finalize_completion_tokens(tokens: torch.Tensor, prompt_lens: List[int], max_new_tokens: int, eos_id: int) -> List[List[int]]:
+    completion_tokens = []
+    for i, toks in enumerate(tokens.tolist()):
+        toks = toks[prompt_lens[i]:prompt_lens[i]+max_new_tokens]
+        if eos_id in toks:
+            toks = toks[:toks.index(eos_id)]
+        toks.append(eos_id)
+        completion_tokens.append(toks)
+    return completion_tokens
+
+
 @torch.inference_mode()
 def generate(
     model: Transformer,
     prompt_tokens: List[List[int]],
     max_new_tokens: int,
     eos_id: int,
-    temperature: float = 1.0
-) -> List[List[int]]:
+    temperature: float = 1.0,
+    return_tensor: bool = False,
+):
     """Batch generation with left-padded prompts.
 
     The first forward pass processes [min_prompt_len:] tokens (prefill phase).
@@ -73,14 +85,9 @@ def generate(
             finished |= torch.logical_and(~prompt_mask[:, cur_pos], next_token == eos_id)
             if decode_steps % eos_check_interval == 0 and finished.all():
                 break
-    completion_tokens = []
-    for i, toks in enumerate(tokens.tolist()):
-        toks = toks[prompt_lens[i]:prompt_lens[i]+max_new_tokens]
-        if eos_id in toks:
-            toks = toks[:toks.index(eos_id)]
-        toks.append(eos_id)
-        completion_tokens.append(toks)
-    return completion_tokens
+    if return_tensor:
+        return tokens, prompt_lens
+    return finalize_completion_tokens(tokens, prompt_lens, max_new_tokens, eos_id)
 
 
 def main(

@@ -55,7 +55,7 @@ def run_inference(args: argparse.Namespace) -> None:
     from transformers import AutoTokenizer
 
     from encoding_dsv4 import encode_messages
-    from generate import generate
+    from generate import finalize_completion_tokens, generate
     from model import ModelArgs, Transformer
 
     world_size = int(os.getenv("WORLD_SIZE", "1"))
@@ -145,6 +145,7 @@ def run_inference(args: argparse.Namespace) -> None:
     )
     a800_cache_attn_fp8 = os.getenv("A800_CACHE_ATTN_FP8", "").strip().lower() in {"1", "true", "yes", "on"}
     a800_eos_check_interval = os.getenv("A800_EOS_CHECK_INTERVAL", "").strip()
+    a800_defer_token_decode = os.getenv("A800_DEFER_TOKEN_DECODE", "").strip().lower() in {"1", "true", "yes", "on"}
 
     if model_args.scale_dtype == "fp32" or a800_force_dequant:
         import torch.nn as nn
@@ -219,6 +220,11 @@ def run_inference(args: argparse.Namespace) -> None:
             f"[A800 compat] A800_EOS_CHECK_INTERVAL={a800_eos_check_interval}, "
             "0 disables per-token EOS synchronization during timing"
         )
+    if a800_defer_token_decode:
+        print(
+            "[A800 compat] A800_DEFER_TOKEN_DECODE=1, "
+            "move token tensor CPU conversion and tokenizer decode outside timed region"
+        )
 
     torch.set_default_device("cuda")
 
@@ -235,17 +241,36 @@ def run_inference(args: argparse.Namespace) -> None:
         print(p)
 
     if args.warmup:
-        generate(model, prompt_tokens, args.max_new_tokens, eos_id, args.temperature)
+        generate(
+            model,
+            prompt_tokens,
+            args.max_new_tokens,
+            eos_id,
+            args.temperature,
+            return_tensor=a800_defer_token_decode,
+        )
         if torch.cuda.is_available():
             torch.cuda.synchronize()
 
     t0 = time.perf_counter()
-    completion_tokens = generate(model, prompt_tokens, args.max_new_tokens, eos_id, args.temperature)
+    token_result = generate(
+        model,
+        prompt_tokens,
+        args.max_new_tokens,
+        eos_id,
+        args.temperature,
+        return_tensor=a800_defer_token_decode,
+    )
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     t1 = time.perf_counter()
 
     if rank == 0:
+        if a800_defer_token_decode:
+            tokens, prompt_lens = token_result
+            completion_tokens = finalize_completion_tokens(tokens, prompt_lens, args.max_new_tokens, eos_id)
+        else:
+            completion_tokens = token_result
         completions = tokenizer.batch_decode(completion_tokens)
         new_tokens = sum(len(t) for t in completion_tokens)
         elapsed = t1 - t0
