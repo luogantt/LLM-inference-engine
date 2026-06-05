@@ -799,8 +799,8 @@ def _a800_cuda_fp4_topk_expert_ffn_accum(
     idx = indices.reshape(-1)
     if idx.numel() != route.numel():
         return False
-    if idx.dtype != torch.int32:
-        idx = idx.to(torch.int32)
+    if idx.dtype != torch.int64:
+        idx = idx.to(torch.int64)
     if not idx.is_contiguous():
         idx = idx.contiguous()
 

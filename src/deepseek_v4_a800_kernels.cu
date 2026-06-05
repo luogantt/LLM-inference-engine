@@ -247,7 +247,7 @@ __global__ void fp4_expert_gate_up_fused_kernel(
 __global__ void fp4_topk_gate_up_fused_kernel(
     const __nv_bfloat16* __restrict__ x,
     const float* __restrict__ routes,
-    const int32_t* __restrict__ indices,
+    const int64_t* __restrict__ indices,
     const uintptr_t* __restrict__ packed_w1_ptrs,
     const uintptr_t* __restrict__ scales1_ptrs,
     const uintptr_t* __restrict__ packed_w3_ptrs,
@@ -269,7 +269,7 @@ __global__ void fp4_topk_gate_up_fused_kernel(
     int top_idx = blockIdx.y;
     int tid = threadIdx.x;
 
-    int expert_id = indices[top_idx];
+    int expert_id = static_cast<int>(indices[top_idx]);
     int local_e = expert_id - local_start;
     if (local_e < 0 || local_e >= n_local) {
         if (tid == 0) {
@@ -354,7 +354,7 @@ __global__ void fp4_topk_gate_up_fused_kernel(
 
 __global__ void fp4_topk_w2_accum_f32_kernel(
     const __nv_bfloat16* __restrict__ hidden,
-    const int32_t* __restrict__ indices,
+    const int64_t* __restrict__ indices,
     const uintptr_t* __restrict__ packed_w2_ptrs,
     const uintptr_t* __restrict__ scales2_ptrs,
     float* __restrict__ y_accum,
@@ -376,7 +376,7 @@ __global__ void fp4_topk_w2_accum_f32_kernel(
     const int packed_inter_dim = inter_dim / 2;
 
     for (int top_idx = 0; top_idx < topk; ++top_idx) {
-        int expert_id = indices[top_idx];
+        int expert_id = static_cast<int>(indices[top_idx]);
         int local_e = expert_id - local_start;
         if (local_e < 0 || local_e >= n_local) {
             continue;
@@ -663,7 +663,7 @@ extern "C" int ds_v4_fp4_expert_ffn_accum_f32(
 extern "C" int ds_v4_fp4_topk_expert_ffn_accum_f32(
     const void* x_bf16,
     const void* routes_fp32,
-    const void* indices_i32,
+    const void* indices_i64,
     const void* w1_ptrs_i64,
     const void* s1_ptrs_i64,
     const void* w2_ptrs_i64,
@@ -689,7 +689,7 @@ extern "C" int ds_v4_fp4_topk_expert_ffn_accum_f32(
 ) {
     set_last_error("");
 
-    if (!x_bf16 || !routes_fp32 || !indices_i32 || !w1_ptrs_i64 || !s1_ptrs_i64 ||
+    if (!x_bf16 || !routes_fp32 || !indices_i64 || !w1_ptrs_i64 || !s1_ptrs_i64 ||
         !w2_ptrs_i64 || !s2_ptrs_i64 || !w3_ptrs_i64 || !s3_ptrs_i64 ||
         !hidden_bf16 || !y_accum_f32) {
         set_last_error("null pointer");
@@ -716,7 +716,7 @@ extern "C" int ds_v4_fp4_topk_expert_ffn_accum_f32(
     fp4_topk_gate_up_fused_kernel<<<dim3(inter_dim, topk), threads, shared_pair_bytes, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(x_bf16),
         reinterpret_cast<const float*>(routes_fp32),
-        reinterpret_cast<const int32_t*>(indices_i32),
+        reinterpret_cast<const int64_t*>(indices_i64),
         reinterpret_cast<const uintptr_t*>(w1_ptrs_i64),
         reinterpret_cast<const uintptr_t*>(s1_ptrs_i64),
         reinterpret_cast<const uintptr_t*>(w3_ptrs_i64),
@@ -743,7 +743,7 @@ extern "C" int ds_v4_fp4_topk_expert_ffn_accum_f32(
 
     fp4_topk_w2_accum_f32_kernel<<<dim3(dim), threads, shared_bytes, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(hidden_bf16),
-        reinterpret_cast<const int32_t*>(indices_i32),
+        reinterpret_cast<const int64_t*>(indices_i64),
         reinterpret_cast<const uintptr_t*>(w2_ptrs_i64),
         reinterpret_cast<const uintptr_t*>(s2_ptrs_i64),
         reinterpret_cast<float*>(y_accum_f32),
