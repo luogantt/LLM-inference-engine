@@ -32,6 +32,39 @@ _A800_PROFILE_ENABLED = None
 _A800_PROFILE_EVENTS = []
 
 
+class _A800NoopProfileRegion:
+    __slots__ = ()
+
+    def __enter__(self):
+        return None
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+class _A800CudaProfileRegion:
+    __slots__ = ("name", "start", "end")
+
+    def __init__(self, name: str):
+        self.name = name
+        self.start = None
+        self.end = None
+
+    def __enter__(self):
+        self.start = torch.cuda.Event(enable_timing=True)
+        self.end = torch.cuda.Event(enable_timing=True)
+        self.start.record()
+        return None
+
+    def __exit__(self, exc_type, exc, tb):
+        self.end.record()
+        _A800_PROFILE_EVENTS.append((self.name, self.start, self.end))
+        return False
+
+
+_A800_NOOP_PROFILE_REGION = _A800NoopProfileRegion()
+
+
 def _env_flag(name: str) -> bool:
     return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -43,19 +76,10 @@ def _a800_profile_stages() -> bool:
     return _A800_PROFILE_ENABLED
 
 
-@contextmanager
 def _a800_profile_region(name: str):
     if not _a800_profile_stages() or not torch.cuda.is_available():
-        yield
-        return
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    try:
-        yield
-    finally:
-        end.record()
-        _A800_PROFILE_EVENTS.append((name, start, end))
+        return _A800_NOOP_PROFILE_REGION
+    return _A800CudaProfileRegion(name)
 
 
 def a800_profile_reset() -> None:
