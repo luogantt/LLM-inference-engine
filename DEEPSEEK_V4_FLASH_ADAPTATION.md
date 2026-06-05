@@ -455,6 +455,25 @@ Shared expert weights are FP8 dense weights and are used once per MoE layer on e
 export A800_CACHE_SHARED_FP8=1
 ```
 
+An experimental shared-expert `.so` path is also available for A/B testing. It keeps the shared expert inside the CUDA dynamic library:
+
+```text
+kernel 1: FP8 w1 + w3 dequant/dot + SwiGLU -> BF16 hidden
+kernel 2: FP8 w2 dequant/dot -> BF16 shared output
+```
+
+This path bypasses PyTorch `F.linear` for the shared expert, but it decodes FP8 weights inside the custom kernel instead of using cuBLAS on cached BF16 weights. It is disabled by default until benchmarked:
+
+```bash
+export A800_USE_CUDA_SHARED_FFN=1
+```
+
+Because this adds a new C ABI symbol, rebuild the dynamic library before testing:
+
+```bash
+make -f Makefile.cuda_lib deepseek-v4-a800 A=sm_80
+```
+
 The first hash-routed MoE layers already know their selected expert ids from the token id. For non-softmax gate scores, A800 can score only those selected experts instead of doing a full 256-expert gate matmul. This was tested slightly slower than the regular gate matmul on A800, so it is disabled by default and should be used only for A/B checks:
 
 ```bash
@@ -515,6 +534,7 @@ FP4 .so + grouped top-k FFN + reused top-k hidden buffer + async MoE all-reduce 
 FP4 .so + reused top-k int32 index buffer: best 2.948 tok/s, avg 2.925 tok/s
 FP4 .so + reused distributed argmax pack buffers: best 2.993 tok/s, avg 2.988 tok/s
 FP4 .so + packed-byte FP4 dot decode: best 2.916 tok/s, avg 2.912 tok/s
+FP4 .so + experimental FP8 shared expert .so: pending A/B test
 FP4 .so + fused FFN + fast MoE + FP32 MoE reduce + direct accum: 2.513 tok/s
 FP4 .so + fused FFN + fast MoE + BF16 MoE reduce: 2.533 tok/s
 FP4 .so + fast MoE + BF16 MoE reduce, FFN fused off: 2.387 tok/s
@@ -533,6 +553,7 @@ export A800_DEQUANT_DTYPE=bf16
 export A800_USE_CUDA_FP4_GEMM=1
 export A800_USE_CUDA_FP4_FFN=1
 export A800_USE_CUDA_FP4_TOPK_FFN=1
+export A800_USE_CUDA_SHARED_FFN=0
 export A800_USE_CUDA_FP4_ACCUM=0
 export A800_FAST_DECODE_MOE=1
 export A800_BF16_MOE_REDUCE=0
