@@ -97,7 +97,7 @@ def _a800_reuse_decode_moe_y() -> bool:
 def _a800_reuse_topk_index_i32() -> bool:
     value = os.getenv("A800_REUSE_TOPK_INDEX_I32")
     if value is None or value.strip() == "":
-        return _a800_force_dequant_gemm()
+        return False
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
