@@ -97,7 +97,7 @@ def _a800_reuse_decode_moe_y() -> bool:
 def _a800_async_moe_allreduce() -> bool:
     value = os.getenv("A800_ASYNC_MOE_ALLREDUCE")
     if value is None or value.strip() == "":
-        return _a800_force_dequant_gemm()
+        return False
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 

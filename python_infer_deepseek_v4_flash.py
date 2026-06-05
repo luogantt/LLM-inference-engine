@@ -68,7 +68,7 @@ def configure_a800_compat(args: argparse.Namespace, torch, local_rank: int) -> L
         "A800_FAST_DECODE_MOE": "1",
         "A800_BF16_MOE_REDUCE": "0",
         "A800_REUSE_DECODE_MOE_Y": "1",
-        "A800_ASYNC_MOE_ALLREDUCE": "1",
+        "A800_ASYNC_MOE_ALLREDUCE": "0",
         "A800_CACHE_GATE_WEIGHT_F32": "0",
         "A800_CACHE_SHARED_FP8": "1",
         "A800_HASH_GATE_TOPK_ONLY": "0",

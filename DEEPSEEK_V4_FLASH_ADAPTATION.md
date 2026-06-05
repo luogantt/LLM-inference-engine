@@ -474,7 +474,7 @@ The routed MoE output requires an all-reduce across tensor-parallel ranks, while
 export A800_ASYNC_MOE_ALLREDUCE=1
 ```
 
-This is enabled by default under A800 auto compatibility. Disable it for A/B testing with `A800_ASYNC_MOE_ALLREDUCE=0`.
+This was tested slower on A800, so it is disabled by default. Keep `A800_ASYNC_MOE_ALLREDUCE=0` for the current best single-token decode path.
 
 Current A800 4-GPU 128-token measurements:
 
@@ -493,13 +493,14 @@ FP4 .so + A800 auto defaults + distributed argmax list gather, 3-run benchmark: 
 FP4 .so + grouped top-k FFN, 3-run benchmark: best 2.943 tok/s, avg 2.938 tok/s
 FP4 .so + grouped top-k FFN int64 index ABI, 3-run benchmark: best 2.918 tok/s, avg 2.915 tok/s
 FP4 .so + grouped top-k FFN + reused top-k hidden buffer, 3-run benchmark: best 3.006 tok/s, avg 3.003 tok/s
-FP4 .so + async MoE all-reduce overlap: pending A/B benchmark
+FP4 .so + grouped top-k FFN + reused top-k hidden buffer + async MoE all-reduce: best 2.907 tok/s, avg 2.900 tok/s
+FP4 .so + grouped top-k FFN + reused top-k hidden buffer + async MoE all-reduce off: best 3.020 tok/s, avg 3.016 tok/s
 FP4 .so + fused FFN + fast MoE + FP32 MoE reduce + direct accum: 2.513 tok/s
 FP4 .so + fused FFN + fast MoE + BF16 MoE reduce: 2.533 tok/s
 FP4 .so + fast MoE + BF16 MoE reduce, FFN fused off: 2.387 tok/s
 ```
 
-Best log so far: `deepseek_v4_flash_a800_topkffn_reuse_hidden_bench3_128.log`
+Best log so far: `deepseek_v4_flash_a800_async_moe_reduce_bench3_128.log` with `A800_ASYNC_MOE_ALLREDUCE=0`
 
 建议先单独测试 FFN 开关，不要同时打开 FP4 LRU cache，避免性能归因混在一起：
 
@@ -516,7 +517,7 @@ export A800_USE_CUDA_FP4_ACCUM=0
 export A800_FAST_DECODE_MOE=1
 export A800_BF16_MOE_REDUCE=0
 export A800_REUSE_DECODE_MOE_Y=1
-export A800_ASYNC_MOE_ALLREDUCE=1
+export A800_ASYNC_MOE_ALLREDUCE=0
 export A800_CACHE_GATE_WEIGHT_F32=0
 export A800_CACHE_SHARED_FP8=1
 export A800_HASH_GATE_TOPK_ONLY=0
