@@ -468,6 +468,14 @@ The benchmark command uses a single prompt with `max_batch_size=1`. A narrow gen
 export A800_SINGLE_PROMPT_FAST_GENERATE=1
 ```
 
+The routed MoE output requires an all-reduce across tensor-parallel ranks, while the shared expert is local compute and does not depend on the reduced routed output. A800 can launch the all-reduce asynchronously, run the shared expert while communication is in flight, then wait and add both results:
+
+```bash
+export A800_ASYNC_MOE_ALLREDUCE=1
+```
+
+This is enabled by default under A800 auto compatibility. Disable it for A/B testing with `A800_ASYNC_MOE_ALLREDUCE=0`.
+
 Current A800 4-GPU 128-token measurements:
 
 ```text
@@ -485,6 +493,7 @@ FP4 .so + A800 auto defaults + distributed argmax list gather, 3-run benchmark: 
 FP4 .so + grouped top-k FFN, 3-run benchmark: best 2.943 tok/s, avg 2.938 tok/s
 FP4 .so + grouped top-k FFN int64 index ABI, 3-run benchmark: best 2.918 tok/s, avg 2.915 tok/s
 FP4 .so + grouped top-k FFN + reused top-k hidden buffer, 3-run benchmark: best 3.006 tok/s, avg 3.003 tok/s
+FP4 .so + async MoE all-reduce overlap: pending A/B benchmark
 FP4 .so + fused FFN + fast MoE + FP32 MoE reduce + direct accum: 2.513 tok/s
 FP4 .so + fused FFN + fast MoE + BF16 MoE reduce: 2.533 tok/s
 FP4 .so + fast MoE + BF16 MoE reduce, FFN fused off: 2.387 tok/s
@@ -507,6 +516,7 @@ export A800_USE_CUDA_FP4_ACCUM=0
 export A800_FAST_DECODE_MOE=1
 export A800_BF16_MOE_REDUCE=0
 export A800_REUSE_DECODE_MOE_Y=1
+export A800_ASYNC_MOE_ALLREDUCE=1
 export A800_CACHE_GATE_WEIGHT_F32=0
 export A800_CACHE_SHARED_FP8=1
 export A800_HASH_GATE_TOPK_ONLY=0

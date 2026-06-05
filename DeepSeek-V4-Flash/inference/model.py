@@ -94,6 +94,13 @@ def _a800_reuse_decode_moe_y() -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _a800_async_moe_allreduce() -> bool:
+    value = os.getenv("A800_ASYNC_MOE_ALLREDUCE")
+    if value is None or value.strip() == "":
+        return _a800_force_dequant_gemm()
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _a800_cache_gate_weight_f32() -> bool:
     value = os.getenv("A800_CACHE_GATE_WEIGHT_F32")
     if value is None or value.strip() == "":
@@ -1621,6 +1628,20 @@ class MoE(nn.Module):
             _a800_warn_cuda_fp4_fallback(f"top-k pointer table build failed: {exc}")
             return None
 
+    def _add_shared_expert_after_reduce(self, y: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        if world_size <= 1:
+            y += self.shared_experts(x)
+            return y
+        if _a800_async_moe_allreduce():
+            work = dist.all_reduce(y, async_op=True)
+            shared = self.shared_experts(x)
+            work.wait()
+            y += shared
+            return y
+        dist.all_reduce(y)
+        y += self.shared_experts(x)
+        return y
+
     def forward(self, x: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
         shape = x.size()
         x = x.view(-1, self.dim)
@@ -1642,9 +1663,7 @@ class MoE(nn.Module):
                 topk_hidden,
                 y,
             ):
-                if world_size > 1:
-                    dist.all_reduce(y)
-                y += self.shared_experts(x)
+                y = self._add_shared_expert_after_reduce(y, x)
                 return y.type_as(x).view(shape)
             for top, expert_id in enumerate(indices[0].tolist()):
                 if self.experts_start_idx <= expert_id < self.experts_end_idx:
@@ -1654,9 +1673,7 @@ class MoE(nn.Module):
                         x, route, expert.w1, expert.w2, expert.w3, expert.swiglu_limit, y
                     ):
                         y += expert(x, route)
-            if world_size > 1:
-                dist.all_reduce(y)
-            y += self.shared_experts(x)
+            y = self._add_shared_expert_after_reduce(y, x)
             return y.type_as(x).view(shape)
 
         y = torch.zeros_like(x, dtype=moe_accum_dtype)
@@ -1667,9 +1684,7 @@ class MoE(nn.Module):
             expert = self.experts[i]
             idx, top = torch.where(indices == i)
             y[idx] += expert(x[idx], weights[idx, top, None])
-        if world_size > 1:
-            dist.all_reduce(y)
-        y += self.shared_experts(x)
+        y = self._add_shared_expert_after_reduce(y, x)
         return y.type_as(x).view(shape)
 
 

@@ -68,6 +68,7 @@ def configure_a800_compat(args: argparse.Namespace, torch, local_rank: int) -> L
         "A800_FAST_DECODE_MOE": "1",
         "A800_BF16_MOE_REDUCE": "0",
         "A800_REUSE_DECODE_MOE_Y": "1",
+        "A800_ASYNC_MOE_ALLREDUCE": "1",
         "A800_CACHE_GATE_WEIGHT_F32": "0",
         "A800_CACHE_SHARED_FP8": "1",
         "A800_HASH_GATE_TOPK_ONLY": "0",
@@ -174,6 +175,12 @@ def run_inference(args: argparse.Namespace) -> None:
         if a800_reuse_decode_moe_y_value == ""
         else a800_reuse_decode_moe_y_value in {"1", "true", "yes", "on"}
     )
+    a800_async_moe_allreduce_value = os.getenv("A800_ASYNC_MOE_ALLREDUCE", "").strip().lower()
+    a800_async_moe_allreduce = (
+        a800_force_dequant
+        if a800_async_moe_allreduce_value == ""
+        else a800_async_moe_allreduce_value in {"1", "true", "yes", "on"}
+    )
     a800_cache_gate_weight_value = os.getenv("A800_CACHE_GATE_WEIGHT_F32", "").strip().lower()
     a800_cache_gate_weight = (
         False
@@ -246,6 +253,11 @@ def run_inference(args: argparse.Namespace) -> None:
         print(
             "[A800 compat] A800_REUSE_DECODE_MOE_Y=1, "
             "reuse per-layer FP32 MoE decode accumulation buffers"
+        )
+    if a800_async_moe_allreduce:
+        print(
+            "[A800 compat] A800_ASYNC_MOE_ALLREDUCE=1, "
+            "overlap routed MoE all-reduce with shared expert compute"
         )
     if a800_cache_gate_weight:
         print(
