@@ -394,7 +394,9 @@ export A800_USE_CUDA_FP4_TOPK_FFN=1
 
 This path is disabled by default because it changes the MoE dispatch shape and needs A/B testing on A800. If it is slower or unstable, set `A800_USE_CUDA_FP4_TOPK_FFN=0` and keep the current per-expert `.so` fast path.
 
-The grouped kernel consumes PyTorch `topk` int64 expert indices directly, avoiding a per-layer dtype conversion on the common non-hash MoE path. Hash-routed layers may still convert their int32 table output to int64 before the `.so` call.
+The grouped kernel keeps an int32 expert-index ABI. A direct int64-index ABI was tested at best 2.918 tok/s, avg 2.915 tok/s, which was slower than the int32 path, so the int32 ABI remains the preferred path.
+
+The grouped path also reuses one `(topk, inter_dim)` BF16 hidden buffer per MoE layer instead of allocating it inside every `.so` wrapper call. This reduces Python/Torch allocator overhead in single-token decode and needs a fresh A/B run after rebuilding the `.so`.
 
 Because this path adds a new C ABI symbol, rebuild the dynamic library before testing it:
 
@@ -481,6 +483,7 @@ FP4 .so + fused FFN + fast MoE + single prompt fast path + distributed argmax li
 FP4 .so + fused FFN + fast MoE + single prompt fast path + distributed argmax all_gather_into_tensor: 2.784 tok/s
 FP4 .so + A800 auto defaults + distributed argmax list gather, 3-run benchmark: best 2.882 tok/s, avg 2.877 tok/s
 FP4 .so + grouped top-k FFN, 3-run benchmark: best 2.943 tok/s, avg 2.938 tok/s
+FP4 .so + grouped top-k FFN int64 index ABI, 3-run benchmark: best 2.918 tok/s, avg 2.915 tok/s
 FP4 .so + fused FFN + fast MoE + FP32 MoE reduce + direct accum: 2.513 tok/s
 FP4 .so + fused FFN + fast MoE + BF16 MoE reduce: 2.533 tok/s
 FP4 .so + fast MoE + BF16 MoE reduce, FFN fused off: 2.387 tok/s

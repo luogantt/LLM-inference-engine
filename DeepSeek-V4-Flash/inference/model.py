@@ -745,6 +745,7 @@ def _a800_cuda_fp4_topk_expert_ffn_accum(
     local_start: int,
     n_local: int,
     swiglu_limit: float,
+    hidden: Optional[torch.Tensor],
     accum: torch.Tensor,
 ) -> bool:
     if not _a800_use_cuda_fp4_topk_ffn():
@@ -756,6 +757,8 @@ def _a800_cuda_fp4_topk_expert_ffn_accum(
     if ptrs is None:
         return False
     if accum.dtype != torch.float32 or not accum.is_cuda or not accum.is_contiguous():
+        return False
+    if hidden is None or hidden.dtype != x.dtype or not hidden.is_cuda or not hidden.is_contiguous():
         return False
     if _a800_dequant_dtype() != torch.bfloat16:
         return False
@@ -785,6 +788,8 @@ def _a800_cuda_fp4_topk_expert_ffn_accum(
         return False
     if inter_dim <= 0 or dim <= 0:
         return False
+    if hidden.shape != (route_weights.numel(), inter_dim):
+        return False
     if len(s1_shape) != 2 or len(s2_shape) != 2 or len(s3_shape) != 2:
         return False
 
@@ -799,8 +804,8 @@ def _a800_cuda_fp4_topk_expert_ffn_accum(
     idx = indices.reshape(-1)
     if idx.numel() != route.numel():
         return False
-    if idx.dtype != torch.int64:
-        idx = idx.to(torch.int64)
+    if idx.dtype != torch.int32:
+        idx = idx.to(torch.int32)
     if not idx.is_contiguous():
         idx = idx.contiguous()
 
@@ -818,7 +823,6 @@ def _a800_cuda_fp4_topk_expert_ffn_accum(
     if y_2d.size(0) != 1:
         return False
 
-    hidden = torch.empty((route.numel(), inter_dim), device=x.device, dtype=x.dtype)
     stream = torch.cuda.current_stream(x.device).cuda_stream
 
     ret = ffn(
@@ -1511,6 +1515,7 @@ class MoE(nn.Module):
         for linear in (self.shared_experts.w1, self.shared_experts.w2, self.shared_experts.w3):
             linear.weight._a800_shared_fp8 = True
         self._a800_decode_y: Optional[torch.Tensor] = None
+        self._a800_topk_hidden: Optional[torch.Tensor] = None
         self._a800_fp4_topk_ptrs = None
         self._a800_fp4_topk_ptrs_failed = False
         self.swiglu_limit = args.swiglu_limit
@@ -1524,6 +1529,16 @@ class MoE(nn.Module):
             self._a800_decode_y = y
         y.zero_()
         return y
+
+    def _a800_topk_hidden_buffer(self, x: torch.Tensor, topk: int, inter_dim: int) -> Optional[torch.Tensor]:
+        if topk <= 0 or inter_dim <= 0:
+            return None
+        hidden = self._a800_topk_hidden
+        shape = (topk, inter_dim)
+        if hidden is None or hidden.shape != shape or hidden.dtype != x.dtype or hidden.device != x.device:
+            hidden = torch.empty(shape, device=x.device, dtype=x.dtype)
+            self._a800_topk_hidden = hidden
+        return hidden
 
     def _a800_local_fp4_topk_ptrs(self):
         if not _a800_use_cuda_fp4_topk_ffn() or self._a800_fp4_topk_ptrs_failed:
@@ -1614,14 +1629,17 @@ class MoE(nn.Module):
 
         if _a800_fast_decode_moe() and x.size(0) == 1:
             y = self._a800_decode_accum_buffer(x, moe_accum_dtype)
+            topk_ptrs = self._a800_local_fp4_topk_ptrs()
+            topk_hidden = self._a800_topk_hidden_buffer(x, weights.numel(), topk_ptrs[-1]) if topk_ptrs is not None else None
             if _a800_cuda_fp4_topk_expert_ffn_accum(
                 x,
                 weights,
                 indices,
-                self._a800_local_fp4_topk_ptrs(),
+                topk_ptrs,
                 self.experts_start_idx,
                 self.n_local_experts,
                 self.swiglu_limit,
+                topk_hidden,
                 y,
             ):
                 if world_size > 1:
