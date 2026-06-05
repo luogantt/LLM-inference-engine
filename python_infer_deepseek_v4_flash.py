@@ -100,7 +100,7 @@ def run_inference(args: argparse.Namespace) -> None:
 
     from encoding_dsv4 import encode_messages
     from generate import finalize_completion_tokens, generate
-    from model import ModelArgs, Transformer
+    from model import ModelArgs, Transformer, a800_profile_report, a800_profile_reset
 
     world_size = int(os.getenv("WORLD_SIZE", "1"))
     rank = int(os.getenv("RANK", "0"))
@@ -119,6 +119,9 @@ def run_inference(args: argparse.Namespace) -> None:
     torch.set_default_dtype(torch.bfloat16)
     torch.set_num_threads(args.torch_threads)
     torch.manual_seed(args.seed)
+    if args.profile_stages:
+        os.environ["A800_PROFILE_STAGES"] = "1"
+    a800_profile_enabled = os.getenv("A800_PROFILE_STAGES", "").strip().lower() in {"1", "true", "yes", "on"}
     a800_defaults = configure_a800_compat(args, torch, local_rank)
 
     with open(args.config, encoding="utf-8") as f:
@@ -142,6 +145,8 @@ def run_inference(args: argparse.Namespace) -> None:
     print(f"max_seq_len={model_args.max_seq_len}, max_batch_size={model_args.max_batch_size}")
     if a800_defaults:
         print(f"[A800 compat] auto defaults applied: {','.join(a800_defaults)}")
+    if a800_profile_enabled:
+        print("[A800 compat] A800_PROFILE_STAGES=1, CUDA-event stage profiling is enabled")
 
     with torch.device("cuda"):
         model = Transformer(model_args)
@@ -356,6 +361,8 @@ def run_inference(args: argparse.Namespace) -> None:
         )
         if torch.cuda.is_available():
             torch.cuda.synchronize()
+        if a800_profile_enabled:
+            a800_profile_reset()
 
     bench_iters = max(1, args.bench_iters)
     elapsed_runs = []
@@ -402,6 +409,9 @@ def run_inference(args: argparse.Namespace) -> None:
             print(f"elapsed_avg_s={elapsed_avg:.6f}")
             print(f"tokens_per_s_avg={new_tokens / elapsed_avg:.3f}")
             print(f"elapsed_runs_s={elapsed_text}")
+        profile_text = a800_profile_report(reset=True)
+        if profile_text:
+            print(profile_text)
 
     if world_size > 1:
         dist.destroy_process_group()
@@ -422,6 +432,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--thinking-mode", default="chat", choices=["chat", "thinking"])
     p.add_argument("--warmup", action="store_true", help="run one warmup generation before timing")
     p.add_argument("--bench-iters", type=int, default=1, help="repeat timed generation after warmup and report best/avg")
+    p.add_argument("--profile-stages", action="store_true", help="print CUDA-event stage timing for A800 decode profiling")
     p.add_argument(
         "--a800-compat",
         default="auto",
