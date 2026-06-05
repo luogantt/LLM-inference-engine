@@ -1551,7 +1551,69 @@ class Attention(nn.Module):
                                          rope_theta, args.rope_factor, args.beta_fast, args.beta_slow)
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
 
+    def _forward_no_profile(self, x: torch.Tensor, start_pos: int):
+        bsz, seqlen, _ = x.size()
+        freqs_cis = self.freqs_cis[start_pos:start_pos+seqlen]
+        win = self.window_size
+        ratio = self.compress_ratio
+        rd = self.rope_head_dim
+        if self.compress_ratio and self.compressor.kv_cache is None:
+            self.compressor.kv_cache = self.kv_cache[:, win:]
+            self.compressor.freqs_cis = self.freqs_cis
+            if self.indexer is not None:
+                self.indexer.freqs_cis = self.freqs_cis
+
+        qr = q = self.q_norm(self.wq_a(x))
+        q = self.wq_b(q).unflatten(-1, (self.n_local_heads, self.head_dim))
+        q *= torch.rsqrt(q.square().mean(-1, keepdim=True) + self.eps)
+        apply_rotary_emb(q[..., -rd:], freqs_cis)
+
+        kv = self.wkv(x)
+        kv = self.kv_norm(kv)
+        apply_rotary_emb(kv[..., -rd:], freqs_cis)
+        if not (_a800_force_dequant_gemm() and not _a800_keep_act_quant()):
+            act_quant(kv[..., :-rd], 64, scale_fmt, scale_dtype, True)
+        topk_idxs = get_window_topk_idxs(win, bsz, seqlen, start_pos)
+        if self.compress_ratio:
+            offset = kv.size(1) if start_pos == 0 else win
+            if self.indexer is not None:
+                compress_topk_idxs = self.indexer(x, qr, start_pos, offset)
+            else:
+                compress_topk_idxs = get_compress_topk_idxs(ratio, bsz, seqlen, start_pos, offset)
+            topk_idxs = torch.cat([topk_idxs, compress_topk_idxs], dim=-1)
+        topk_idxs = topk_idxs.int()
+
+        if start_pos == 0:
+            if seqlen <= win:
+                self.kv_cache[:bsz, :seqlen] = kv
+            else:
+                cutoff = seqlen % win
+                self.kv_cache[:bsz, cutoff: win], self.kv_cache[:bsz, :cutoff] = kv[:, -win:].split([win - cutoff, cutoff], dim=1)
+            if self.compress_ratio:
+                if (kv_compress := self.compressor(x, start_pos)) is not None:
+                    kv = torch.cat([kv, kv_compress], dim=1)
+            if _a800_force_dequant_gemm():
+                o = _torch_sparse_attn(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
+            else:
+                o = sparse_attn(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
+        else:
+            self.kv_cache[:bsz, start_pos % win] = kv.squeeze(1)
+            if self.compress_ratio:
+                self.compressor(x, start_pos)
+            if _a800_force_dequant_gemm():
+                o = _torch_sparse_attn(q, self.kv_cache[:bsz], self.attn_sink, topk_idxs, self.softmax_scale)
+            else:
+                o = sparse_attn(q, self.kv_cache[:bsz], self.attn_sink, topk_idxs, self.softmax_scale)
+        apply_rotary_emb(o[..., -rd:], freqs_cis, True)
+
+        o = o.view(bsz, seqlen, self.n_local_groups, -1)
+        wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
+        o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
+        return self.wo_b(o.flatten(2))
+
     def forward(self, x: torch.Tensor, start_pos: int):
+        if not _a800_profile_stages():
+            return self._forward_no_profile(x, start_pos)
         bsz, seqlen, _ = x.size()
         freqs_cis = self.freqs_cis[start_pos:start_pos+seqlen]
         win = self.window_size
@@ -1653,7 +1715,42 @@ class Gate(nn.Module):
             self._a800_weight_f32 = weight
         return weight
 
+    def _forward_no_profile(self, x: torch.Tensor, input_ids: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.hash and self.score_func != "softmax" and _a800_hash_gate_topk_only():
+            indices = self.tid2eid[input_ids].long()
+            selected_weight = self.weight[indices].float()
+            scores = torch.bmm(selected_weight, x.float().unsqueeze(-1)).squeeze(-1)
+            if self.score_func == "sigmoid":
+                weights = scores.sigmoid()
+            else:
+                weights = F.softplus(scores).sqrt()
+            weights /= weights.sum(dim=-1, keepdim=True)
+            weights *= self.route_scale
+            return weights, indices
+
+        scores = linear(x.float(), self._gate_weight_f32())
+        if self.score_func == "softmax":
+            scores = scores.softmax(dim=-1)
+        elif self.score_func == "sigmoid":
+            scores = scores.sigmoid()
+        else:
+            scores = F.softplus(scores).sqrt()
+        original_scores = scores
+        if self.bias is not None:
+            scores = scores + self.bias
+        if self.hash:
+            indices = self.tid2eid[input_ids]
+        else:
+            indices = scores.topk(self.topk, dim=-1)[1]
+        weights = original_scores.gather(1, indices)
+        if self.score_func != "softmax":
+            weights /= weights.sum(dim=-1, keepdim=True)
+        weights *= self.route_scale
+        return weights, indices
+
     def forward(self, x: torch.Tensor, input_ids: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        if not _a800_profile_stages():
+            return self._forward_no_profile(x, input_ids)
         if self.hash and self.score_func != "softmax" and _a800_hash_gate_topk_only():
             with _a800_profile_region("moe.gate"):
                 indices = self.tid2eid[input_ids].long()
@@ -1863,6 +1960,8 @@ class MoE(nn.Module):
             return None
 
     def _add_shared_expert_after_reduce(self, y: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        if not _a800_profile_stages():
+            return self._add_shared_expert_after_reduce_no_profile(y, x)
         if world_size <= 1:
             with _a800_profile_region("moe.shared"):
                 y += self.shared_experts(x)
@@ -1882,7 +1981,69 @@ class MoE(nn.Module):
             y += self.shared_experts(x)
         return y
 
+    def _add_shared_expert_after_reduce_no_profile(self, y: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        if world_size <= 1:
+            y += self.shared_experts(x)
+            return y
+        if _a800_async_moe_allreduce():
+            work = dist.all_reduce(y, async_op=True)
+            shared = self.shared_experts(x)
+            work.wait()
+            y += shared
+            return y
+        dist.all_reduce(y)
+        y += self.shared_experts(x)
+        return y
+
+    def _forward_no_profile(self, x: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
+        shape = x.size()
+        x = x.view(-1, self.dim)
+        weights, indices = self.gate(x, input_ids.flatten())
+        moe_accum_dtype = x.dtype if _a800_bf16_moe_reduce() else torch.float32
+
+        if _a800_fast_decode_moe() and x.size(0) == 1:
+            y = self._a800_decode_accum_buffer(x, moe_accum_dtype)
+            topk_ptrs = self._a800_local_fp4_topk_ptrs()
+            topk_hidden = self._a800_topk_hidden_buffer(x, weights.numel(), topk_ptrs[-1]) if topk_ptrs is not None else None
+            topk_indices = self._a800_topk_indices_i32_buffer(indices) if topk_ptrs is not None else indices
+            if _a800_cuda_fp4_topk_expert_ffn_accum(
+                x,
+                weights,
+                topk_indices,
+                topk_ptrs,
+                self.experts_start_idx,
+                self.n_local_experts,
+                self.swiglu_limit,
+                topk_hidden,
+                y,
+            ):
+                y = self._add_shared_expert_after_reduce_no_profile(y, x)
+                return y.type_as(x).view(shape)
+            for top, expert_id in enumerate(indices[0].tolist()):
+                if self.experts_start_idx <= expert_id < self.experts_end_idx:
+                    expert = self.experts[expert_id]
+                    route = weights[:, top : top + 1]
+                    if not _a800_cuda_fp4_expert_ffn_accum(
+                        x, route, expert.w1, expert.w2, expert.w3, expert.swiglu_limit, y
+                    ):
+                        y += expert(x, route)
+            y = self._add_shared_expert_after_reduce_no_profile(y, x)
+            return y.type_as(x).view(shape)
+
+        y = torch.zeros_like(x, dtype=moe_accum_dtype)
+        counts = torch.bincount(indices.flatten(), minlength=self.n_routed_experts).tolist()
+        for i in range(self.experts_start_idx, self.experts_end_idx):
+            if counts[i] == 0:
+                continue
+            expert = self.experts[i]
+            idx, top = torch.where(indices == i)
+            y[idx] += expert(x[idx], weights[idx, top, None])
+        y = self._add_shared_expert_after_reduce_no_profile(y, x)
+        return y.type_as(x).view(shape)
+
     def forward(self, x: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
+        if not _a800_profile_stages():
+            return self._forward_no_profile(x, input_ids)
         shape = x.size()
         x = x.view(-1, self.dim)
         weights, indices = self.gate(x, input_ids.flatten())
@@ -1978,6 +2139,19 @@ class Block(nn.Module):
         return y.type_as(x)
 
     def forward(self, x: torch.Tensor, start_pos: int, input_ids: Optional[torch.Tensor]) -> torch.Tensor:
+        if not _a800_profile_stages():
+            residual = x
+            x, post, comb = self.hc_pre(x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
+            x = self.attn_norm(x)
+            x = self.attn(x, start_pos)
+            x = self.hc_post(x, residual, post, comb)
+
+            residual = x
+            x, post, comb = self.hc_pre(x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
+            x = self.ffn_norm(x)
+            x = self.ffn(x, input_ids)
+            return self.hc_post(x, residual, post, comb)
+
         residual = x
         with _a800_profile_region("block.attn_hc_pre"):
             x, post, comb = self.hc_pre(x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
@@ -2017,6 +2191,15 @@ class ParallelHead(nn.Module):
         return F.linear(x[:, -1].float(), self.weight)
 
     def forward(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor, norm: RMSNorm):
+        if not _a800_profile_stages():
+            x = self.hc_head(x, hc_fn, hc_scale, hc_base)
+            logits = self.get_logits(norm(x))
+            if world_size > 1:
+                all_logits = [torch.empty_like(logits) for _ in range(world_size)]
+                dist.all_gather(all_logits, logits)
+                logits = torch.cat(all_logits, dim=-1)
+            return logits
+
         # x: [b,s,hc,d]
         with _a800_profile_region("head.hc_norm"):
             x = self.hc_head(x, hc_fn, hc_scale, hc_base)
@@ -2031,6 +2214,9 @@ class ParallelHead(nn.Module):
         return logits
 
     def argmax(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor, norm: RMSNorm):
+        if not _a800_profile_stages():
+            return self._argmax_no_profile(x, hc_fn, hc_scale, hc_base, norm)
+
         # Greedy decode only needs the global max token. Avoid all-gathering full vocab logits.
         with _a800_profile_region("head.hc_norm"):
             x = self.hc_head(x, hc_fn, hc_scale, hc_base)
@@ -2099,6 +2285,67 @@ class ParallelHead(nn.Module):
             best_rank = packs[:, :, 0].argmax(dim=0)
             best_local = packs[:, :, 1].gather(0, best_rank.unsqueeze(0)).squeeze(0).to(local_indices.dtype)
             return best_local + best_rank.to(best_local.dtype) * self.part_vocab_size
+
+    def _argmax_no_profile(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor, norm: RMSNorm):
+        x = self.hc_head(x, hc_fn, hc_scale, hc_base)
+        logits = self.get_logits(norm(x))
+        local_values, local_indices = logits.max(dim=-1)
+        if world_size <= 1:
+            return local_indices
+
+        if _a800_argmax_gather_into_tensor() and hasattr(dist, "all_gather_into_tensor"):
+            bsz = local_values.numel()
+            local_shape = (bsz, 2)
+            gather_shape = (world_size * bsz, 2)
+            if (
+                self._a800_argmax_local_pack is None
+                or self._a800_argmax_local_pack.shape != local_shape
+                or self._a800_argmax_local_pack.device != local_values.device
+                or self._a800_argmax_local_pack.dtype != local_values.dtype
+            ):
+                self._a800_argmax_local_pack = torch.empty(local_shape, device=local_values.device, dtype=local_values.dtype)
+            if (
+                self._a800_argmax_gather_pack is None
+                or self._a800_argmax_gather_pack.shape != gather_shape
+                or self._a800_argmax_gather_pack.device != local_values.device
+                or self._a800_argmax_gather_pack.dtype != local_values.dtype
+            ):
+                self._a800_argmax_gather_pack = torch.empty(gather_shape, device=local_values.device, dtype=local_values.dtype)
+            self._a800_argmax_local_pack[:, 0].copy_(local_values)
+            self._a800_argmax_local_pack[:, 1].copy_(local_indices)
+            dist.all_gather_into_tensor(self._a800_argmax_gather_pack, self._a800_argmax_local_pack)
+            packs = self._a800_argmax_gather_pack.view(world_size, bsz, 2)
+        elif _a800_reuse_argmax_packs():
+            bsz = local_values.numel()
+            local_shape = (bsz, 2)
+            gather_shape = (world_size, bsz, 2)
+            if (
+                self._a800_argmax_local_pack is None
+                or self._a800_argmax_local_pack.shape != local_shape
+                or self._a800_argmax_local_pack.device != local_values.device
+                or self._a800_argmax_local_pack.dtype != local_values.dtype
+            ):
+                self._a800_argmax_local_pack = torch.empty(local_shape, device=local_values.device, dtype=local_values.dtype)
+            if (
+                self._a800_argmax_gather_pack is None
+                or self._a800_argmax_gather_pack.shape != gather_shape
+                or self._a800_argmax_gather_pack.device != local_values.device
+                or self._a800_argmax_gather_pack.dtype != local_values.dtype
+            ):
+                self._a800_argmax_gather_pack = torch.empty(gather_shape, device=local_values.device, dtype=local_values.dtype)
+                self._a800_argmax_all_packs = [self._a800_argmax_gather_pack[i] for i in range(world_size)]
+            self._a800_argmax_local_pack[:, 0].copy_(local_values)
+            self._a800_argmax_local_pack[:, 1].copy_(local_indices)
+            dist.all_gather(self._a800_argmax_all_packs, self._a800_argmax_local_pack)
+            packs = self._a800_argmax_gather_pack
+        else:
+            local_pack = torch.stack((local_values, local_indices.to(local_values.dtype)), dim=-1).contiguous()
+            all_packs = [torch.empty_like(local_pack) for _ in range(world_size)]
+            dist.all_gather(all_packs, local_pack)
+            packs = torch.stack(all_packs, dim=0)
+        best_rank = packs[:, :, 0].argmax(dim=0)
+        best_local = packs[:, :, 1].gather(0, best_rank.unsqueeze(0)).squeeze(0).to(local_indices.dtype)
+        return best_local + best_rank.to(best_local.dtype) * self.part_vocab_size
 
     def hc_head(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor):
         shape, dtype = x.size(), x.dtype
@@ -2175,6 +2422,13 @@ class Transformer(nn.Module):
 
     @torch.inference_mode()
     def forward(self, input_ids: torch.Tensor, start_pos: int = 0):
+        if not _a800_profile_stages():
+            h = self.embed(input_ids)
+            h = h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
+            for layer in self.layers:
+                h = layer(h, start_pos, input_ids)
+            return self.head(h, self.hc_head_fn, self.hc_head_scale, self.hc_head_base, self.norm)
+
         with _a800_profile_region("model.embed"):
             h = self.embed(input_ids)
             # Expand to hc_mult copies for Hyper-Connections
@@ -2187,6 +2441,13 @@ class Transformer(nn.Module):
 
     @torch.inference_mode()
     def forward_argmax(self, input_ids: torch.Tensor, start_pos: int = 0):
+        if not _a800_profile_stages():
+            h = self.embed(input_ids)
+            h = h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
+            for layer in self.layers:
+                h = layer(h, start_pos, input_ids)
+            return self.head.argmax(h, self.hc_head_fn, self.hc_head_scale, self.hc_head_base, self.norm)
+
         with _a800_profile_region("model.embed"):
             h = self.embed(input_ids)
             h = h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
