@@ -94,6 +94,13 @@ def _a800_reuse_decode_moe_y() -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _a800_reuse_topk_index_i32() -> bool:
+    value = os.getenv("A800_REUSE_TOPK_INDEX_I32")
+    if value is None or value.strip() == "":
+        return _a800_force_dequant_gemm()
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _a800_async_moe_allreduce() -> bool:
     value = os.getenv("A800_ASYNC_MOE_ALLREDUCE")
     if value is None or value.strip() == "":
@@ -1523,6 +1530,7 @@ class MoE(nn.Module):
             linear.weight._a800_shared_fp8 = True
         self._a800_decode_y: Optional[torch.Tensor] = None
         self._a800_topk_hidden: Optional[torch.Tensor] = None
+        self._a800_topk_indices_i32: Optional[torch.Tensor] = None
         self._a800_fp4_topk_ptrs = None
         self._a800_fp4_topk_ptrs_failed = False
         self.swiglu_limit = args.swiglu_limit
@@ -1546,6 +1554,19 @@ class MoE(nn.Module):
             hidden = torch.empty(shape, device=x.device, dtype=x.dtype)
             self._a800_topk_hidden = hidden
         return hidden
+
+    def _a800_topk_indices_i32_buffer(self, indices: torch.Tensor) -> torch.Tensor:
+        idx = indices.reshape(-1)
+        if idx.dtype == torch.int32 and idx.is_contiguous():
+            return idx
+        if not _a800_reuse_topk_index_i32():
+            return idx
+        buf = self._a800_topk_indices_i32
+        if buf is None or buf.numel() != idx.numel() or buf.device != idx.device:
+            buf = torch.empty((idx.numel(),), device=idx.device, dtype=torch.int32)
+            self._a800_topk_indices_i32 = buf
+        buf.copy_(idx, non_blocking=True)
+        return buf
 
     def _a800_local_fp4_topk_ptrs(self):
         if not _a800_use_cuda_fp4_topk_ffn() or self._a800_fp4_topk_ptrs_failed:
@@ -1652,10 +1673,11 @@ class MoE(nn.Module):
             y = self._a800_decode_accum_buffer(x, moe_accum_dtype)
             topk_ptrs = self._a800_local_fp4_topk_ptrs()
             topk_hidden = self._a800_topk_hidden_buffer(x, weights.numel(), topk_ptrs[-1]) if topk_ptrs is not None else None
+            topk_indices = self._a800_topk_indices_i32_buffer(indices) if topk_ptrs is not None else indices
             if _a800_cuda_fp4_topk_expert_ffn_accum(
                 x,
                 weights,
-                indices,
+                topk_indices,
                 topk_ptrs,
                 self.experts_start_idx,
                 self.n_local_experts,

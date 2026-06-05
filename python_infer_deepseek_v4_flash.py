@@ -68,6 +68,7 @@ def configure_a800_compat(args: argparse.Namespace, torch, local_rank: int) -> L
         "A800_FAST_DECODE_MOE": "1",
         "A800_BF16_MOE_REDUCE": "0",
         "A800_REUSE_DECODE_MOE_Y": "1",
+        "A800_REUSE_TOPK_INDEX_I32": "1",
         "A800_ASYNC_MOE_ALLREDUCE": "0",
         "A800_CACHE_GATE_WEIGHT_F32": "0",
         "A800_CACHE_SHARED_FP8": "1",
@@ -175,6 +176,12 @@ def run_inference(args: argparse.Namespace) -> None:
         if a800_reuse_decode_moe_y_value == ""
         else a800_reuse_decode_moe_y_value in {"1", "true", "yes", "on"}
     )
+    a800_reuse_topk_index_value = os.getenv("A800_REUSE_TOPK_INDEX_I32", "").strip().lower()
+    a800_reuse_topk_index = (
+        a800_force_dequant
+        if a800_reuse_topk_index_value == ""
+        else a800_reuse_topk_index_value in {"1", "true", "yes", "on"}
+    )
     a800_async_moe_allreduce_value = os.getenv("A800_ASYNC_MOE_ALLREDUCE", "").strip().lower()
     a800_async_moe_allreduce = (
         a800_force_dequant
@@ -253,6 +260,11 @@ def run_inference(args: argparse.Namespace) -> None:
         print(
             "[A800 compat] A800_REUSE_DECODE_MOE_Y=1, "
             "reuse per-layer FP32 MoE decode accumulation buffers"
+        )
+    if a800_cuda_fp4_topk_ffn and a800_reuse_topk_index:
+        print(
+            "[A800 compat] A800_REUSE_TOPK_INDEX_I32=1, "
+            "reuse per-layer int32 top-k expert index buffers for CUDA .so"
         )
     if a800_async_moe_allreduce:
         print(

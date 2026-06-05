@@ -398,6 +398,12 @@ The grouped kernel keeps an int32 expert-index ABI. A direct int64-index ABI was
 
 The grouped path also reuses one `(topk, inter_dim)` BF16 hidden buffer per MoE layer instead of allocating it inside every `.so` wrapper call. This reduces Python/Torch allocator overhead in single-token decode.
 
+The CUDA top-k FFN ABI uses int32 expert ids. The A800 path can reuse one int32 top-k index buffer per MoE layer instead of allocating a fresh converted tensor each decode step:
+
+```bash
+export A800_REUSE_TOPK_INDEX_I32=1
+```
+
 Because this path adds a new C ABI symbol, rebuild the dynamic library before testing it:
 
 ```bash
@@ -495,6 +501,7 @@ FP4 .so + grouped top-k FFN int64 index ABI, 3-run benchmark: best 2.918 tok/s, 
 FP4 .so + grouped top-k FFN + reused top-k hidden buffer, 3-run benchmark: best 3.006 tok/s, avg 3.003 tok/s
 FP4 .so + grouped top-k FFN + reused top-k hidden buffer + async MoE all-reduce: best 2.907 tok/s, avg 2.900 tok/s
 FP4 .so + grouped top-k FFN + reused top-k hidden buffer + async MoE all-reduce off: best 3.020 tok/s, avg 3.016 tok/s
+FP4 .so + reused top-k int32 index buffer: pending A/B benchmark
 FP4 .so + fused FFN + fast MoE + FP32 MoE reduce + direct accum: 2.513 tok/s
 FP4 .so + fused FFN + fast MoE + BF16 MoE reduce: 2.533 tok/s
 FP4 .so + fast MoE + BF16 MoE reduce, FFN fused off: 2.387 tok/s
@@ -517,6 +524,7 @@ export A800_USE_CUDA_FP4_ACCUM=0
 export A800_FAST_DECODE_MOE=1
 export A800_BF16_MOE_REDUCE=0
 export A800_REUSE_DECODE_MOE_Y=1
+export A800_REUSE_TOPK_INDEX_I32=1
 export A800_ASYNC_MOE_ALLREDUCE=0
 export A800_CACHE_GATE_WEIGHT_F32=0
 export A800_CACHE_SHARED_FP8=1
