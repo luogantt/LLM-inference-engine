@@ -386,17 +386,17 @@ kernel 2: w2 FP4 unpack/scale/dot -> BF16 output
 
 Newer `.so` builds also expose `ds_v4_fp4_expert_ffn_accum_f32`. In single-token fast MoE decode, this lets the `w2` kernel accumulate directly into the FP32 MoE output buffer and skips the temporary BF16 expert output tensor plus the Python `y += expert(...)` add. Current measurements show this direct-accum path is slower, so it is opt-in only. Use `A800_USE_CUDA_FP4_ACCUM=1` to enable it for A/B testing.
 
-An experimental grouped top-k FFN path is also available. Instead of looping through selected experts in Python and launching the per-expert FFN path one by one, the MoE layer builds a tiny CUDA pointer table for local expert weights and calls `ds_v4_fp4_topk_expert_ffn_accum_f32` once per MoE layer. The kernel directly reads the original FP4 expert tensors through device pointers, so it does not duplicate the expert weights in memory:
+The current A800 default enables a grouped top-k FFN path. Instead of looping through selected experts in Python and launching the per-expert FFN path one by one, the MoE layer builds a tiny CUDA pointer table for local expert weights and calls `ds_v4_fp4_topk_expert_ffn_accum_f32` once per MoE layer. The kernel directly reads the original FP4 expert tensors through device pointers, so it does not duplicate the expert weights in memory:
 
 ```bash
 export A800_USE_CUDA_FP4_TOPK_FFN=1
 ```
 
-This path is disabled by default because it changes the MoE dispatch shape and needs A/B testing on A800. If it is slower or unstable, set `A800_USE_CUDA_FP4_TOPK_FFN=0` and keep the current per-expert `.so` fast path.
+This path is enabled by default under A800 auto compatibility after measuring faster than the per-expert `.so` path. If it is slower or unstable on another environment, set `A800_USE_CUDA_FP4_TOPK_FFN=0` to fall back to the per-expert `.so` fast path.
 
 The grouped kernel keeps an int32 expert-index ABI. A direct int64-index ABI was tested at best 2.918 tok/s, avg 2.915 tok/s, which was slower than the int32 path, so the int32 ABI remains the preferred path.
 
-The grouped path also reuses one `(topk, inter_dim)` BF16 hidden buffer per MoE layer instead of allocating it inside every `.so` wrapper call. This reduces Python/Torch allocator overhead in single-token decode and needs a fresh A/B run after rebuilding the `.so`.
+The grouped path also reuses one `(topk, inter_dim)` BF16 hidden buffer per MoE layer instead of allocating it inside every `.so` wrapper call. This reduces Python/Torch allocator overhead in single-token decode.
 
 Because this path adds a new C ABI symbol, rebuild the dynamic library before testing it:
 
@@ -484,12 +484,13 @@ FP4 .so + fused FFN + fast MoE + single prompt fast path + distributed argmax al
 FP4 .so + A800 auto defaults + distributed argmax list gather, 3-run benchmark: best 2.882 tok/s, avg 2.877 tok/s
 FP4 .so + grouped top-k FFN, 3-run benchmark: best 2.943 tok/s, avg 2.938 tok/s
 FP4 .so + grouped top-k FFN int64 index ABI, 3-run benchmark: best 2.918 tok/s, avg 2.915 tok/s
+FP4 .so + grouped top-k FFN + reused top-k hidden buffer, 3-run benchmark: best 3.006 tok/s, avg 3.003 tok/s
 FP4 .so + fused FFN + fast MoE + FP32 MoE reduce + direct accum: 2.513 tok/s
 FP4 .so + fused FFN + fast MoE + BF16 MoE reduce: 2.533 tok/s
 FP4 .so + fast MoE + BF16 MoE reduce, FFN fused off: 2.387 tok/s
 ```
 
-Best log so far: `deepseek_v4_flash_a800_auto_bench3_128.log`
+Best log so far: `deepseek_v4_flash_a800_topkffn_reuse_hidden_bench3_128.log`
 
 建议先单独测试 FFN 开关，不要同时打开 FP4 LRU cache，避免性能归因混在一起：
 
@@ -501,7 +502,7 @@ export A800_FORCE_DEQUANT_GEMM=1
 export A800_DEQUANT_DTYPE=bf16
 export A800_USE_CUDA_FP4_GEMM=1
 export A800_USE_CUDA_FP4_FFN=1
-export A800_USE_CUDA_FP4_TOPK_FFN=0
+export A800_USE_CUDA_FP4_TOPK_FFN=1
 export A800_USE_CUDA_FP4_ACCUM=0
 export A800_FAST_DECODE_MOE=1
 export A800_BF16_MOE_REDUCE=0

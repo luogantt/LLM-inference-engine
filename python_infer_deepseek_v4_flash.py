@@ -63,7 +63,7 @@ def configure_a800_compat(args: argparse.Namespace, torch, local_rank: int) -> L
         "A800_DEQUANT_DTYPE": "bf16",
         "A800_USE_CUDA_FP4_GEMM": "1",
         "A800_USE_CUDA_FP4_FFN": "1",
-        "A800_USE_CUDA_FP4_TOPK_FFN": "0",
+        "A800_USE_CUDA_FP4_TOPK_FFN": "1",
         "A800_USE_CUDA_FP4_ACCUM": "0",
         "A800_FAST_DECODE_MOE": "1",
         "A800_BF16_MOE_REDUCE": "0",
