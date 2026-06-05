@@ -79,7 +79,7 @@ def configure_a800_compat(args: argparse.Namespace, torch, local_rank: int) -> L
         "A800_SINGLE_PROMPT_FAST_GENERATE": "1",
         "A800_DISTRIBUTED_ARGMAX": "1",
         "A800_ARGMAX_GATHER_INTO_TENSOR": "0",
-        "A800_REUSE_ARGMAX_PACKS": "1",
+        "A800_REUSE_ARGMAX_PACKS": "0",
         "A800_CUDA_LIB": "./build/libdeepseek_v4_a800.so",
     }
 

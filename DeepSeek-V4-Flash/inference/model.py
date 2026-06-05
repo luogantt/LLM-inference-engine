@@ -132,7 +132,7 @@ def _a800_argmax_gather_into_tensor() -> bool:
 def _a800_reuse_argmax_packs() -> bool:
     value = os.getenv("A800_REUSE_ARGMAX_PACKS")
     if value is None or value.strip() == "":
-        return _a800_force_dequant_gemm()
+        return False
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 

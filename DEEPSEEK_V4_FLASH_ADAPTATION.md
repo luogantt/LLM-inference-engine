@@ -504,7 +504,7 @@ FP4 .so + grouped top-k FFN + reused top-k hidden buffer, 3-run benchmark: best 
 FP4 .so + grouped top-k FFN + reused top-k hidden buffer + async MoE all-reduce: best 2.907 tok/s, avg 2.900 tok/s
 FP4 .so + grouped top-k FFN + reused top-k hidden buffer + async MoE all-reduce off: best 3.020 tok/s, avg 3.016 tok/s
 FP4 .so + reused top-k int32 index buffer: best 2.948 tok/s, avg 2.925 tok/s
-FP4 .so + reused distributed argmax pack buffers: pending A/B test
+FP4 .so + reused distributed argmax pack buffers: best 2.993 tok/s, avg 2.988 tok/s
 FP4 .so + fused FFN + fast MoE + FP32 MoE reduce + direct accum: 2.513 tok/s
 FP4 .so + fused FFN + fast MoE + BF16 MoE reduce: 2.533 tok/s
 FP4 .so + fast MoE + BF16 MoE reduce, FFN fused off: 2.387 tok/s
@@ -538,7 +538,7 @@ export A800_DEFER_TOKEN_DECODE=1
 export A800_SINGLE_PROMPT_FAST_GENERATE=1
 export A800_DISTRIBUTED_ARGMAX=1
 export A800_ARGMAX_GATHER_INTO_TENSOR=0
-export A800_REUSE_ARGMAX_PACKS=1
+export A800_REUSE_ARGMAX_PACKS=0
 export A800_CUDA_LIB=./build/libdeepseek_v4_a800.so
 ```
 
@@ -548,7 +548,7 @@ export A800_CUDA_LIB=./build/libdeepseek_v4_a800.so
 export A800_DISTRIBUTED_ARGMAX=0
 ```
 
-`A800_REUSE_ARGMAX_PACKS=1` keeps the faster list `all_gather` path, but reuses the tiny per-rank `(value, token_id)` pack tensors and the gathered view instead of allocating them every decode step. If it regresses on a driver/NCCL build, disable only this switch:
+`A800_REUSE_ARGMAX_PACKS=1` keeps the list `all_gather` path, but reuses the tiny per-rank `(value, token_id)` pack tensors and the gathered view instead of allocating them every decode step. This measured slower on A800, so keep it disabled for the current best path:
 
 ```bash
 export A800_REUSE_ARGMAX_PACKS=0
