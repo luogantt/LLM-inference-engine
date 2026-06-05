@@ -129,6 +129,13 @@ def _a800_argmax_gather_into_tensor() -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _a800_reuse_argmax_packs() -> bool:
+    value = os.getenv("A800_REUSE_ARGMAX_PACKS")
+    if value is None or value.strip() == "":
+        return _a800_force_dequant_gemm()
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _a800_fp4_cache_limit_bytes() -> int:
     if not _a800_cache_fp4_weight():
         return 0
@@ -1782,6 +1789,7 @@ class ParallelHead(nn.Module):
         self.weight = nn.Parameter(torch.empty(self.part_vocab_size, self.dim, dtype=torch.float32))
         self._a800_argmax_local_pack = None
         self._a800_argmax_gather_pack = None
+        self._a800_argmax_all_packs = None
 
     def get_logits(self, x):
         return F.linear(x[:, -1].float(), self.weight)
@@ -1823,9 +1831,32 @@ class ParallelHead(nn.Module):
             ):
                 self._a800_argmax_gather_pack = torch.empty(gather_shape, device=local_values.device, dtype=local_values.dtype)
             self._a800_argmax_local_pack[:, 0].copy_(local_values)
-            self._a800_argmax_local_pack[:, 1].copy_(local_indices.to(local_values.dtype))
+            self._a800_argmax_local_pack[:, 1].copy_(local_indices)
             dist.all_gather_into_tensor(self._a800_argmax_gather_pack, self._a800_argmax_local_pack)
             packs = self._a800_argmax_gather_pack.view(world_size, bsz, 2)
+        elif _a800_reuse_argmax_packs():
+            bsz = local_values.numel()
+            local_shape = (bsz, 2)
+            gather_shape = (world_size, bsz, 2)
+            if (
+                self._a800_argmax_local_pack is None
+                or self._a800_argmax_local_pack.shape != local_shape
+                or self._a800_argmax_local_pack.device != local_values.device
+                or self._a800_argmax_local_pack.dtype != local_values.dtype
+            ):
+                self._a800_argmax_local_pack = torch.empty(local_shape, device=local_values.device, dtype=local_values.dtype)
+            if (
+                self._a800_argmax_gather_pack is None
+                or self._a800_argmax_gather_pack.shape != gather_shape
+                or self._a800_argmax_gather_pack.device != local_values.device
+                or self._a800_argmax_gather_pack.dtype != local_values.dtype
+            ):
+                self._a800_argmax_gather_pack = torch.empty(gather_shape, device=local_values.device, dtype=local_values.dtype)
+                self._a800_argmax_all_packs = [self._a800_argmax_gather_pack[i] for i in range(world_size)]
+            self._a800_argmax_local_pack[:, 0].copy_(local_values)
+            self._a800_argmax_local_pack[:, 1].copy_(local_indices)
+            dist.all_gather(self._a800_argmax_all_packs, self._a800_argmax_local_pack)
+            packs = self._a800_argmax_gather_pack
         else:
             local_pack = torch.stack((local_values, local_indices.to(local_values.dtype)), dim=-1).contiguous()
             all_packs = [torch.empty_like(local_pack) for _ in range(world_size)]
