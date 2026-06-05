@@ -81,6 +81,7 @@ def configure_a800_compat(args: argparse.Namespace, torch, local_rank: int) -> L
         "A800_DISTRIBUTED_ARGMAX": "1",
         "A800_ARGMAX_GATHER_INTO_TENSOR": "0",
         "A800_REUSE_ARGMAX_PACKS": "0",
+        "A800_USE_HC_SPLIT_KERNEL": "1",
         "A800_CUDA_LIB": "./build/libdeepseek_v4_a800.so",
     }
 
@@ -216,6 +217,7 @@ def run_inference(args: argparse.Namespace) -> None:
     a800_distributed_argmax = os.getenv("A800_DISTRIBUTED_ARGMAX", "").strip().lower() in {"1", "true", "yes", "on"}
     a800_argmax_gather_tensor = os.getenv("A800_ARGMAX_GATHER_INTO_TENSOR", "").strip().lower() in {"1", "true", "yes", "on"}
     a800_reuse_argmax_packs = os.getenv("A800_REUSE_ARGMAX_PACKS", "").strip().lower() in {"1", "true", "yes", "on"}
+    a800_hc_split_kernel = os.getenv("A800_USE_HC_SPLIT_KERNEL", "").strip().lower() in {"1", "true", "yes", "on"}
 
     if model_args.scale_dtype == "fp32" or a800_force_dequant:
         import torch.nn as nn
@@ -335,6 +337,11 @@ def run_inference(args: argparse.Namespace) -> None:
                 "[A800 compat] A800_REUSE_ARGMAX_PACKS=1, "
                 "reuse tiny list-gather pack buffers for greedy decode"
             )
+    if a800_hc_split_kernel:
+        print(
+            "[A800 compat] A800_USE_HC_SPLIT_KERNEL=1, "
+            "try TileLang fused HC split/sinkhorn kernel before torch fallback"
+        )
 
     torch.set_default_device("cuda")
 

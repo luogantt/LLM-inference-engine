@@ -30,6 +30,8 @@ _A800_CUDA_LIB_FAILED = False
 _A800_CUDA_FP4_WARNED = False
 _A800_PROFILE_ENABLED = None
 _A800_PROFILE_EVENTS = []
+_A800_HC_SPLIT_KERNEL_FAILED = False
+_A800_HC_SPLIT_KERNEL_WARNED = False
 
 
 class _A800NoopProfileRegion:
@@ -222,6 +224,13 @@ def _a800_reuse_argmax_packs() -> bool:
     value = os.getenv("A800_REUSE_ARGMAX_PACKS")
     if value is None or value.strip() == "":
         return False
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _a800_use_hc_split_kernel() -> bool:
+    value = os.getenv("A800_USE_HC_SPLIT_KERNEL")
+    if value is None or value.strip() == "":
+        return _a800_force_dequant_gemm()
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
@@ -557,6 +566,26 @@ def _torch_hc_split_sinkhorn(
         comb = comb / (comb.sum(dim=-1, keepdim=True) + eps)
         comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
     return pre, post, comb
+
+
+def _a800_hc_split_sinkhorn(
+    mixes: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    hc_mult: int,
+    sinkhorn_iters: int,
+    eps: float,
+):
+    global _A800_HC_SPLIT_KERNEL_FAILED, _A800_HC_SPLIT_KERNEL_WARNED
+    if _a800_use_hc_split_kernel() and not _A800_HC_SPLIT_KERNEL_FAILED:
+        try:
+            return hc_split_sinkhorn(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps)
+        except Exception as exc:
+            _A800_HC_SPLIT_KERNEL_FAILED = True
+            if not _A800_HC_SPLIT_KERNEL_WARNED and rank == 0:
+                print(f"[A800 compat] HC split TileLang kernel fallback to torch path: {exc}")
+                _A800_HC_SPLIT_KERNEL_WARNED = True
+    return _torch_hc_split_sinkhorn(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps)
 
 
 def _torch_sparse_attn(
@@ -2127,7 +2156,7 @@ class Block(nn.Module):
         rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)
         mixes = F.linear(x, hc_fn) * rsqrt
         if _a800_force_dequant_gemm():
-            pre, post, comb = _torch_hc_split_sinkhorn(mixes, hc_scale, hc_base, self.hc_mult, self.hc_sinkhorn_iters, self.hc_eps)
+            pre, post, comb = _a800_hc_split_sinkhorn(mixes, hc_scale, hc_base, self.hc_mult, self.hc_sinkhorn_iters, self.hc_eps)
         else:
             pre, post, comb = hc_split_sinkhorn(mixes, hc_scale, hc_base, self.hc_mult, self.hc_sinkhorn_iters, self.hc_eps)
         y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=2)
