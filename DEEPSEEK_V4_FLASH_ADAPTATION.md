@@ -382,12 +382,14 @@ kernel 1: fused w1 + w3 FP4 unpack/scale/dot + SwiGLU + route -> BF16 hidden
 kernel 2: w2 FP4 unpack/scale/dot -> BF16 output
 ```
 
-The A800 CUDA FP4 kernels use packed-byte decoding in the hot dot loops. Each loaded byte contains two FP4 values, so the kernel decodes low/high nibbles together and accumulates both into the same FP32 reduction. Since DeepSeek-V4-Flash uses one scale per 32 FP4 elements, the two nibbles in one byte also share one block scale. This avoids reading the same packed byte twice, halves scale-column work for each pair, and replaces the per-nibble switch decode with a tiny constant lookup table:
+Packed-byte FP4 dot decoding was tested as an A/B optimization. The idea was to decode low/high nibbles from each packed byte together, share one block scale for the two FP4 values, and accumulate both into the same FP32 reduction:
 
 ```text
 old: one loop iteration per FP4 value
 new: one loop iteration per packed byte -> one block scale -> two FP4 values -> FP32 accumulation
 ```
+
+This measured slower on A800 (`best 2.916 tok/s`, `avg 2.912 tok/s`), likely because the changed loop shape reduced compiler/runtime efficiency more than it saved memory reads. The current best path keeps the original per-FP4-value loop.
 
 `gate_f32` is no longer materialized on the Python side; the legacy C ABI slot is passed as null for compatibility.
 
@@ -512,6 +514,7 @@ FP4 .so + grouped top-k FFN + reused top-k hidden buffer + async MoE all-reduce:
 FP4 .so + grouped top-k FFN + reused top-k hidden buffer + async MoE all-reduce off: best 3.020 tok/s, avg 3.016 tok/s
 FP4 .so + reused top-k int32 index buffer: best 2.948 tok/s, avg 2.925 tok/s
 FP4 .so + reused distributed argmax pack buffers: best 2.993 tok/s, avg 2.988 tok/s
+FP4 .so + packed-byte FP4 dot decode: best 2.916 tok/s, avg 2.912 tok/s
 FP4 .so + fused FFN + fast MoE + FP32 MoE reduce + direct accum: 2.513 tok/s
 FP4 .so + fused FFN + fast MoE + BF16 MoE reduce: 2.533 tok/s
 FP4 .so + fast MoE + BF16 MoE reduce, FFN fused off: 2.387 tok/s
