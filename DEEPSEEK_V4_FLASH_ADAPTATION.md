@@ -382,6 +382,13 @@ kernel 1: fused w1 + w3 FP4 unpack/scale/dot + SwiGLU + route -> BF16 hidden
 kernel 2: w2 FP4 unpack/scale/dot -> BF16 output
 ```
 
+The A800 CUDA FP4 kernels use packed-byte decoding in the hot dot loops. Each loaded byte contains two FP4 values, so the kernel decodes low/high nibbles together and accumulates both into the same FP32 reduction. Since DeepSeek-V4-Flash uses one scale per 32 FP4 elements, the two nibbles in one byte also share one block scale. This avoids reading the same packed byte twice, halves scale-column work for each pair, and replaces the per-nibble switch decode with a tiny constant lookup table:
+
+```text
+old: one loop iteration per FP4 value
+new: one loop iteration per packed byte -> one block scale -> two FP4 values -> FP32 accumulation
+```
+
 `gate_f32` is no longer materialized on the Python side; the legacy C ABI slot is passed as null for compatibility.
 
 Newer `.so` builds also expose `ds_v4_fp4_expert_ffn_accum_f32`. In single-token fast MoE decode, this lets the `w2` kernel accumulate directly into the FP32 MoE output buffer and skips the temporary BF16 expert output tensor plus the Python `y += expert(...)` add. Current measurements show this direct-accum path is slower, so it is opt-in only. Use `A800_USE_CUDA_FP4_ACCUM=1` to enable it for A/B testing.

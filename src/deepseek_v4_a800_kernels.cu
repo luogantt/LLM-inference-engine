@@ -19,25 +19,18 @@ extern "C" const char* ds_v4_a800_last_error() {
     return g_last_error;
 }
 
+__constant__ float kFp4E2M1Table[16] = {
+    0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+    0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f,
+};
+
 __device__ __forceinline__ float fp4_e2m1_to_float(uint8_t v) {
-    switch (v & 0x0F) {
-        case 0x0: return 0.0f;
-        case 0x1: return 0.5f;
-        case 0x2: return 1.0f;
-        case 0x3: return 1.5f;
-        case 0x4: return 2.0f;
-        case 0x5: return 3.0f;
-        case 0x6: return 4.0f;
-        case 0x7: return 6.0f;
-        case 0x8: return 0.0f;
-        case 0x9: return -0.5f;
-        case 0xA: return -1.0f;
-        case 0xB: return -1.5f;
-        case 0xC: return -2.0f;
-        case 0xD: return -3.0f;
-        case 0xE: return -4.0f;
-        default: return -6.0f;
-    }
+    return kFp4E2M1Table[v & 0x0F];
+}
+
+__device__ __forceinline__ int clamp_scale_col_for_packed_pair(int packed_idx, int group_size, int scale_cols) {
+    int scale_col = (packed_idx << 1) / group_size;
+    return scale_col < scale_cols ? scale_col : scale_cols - 1;
 }
 
 __global__ void fp4_dequant_gemm_bf16_kernel(
@@ -70,15 +63,18 @@ __global__ void fp4_dequant_gemm_bf16_kernel(
         }
     }
 
-    for (int k = tid; k < in_dim; k += blockDim.x) {
-        uint8_t packed = w_row[k >> 1];
-        uint8_t nibble = (k & 1) ? ((packed >> 4) & 0x0F) : (packed & 0x0F);
-        int scale_col = k / group_size;
-        if (scale_col >= scale_cols) {
-            scale_col = scale_cols - 1;
-        }
-        float w = fp4_e2m1_to_float(nibble) * scales[scale_row * scale_cols + scale_col];
-        acc += __bfloat162float(x_row[k]) * w;
+    int packed_cols = in_dim >> 1;
+    const float* scale_row_ptr = scales + scale_row * scale_cols;
+    for (int p = tid; p < packed_cols; p += blockDim.x) {
+        uint8_t packed = w_row[p];
+        int k0 = p << 1;
+        int k1 = k0 + 1;
+        int scale_col = clamp_scale_col_for_packed_pair(p, group_size, scale_cols);
+        float block_scale = scale_row_ptr[scale_col];
+        float w0 = fp4_e2m1_to_float(packed) * block_scale;
+        float w1 = fp4_e2m1_to_float(packed >> 4) * block_scale;
+        acc += __bfloat162float(x_row[k0]) * w0;
+        acc += __bfloat162float(x_row[k1]) * w1;
     }
 
     smem[tid] = acc;
@@ -126,15 +122,18 @@ __global__ void fp4_dequant_gemm_accum_f32_kernel(
         }
     }
 
-    for (int k = tid; k < in_dim; k += blockDim.x) {
-        uint8_t packed = w_row[k >> 1];
-        uint8_t nibble = (k & 1) ? ((packed >> 4) & 0x0F) : (packed & 0x0F);
-        int scale_col = k / group_size;
-        if (scale_col >= scale_cols) {
-            scale_col = scale_cols - 1;
-        }
-        float w = fp4_e2m1_to_float(nibble) * scales[scale_row * scale_cols + scale_col];
-        acc += __bfloat162float(x_row[k]) * w;
+    int packed_cols = in_dim >> 1;
+    const float* scale_row_ptr = scales + scale_row * scale_cols;
+    for (int p = tid; p < packed_cols; p += blockDim.x) {
+        uint8_t packed = w_row[p];
+        int k0 = p << 1;
+        int k1 = k0 + 1;
+        int scale_col = clamp_scale_col_for_packed_pair(p, group_size, scale_cols);
+        float block_scale = scale_row_ptr[scale_col];
+        float w0 = fp4_e2m1_to_float(packed) * block_scale;
+        float w1 = fp4_e2m1_to_float(packed >> 4) * block_scale;
+        acc += __bfloat162float(x_row[k0]) * w0;
+        acc += __bfloat162float(x_row[k1]) * w1;
     }
 
     smem[tid] = acc;
@@ -202,21 +201,28 @@ __global__ void fp4_expert_gate_up_fused_kernel(
         }
     }
 
-    for (int k = tid; k < dim; k += blockDim.x) {
-        float xv = __bfloat162float(x_row[k]);
-        int scale_col = k / group_size;
+    int packed_cols = dim >> 1;
+    const float* scale1_row_ptr = scales1 + scale1_row * scale1_cols;
+    const float* scale3_row_ptr = scales3 + scale3_row * scale3_cols;
+    for (int p = tid; p < packed_cols; p += blockDim.x) {
+        int k0 = p << 1;
+        int k1 = k0 + 1;
+        float x0 = __bfloat162float(x_row[k0]);
+        float x1 = __bfloat162float(x_row[k1]);
+        int scale1_col = clamp_scale_col_for_packed_pair(p, group_size, scale1_cols);
+        int scale3_col = clamp_scale_col_for_packed_pair(p, group_size, scale3_cols);
+        float scale1 = scale1_row_ptr[scale1_col];
+        float scale3 = scale3_row_ptr[scale3_col];
 
-        int scale1_col = scale_col < scale1_cols ? scale_col : scale1_cols - 1;
-        uint8_t packed1 = w1_row[k >> 1];
-        uint8_t nibble1 = (k & 1) ? ((packed1 >> 4) & 0x0F) : (packed1 & 0x0F);
-        float w1 = fp4_e2m1_to_float(nibble1) * scales1[scale1_row * scale1_cols + scale1_col];
-        gate_acc += xv * w1;
+        uint8_t packed1 = w1_row[p];
+        float w10 = fp4_e2m1_to_float(packed1) * scale1;
+        float w11 = fp4_e2m1_to_float(packed1 >> 4) * scale1;
+        gate_acc += x0 * w10 + x1 * w11;
 
-        int scale3_col = scale_col < scale3_cols ? scale_col : scale3_cols - 1;
-        uint8_t packed3 = w3_row[k >> 1];
-        uint8_t nibble3 = (k & 1) ? ((packed3 >> 4) & 0x0F) : (packed3 & 0x0F);
-        float w3 = fp4_e2m1_to_float(nibble3) * scales3[scale3_row * scale3_cols + scale3_col];
-        up_acc += xv * w3;
+        uint8_t packed3 = w3_row[p];
+        float w30 = fp4_e2m1_to_float(packed3) * scale3;
+        float w31 = fp4_e2m1_to_float(packed3 >> 4) * scale3;
+        up_acc += x0 * w30 + x1 * w31;
     }
 
     smem_gate[tid] = gate_acc;
@@ -310,22 +316,28 @@ __global__ void fp4_topk_gate_up_fused_kernel(
 
     const float* scales1 = reinterpret_cast<const float*>(scales1_ptrs[local_e]);
     const float* scales3 = reinterpret_cast<const float*>(scales3_ptrs[local_e]);
+    const float* scale1_row_ptr = scales1 + scale1_row * scale1_cols;
+    const float* scale3_row_ptr = scales3 + scale3_row * scale3_cols;
 
-    for (int k = tid; k < dim; k += blockDim.x) {
-        float xv = __bfloat162float(x_row[k]);
-        int scale_col = k / group_size;
+    for (int p = tid; p < packed_dim; p += blockDim.x) {
+        int k0 = p << 1;
+        int k1 = k0 + 1;
+        float x0 = __bfloat162float(x_row[k0]);
+        float x1 = __bfloat162float(x_row[k1]);
+        int scale1_col = clamp_scale_col_for_packed_pair(p, group_size, scale1_cols);
+        int scale3_col = clamp_scale_col_for_packed_pair(p, group_size, scale3_cols);
+        float scale1 = scale1_row_ptr[scale1_col];
+        float scale3 = scale3_row_ptr[scale3_col];
 
-        int scale1_col = scale_col < scale1_cols ? scale_col : scale1_cols - 1;
-        uint8_t packed1 = w1_row[k >> 1];
-        uint8_t nibble1 = (k & 1) ? ((packed1 >> 4) & 0x0F) : (packed1 & 0x0F);
-        float w1 = fp4_e2m1_to_float(nibble1) * scales1[scale1_row * scale1_cols + scale1_col];
-        gate_acc += xv * w1;
+        uint8_t packed1 = w1_row[p];
+        float w10 = fp4_e2m1_to_float(packed1) * scale1;
+        float w11 = fp4_e2m1_to_float(packed1 >> 4) * scale1;
+        gate_acc += x0 * w10 + x1 * w11;
 
-        int scale3_col = scale_col < scale3_cols ? scale_col : scale3_cols - 1;
-        uint8_t packed3 = w3_row[k >> 1];
-        uint8_t nibble3 = (k & 1) ? ((packed3 >> 4) & 0x0F) : (packed3 & 0x0F);
-        float w3 = fp4_e2m1_to_float(nibble3) * scales3[scale3_row * scale3_cols + scale3_col];
-        up_acc += xv * w3;
+        uint8_t packed3 = w3_row[p];
+        float w30 = fp4_e2m1_to_float(packed3) * scale3;
+        float w31 = fp4_e2m1_to_float(packed3 >> 4) * scale3;
+        up_acc += x0 * w30 + x1 * w31;
     }
 
     smem_gate[tid] = gate_acc;
@@ -395,15 +407,17 @@ __global__ void fp4_topk_w2_accum_f32_kernel(
         }
         const float* scales2 = reinterpret_cast<const float*>(scales2_ptrs[local_e]);
 
-        for (int k = tid; k < inter_dim; k += blockDim.x) {
-            uint8_t packed = w2_row[k >> 1];
-            uint8_t nibble = (k & 1) ? ((packed >> 4) & 0x0F) : (packed & 0x0F);
-            int scale_col = k / group_size;
-            if (scale_col >= scale2_cols) {
-                scale_col = scale2_cols - 1;
-            }
-            float w = fp4_e2m1_to_float(nibble) * scales2[scale2_row * scale2_cols + scale_col];
-            acc += __bfloat162float(hidden_row[k]) * w;
+        const float* scale2_row_ptr = scales2 + scale2_row * scale2_cols;
+        for (int p = tid; p < packed_inter_dim; p += blockDim.x) {
+            uint8_t packed = w2_row[p];
+            int k0 = p << 1;
+            int k1 = k0 + 1;
+            int scale_col = clamp_scale_col_for_packed_pair(p, group_size, scale2_cols);
+            float block_scale = scale2_row_ptr[scale_col];
+            float w0 = fp4_e2m1_to_float(packed) * block_scale;
+            float w1 = fp4_e2m1_to_float(packed >> 4) * block_scale;
+            acc += __bfloat162float(hidden_row[k0]) * w0;
+            acc += __bfloat162float(hidden_row[k1]) * w1;
         }
     }
 
