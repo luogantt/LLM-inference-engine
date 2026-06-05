@@ -63,6 +63,7 @@ def configure_a800_compat(args: argparse.Namespace, torch, local_rank: int) -> L
         "A800_DEQUANT_DTYPE": "bf16",
         "A800_USE_CUDA_FP4_GEMM": "1",
         "A800_USE_CUDA_FP4_FFN": "1",
+        "A800_USE_CUDA_FP4_TOPK_FFN": "0",
         "A800_USE_CUDA_FP4_ACCUM": "0",
         "A800_FAST_DECODE_MOE": "1",
         "A800_BF16_MOE_REDUCE": "0",
@@ -148,6 +149,7 @@ def run_inference(args: argparse.Namespace) -> None:
     a800_force_dequant = os.getenv("A800_FORCE_DEQUANT_GEMM", "").strip().lower() in {"1", "true", "yes", "on"}
     a800_cuda_fp4 = os.getenv("A800_USE_CUDA_FP4_GEMM", "").strip().lower() in {"1", "true", "yes", "on"}
     a800_cuda_fp4_ffn = os.getenv("A800_USE_CUDA_FP4_FFN", "").strip().lower() in {"1", "true", "yes", "on"}
+    a800_cuda_fp4_topk_ffn = os.getenv("A800_USE_CUDA_FP4_TOPK_FFN", "").strip().lower() in {"1", "true", "yes", "on"}
     a800_cuda_fp4_accum_value = os.getenv("A800_USE_CUDA_FP4_ACCUM", "").strip().lower()
     a800_cuda_fp4_accum = (
         False
@@ -225,6 +227,11 @@ def run_inference(args: argparse.Namespace) -> None:
         )
     if a800_cuda_fp4_ffn and a800_cuda_fp4_accum:
         print("[A800 compat] A800_USE_CUDA_FP4_ACCUM=1, direct FP32 MoE accumulation is enabled")
+    if a800_cuda_fp4_ffn and a800_cuda_fp4_topk_ffn:
+        print(
+            "[A800 compat] A800_USE_CUDA_FP4_TOPK_FFN=1, "
+            "group selected top-k FP4 experts through one CUDA .so call per MoE layer"
+        )
     if a800_fast_decode_moe:
         print(
             "[A800 compat] A800_FAST_DECODE_MOE=1, "

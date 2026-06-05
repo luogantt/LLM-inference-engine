@@ -62,6 +62,10 @@ def _a800_use_cuda_fp4_ffn() -> bool:
     return _env_flag("A800_USE_CUDA_FP4_FFN")
 
 
+def _a800_use_cuda_fp4_topk_ffn() -> bool:
+    return _env_flag("A800_USE_CUDA_FP4_TOPK_FFN")
+
+
 def _a800_use_cuda_fp4_accum() -> bool:
     value = os.getenv("A800_USE_CUDA_FP4_ACCUM")
     if value is None or value.strip() == "":
@@ -236,6 +240,39 @@ def _a800_load_cuda_lib():
             lib.ds_v4_fp4_expert_ffn_accum_f32.restype = ctypes.c_int
             if rank == 0:
                 print("[A800 compat] CUDA fp4 expert FFN direct-accum symbol available")
+        except AttributeError:
+            pass
+        try:
+            lib.ds_v4_fp4_topk_expert_ffn_accum_f32.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_float,
+                ctypes.c_void_p,
+            ]
+            lib.ds_v4_fp4_topk_expert_ffn_accum_f32.restype = ctypes.c_int
+            if rank == 0:
+                print("[A800 compat] CUDA fp4 top-k expert FFN symbol available")
         except AttributeError:
             pass
         lib.ds_v4_a800_last_error.argtypes = []
@@ -683,6 +720,138 @@ def _a800_cuda_fp4_expert_ffn_accum(
         err = lib.ds_v4_a800_last_error()
         err_text = err.decode("utf-8", errors="replace") if err else f"ret={ret}"
         _a800_warn_cuda_fp4_fallback(f"fused FFN accum {err_text}")
+        return False
+    return True
+
+
+def _a800_cuda_fp4_topk_expert_ffn_accum(
+    x: torch.Tensor,
+    route_weights: torch.Tensor,
+    indices: torch.Tensor,
+    ptrs: Optional[
+        Tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            Tuple[int, int],
+            Tuple[int, int],
+            Tuple[int, int],
+            int,
+        ]
+    ],
+    local_start: int,
+    n_local: int,
+    swiglu_limit: float,
+    accum: torch.Tensor,
+) -> bool:
+    if not _a800_use_cuda_fp4_topk_ffn():
+        return False
+    if not _a800_use_cuda_fp4_ffn():
+        return False
+    if not _a800_force_dequant_gemm():
+        return False
+    if ptrs is None:
+        return False
+    if accum.dtype != torch.float32 or not accum.is_cuda or not accum.is_contiguous():
+        return False
+    if _a800_dequant_dtype() != torch.bfloat16:
+        return False
+    if x.dtype != torch.bfloat16 or not x.is_cuda:
+        return False
+
+    (
+        w1_ptrs,
+        s1_ptrs,
+        w2_ptrs,
+        s2_ptrs,
+        w3_ptrs,
+        s3_ptrs,
+        s1_shape,
+        s2_shape,
+        s3_shape,
+        inter_dim,
+    ) = ptrs
+    ptr_tensors = (w1_ptrs, s1_ptrs, w2_ptrs, s2_ptrs, w3_ptrs, s3_ptrs)
+    if any(t.dtype != torch.int64 or not t.is_cuda or not t.is_contiguous() or t.numel() != n_local for t in ptr_tensors):
+        return False
+
+    dim = x.size(-1)
+    if x.reshape(-1, dim).size(0) != 1:
+        return False
+    if accum.size(-1) != dim:
+        return False
+    if inter_dim <= 0 or dim <= 0:
+        return False
+    if len(s1_shape) != 2 or len(s2_shape) != 2 or len(s3_shape) != 2:
+        return False
+
+    route = route_weights.reshape(-1)
+    if route.numel() <= 0:
+        return False
+    if route.dtype != torch.float32:
+        route = route.float()
+    if not route.is_contiguous():
+        route = route.contiguous()
+
+    idx = indices.reshape(-1)
+    if idx.numel() != route.numel():
+        return False
+    if idx.dtype != torch.int32:
+        idx = idx.to(torch.int32)
+    if not idx.is_contiguous():
+        idx = idx.contiguous()
+
+    lib = _a800_load_cuda_lib()
+    if lib is None:
+        return False
+    try:
+        ffn = lib.ds_v4_fp4_topk_expert_ffn_accum_f32
+    except AttributeError:
+        _a800_warn_cuda_fp4_fallback("top-k fused FFN symbol missing")
+        return False
+
+    x_2d = x.reshape(-1, dim).contiguous()
+    y_2d = accum.reshape(-1, dim)
+    if y_2d.size(0) != 1:
+        return False
+
+    hidden = torch.empty((route.numel(), inter_dim), device=x.device, dtype=x.dtype)
+    stream = torch.cuda.current_stream(x.device).cuda_stream
+
+    ret = ffn(
+        ctypes.c_void_p(x_2d.data_ptr()),
+        ctypes.c_void_p(route.data_ptr()),
+        ctypes.c_void_p(idx.data_ptr()),
+        ctypes.c_void_p(w1_ptrs.data_ptr()),
+        ctypes.c_void_p(s1_ptrs.data_ptr()),
+        ctypes.c_void_p(w2_ptrs.data_ptr()),
+        ctypes.c_void_p(s2_ptrs.data_ptr()),
+        ctypes.c_void_p(w3_ptrs.data_ptr()),
+        ctypes.c_void_p(s3_ptrs.data_ptr()),
+        ctypes.c_void_p(hidden.data_ptr()),
+        ctypes.c_void_p(y_2d.data_ptr()),
+        ctypes.c_int(route.numel()),
+        ctypes.c_int(local_start),
+        ctypes.c_int(n_local),
+        ctypes.c_int(dim),
+        ctypes.c_int(inter_dim),
+        ctypes.c_int(s1_shape[0]),
+        ctypes.c_int(s1_shape[1]),
+        ctypes.c_int(s2_shape[0]),
+        ctypes.c_int(s2_shape[1]),
+        ctypes.c_int(s3_shape[0]),
+        ctypes.c_int(s3_shape[1]),
+        ctypes.c_int(fp4_block_size),
+        ctypes.c_float(float(swiglu_limit)),
+        ctypes.c_void_p(stream),
+    )
+    if ret != 0:
+        err = lib.ds_v4_a800_last_error()
+        err_text = err.decode("utf-8", errors="replace") if err else f"ret={ret}"
+        _a800_warn_cuda_fp4_fallback(f"top-k fused FFN accum {err_text}")
         return False
     return True
 
@@ -1342,6 +1511,9 @@ class MoE(nn.Module):
         for linear in (self.shared_experts.w1, self.shared_experts.w2, self.shared_experts.w3):
             linear.weight._a800_shared_fp8 = True
         self._a800_decode_y: Optional[torch.Tensor] = None
+        self._a800_fp4_topk_ptrs = None
+        self._a800_fp4_topk_ptrs_failed = False
+        self.swiglu_limit = args.swiglu_limit
 
     def _a800_decode_accum_buffer(self, x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
         if dtype != torch.float32 or not _a800_reuse_decode_moe_y():
@@ -1353,6 +1525,87 @@ class MoE(nn.Module):
         y.zero_()
         return y
 
+    def _a800_local_fp4_topk_ptrs(self):
+        if not _a800_use_cuda_fp4_topk_ffn() or self._a800_fp4_topk_ptrs_failed:
+            return None
+        if self._a800_fp4_topk_ptrs is not None:
+            return self._a800_fp4_topk_ptrs
+
+        try:
+            w1_ptrs, s1_ptrs = [], []
+            w2_ptrs, s2_ptrs = [], []
+            w3_ptrs, s3_ptrs = [], []
+            s1_shape = s2_shape = s3_shape = None
+            inter_dim = None
+            device = None
+
+            for expert_id in range(self.experts_start_idx, self.experts_end_idx):
+                expert = self.experts[expert_id]
+                if expert is None:
+                    self._a800_fp4_topk_ptrs_failed = True
+                    return None
+
+                weights = (expert.w1.weight, expert.w2.weight, expert.w3.weight)
+                scales = tuple(getattr(weight, "scale", None) for weight in weights)
+                if any(weight.dtype != torch.float4_e2m1fn_x2 or not weight.is_cuda or not weight.is_contiguous() for weight in weights):
+                    self._a800_fp4_topk_ptrs_failed = True
+                    return None
+                if any(scale is None or scale.dtype != torch.float32 or not scale.is_cuda or not scale.is_contiguous() or scale.ndim != 2 for scale in scales):
+                    self._a800_fp4_topk_ptrs_failed = True
+                    return None
+
+                dim = self.dim
+                cur_inter_dim = expert.w1.weight.size(0)
+                if expert.w3.weight.size(0) != cur_inter_dim or expert.w2.weight.size(0) != dim:
+                    self._a800_fp4_topk_ptrs_failed = True
+                    return None
+                if expert.w1.weight.size(1) * 2 != dim or expert.w3.weight.size(1) * 2 != dim or expert.w2.weight.size(1) * 2 != cur_inter_dim:
+                    self._a800_fp4_topk_ptrs_failed = True
+                    return None
+
+                cur_s1_shape = (scales[0].size(0), scales[0].size(1))
+                cur_s2_shape = (scales[1].size(0), scales[1].size(1))
+                cur_s3_shape = (scales[2].size(0), scales[2].size(1))
+                if s1_shape is None:
+                    s1_shape, s2_shape, s3_shape = cur_s1_shape, cur_s2_shape, cur_s3_shape
+                    inter_dim = cur_inter_dim
+                    device = expert.w1.weight.device
+                elif s1_shape != cur_s1_shape or s2_shape != cur_s2_shape or s3_shape != cur_s3_shape or inter_dim != cur_inter_dim:
+                    self._a800_fp4_topk_ptrs_failed = True
+                    return None
+
+                w1_ptrs.append(expert.w1.weight.data_ptr())
+                s1_ptrs.append(scales[0].data_ptr())
+                w2_ptrs.append(expert.w2.weight.data_ptr())
+                s2_ptrs.append(scales[1].data_ptr())
+                w3_ptrs.append(expert.w3.weight.data_ptr())
+                s3_ptrs.append(scales[2].data_ptr())
+
+            if device is None or inter_dim is None or s1_shape is None or s2_shape is None or s3_shape is None:
+                self._a800_fp4_topk_ptrs_failed = True
+                return None
+
+            def ptr_tensor(values):
+                return torch.tensor(values, dtype=torch.int64, device=device)
+
+            self._a800_fp4_topk_ptrs = (
+                ptr_tensor(w1_ptrs),
+                ptr_tensor(s1_ptrs),
+                ptr_tensor(w2_ptrs),
+                ptr_tensor(s2_ptrs),
+                ptr_tensor(w3_ptrs),
+                ptr_tensor(s3_ptrs),
+                s1_shape,
+                s2_shape,
+                s3_shape,
+                inter_dim,
+            )
+            return self._a800_fp4_topk_ptrs
+        except (RuntimeError, TypeError, ValueError) as exc:
+            self._a800_fp4_topk_ptrs_failed = True
+            _a800_warn_cuda_fp4_fallback(f"top-k pointer table build failed: {exc}")
+            return None
+
     def forward(self, x: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
         shape = x.size()
         x = x.view(-1, self.dim)
@@ -1361,6 +1614,20 @@ class MoE(nn.Module):
 
         if _a800_fast_decode_moe() and x.size(0) == 1:
             y = self._a800_decode_accum_buffer(x, moe_accum_dtype)
+            if _a800_cuda_fp4_topk_expert_ffn_accum(
+                x,
+                weights,
+                indices,
+                self._a800_local_fp4_topk_ptrs(),
+                self.experts_start_idx,
+                self.n_local_experts,
+                self.swiglu_limit,
+                y,
+            ):
+                if world_size > 1:
+                    dist.all_reduce(y)
+                y += self.shared_experts(x)
+                return y.type_as(x).view(shape)
             for top, expert_id in enumerate(indices[0].tolist()):
                 if self.experts_start_idx <= expert_id < self.experts_end_idx:
                     expert = self.experts[expert_id]

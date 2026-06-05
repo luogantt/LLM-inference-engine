@@ -386,6 +386,20 @@ kernel 2: w2 FP4 unpack/scale/dot -> BF16 output
 
 Newer `.so` builds also expose `ds_v4_fp4_expert_ffn_accum_f32`. In single-token fast MoE decode, this lets the `w2` kernel accumulate directly into the FP32 MoE output buffer and skips the temporary BF16 expert output tensor plus the Python `y += expert(...)` add. Current measurements show this direct-accum path is slower, so it is opt-in only. Use `A800_USE_CUDA_FP4_ACCUM=1` to enable it for A/B testing.
 
+An experimental grouped top-k FFN path is also available. Instead of looping through selected experts in Python and launching the per-expert FFN path one by one, the MoE layer builds a tiny CUDA pointer table for local expert weights and calls `ds_v4_fp4_topk_expert_ffn_accum_f32` once per MoE layer. The kernel directly reads the original FP4 expert tensors through device pointers, so it does not duplicate the expert weights in memory:
+
+```bash
+export A800_USE_CUDA_FP4_TOPK_FFN=1
+```
+
+This path is disabled by default because it changes the MoE dispatch shape and needs A/B testing on A800. If it is slower or unstable, set `A800_USE_CUDA_FP4_TOPK_FFN=0` and keep the current per-expert `.so` fast path.
+
+Because this path adds a new C ABI symbol, rebuild the dynamic library before testing it:
+
+```bash
+make -f Makefile.cuda_lib deepseek-v4-a800 A=sm_80
+```
+
 Decode MoE dispatch can also skip the full local expert scan. DeepSeek-V4-Flash routes only top-k experts per token (`n_activated_experts=6`), while each A800 rank owns 64 local experts under 4-way tensor parallelism. For single-token decode, the A800 path can iterate only the selected top-k expert ids:
 
 ```bash
@@ -481,6 +495,7 @@ export A800_FORCE_DEQUANT_GEMM=1
 export A800_DEQUANT_DTYPE=bf16
 export A800_USE_CUDA_FP4_GEMM=1
 export A800_USE_CUDA_FP4_FFN=1
+export A800_USE_CUDA_FP4_TOPK_FFN=0
 export A800_USE_CUDA_FP4_ACCUM=0
 export A800_FAST_DECODE_MOE=1
 export A800_BF16_MOE_REDUCE=0
