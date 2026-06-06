@@ -306,7 +306,7 @@ __global__ void fp8_shared_gate_up_fused_kernel(
     }
 }
 
-__global__ void fp4_expert_gate_up_fused_kernel(
+__global__ __launch_bounds__(256, 4) void fp4_expert_gate_up_fused_kernel(
     const __nv_bfloat16* __restrict__ x,
     const float* __restrict__ route,
     const uint8_t* __restrict__ packed_w1,
@@ -397,13 +397,15 @@ __global__ void fp4_expert_gate_up_fused_kernel(
     }
 }
 
-// Tiled FP4 topk gate+up kernel: each block handles FP4_TOPK_GU_TILE=8 outputs
-// for one expert. x loaded into shared memory once per block (not once per output!).
-// 8 warps cooperatively compute 8 output elements simultaneously via warp shuffle.
-// Grid: (ceil(inter_dim / 8), topk) — 8x fewer blocks than original.
-#define FP4_TOPK_GU_TILE 8
+// Tiled gate+up kernel: each block handles TILE output elements using 8 warps.
+// x loaded into shared memory once per block. Each warp computes TILE/8 outputs.
+// Grid: (ceil(inter_dim / TILE), topk).
+#define FP4_TOPK_GU_TILE 16
+#define FP4_TOPK_GU_ELEMS_PER_WARP (FP4_TOPK_GU_TILE / 8)  // 2 outputs per warp
+#define BF16_TOPK_GU_TILE 32
+#define BF16_TOPK_GU_ELEMS_PER_WARP (BF16_TOPK_GU_TILE / 8)  // 4 outputs per warp
 
-__global__ __launch_bounds__(256, 2) void fp4_topk_gate_up_fused_kernel(
+__global__ __launch_bounds__(256, 4) void fp4_topk_gate_up_fused_kernel(
     const __nv_bfloat16* __restrict__ x,
     const float* __restrict__ routes,
     const int32_t* __restrict__ indices,
@@ -459,57 +461,61 @@ __global__ __launch_bounds__(256, 2) void fp4_topk_gate_up_fused_kernel(
     const int packed_dim = dim / 2;
     float route_val = routes ? routes[top_idx] : 1.0f;
 
-    // Each warp handles one output element (inter_idx = inter_base + warp_id)
-    int inter_idx = inter_base + warp_id;
-    if (inter_idx < inter_dim) {
-        const uint8_t* w1_row = w1_base + inter_idx * packed_dim;
-        const uint8_t* w3_row = w3_base + inter_idx * packed_dim;
-        int s1_row = (scale1_rows == inter_dim) ? inter_idx :
-            min(inter_idx / group_size, scale1_rows - 1);
-        int s3_row = (scale3_rows == inter_dim) ? inter_idx :
-            min(inter_idx / group_size, scale3_rows - 1);
+    // Each warp computes FP4_TOPK_GU_ELEMS_PER_WARP output elements sequentially.
+    // x_s is reused across all outputs — loaded once per block.
+    #pragma unroll
+    for (int w = 0; w < FP4_TOPK_GU_ELEMS_PER_WARP; ++w) {
+        int inter_idx = inter_base + warp_id + w * 8;
+        if (inter_idx < inter_dim) {
+            const uint8_t* w1_row = w1_base + inter_idx * packed_dim;
+            const uint8_t* w3_row = w3_base + inter_idx * packed_dim;
+            int s1_row = (scale1_rows == inter_dim) ? inter_idx :
+                min(inter_idx / group_size, scale1_rows - 1);
+            int s3_row = (scale3_rows == inter_dim) ? inter_idx :
+                min(inter_idx / group_size, scale3_rows - 1);
 
-        float gate_acc = 0.0f, up_acc = 0.0f;
-        for (int k = lane; k < dim; k += WARP_SIZE) {
-            float xv = x_s[k];
-            int sc = min(k / group_size, scale1_cols - 1);
+            float gate_acc = 0.0f, up_acc = 0.0f;
+            for (int k = lane; k < dim; k += WARP_SIZE) {
+                float xv = x_s[k];
+                int sc = min(k / group_size, scale1_cols - 1);
 
-            // w1 (gate): dequant FP4 nibble + scale
-            uint8_t p1 = w1_row[k >> 1];
-            uint8_t n1 = (k & 1) ? (p1 >> 4) : (p1 & 0x0F);
-            gate_acc += xv * fp4_e2m1_to_float(n1) *
-                scales1[s1_row * scale1_cols + sc];
+                // w1 (gate): dequant FP4 nibble + scale
+                uint8_t p1 = w1_row[k >> 1];
+                uint8_t n1 = (k & 1) ? (p1 >> 4) : (p1 & 0x0F);
+                gate_acc += xv * fp4_e2m1_to_float(n1) *
+                    scales1[s1_row * scale1_cols + sc];
 
-            // w3 (up)
-            int s3c = min(sc, scale3_cols - 1);
-            uint8_t p3 = w3_row[k >> 1];
-            uint8_t n3 = (k & 1) ? (p3 >> 4) : (p3 & 0x0F);
-            up_acc += xv * fp4_e2m1_to_float(n3) *
-                scales3[s3_row * scale3_cols + s3c];
-        }
-
-        // Warp shuffle reduction
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            gate_acc += __shfl_xor_sync(0xFFFFFFFF, gate_acc, offset);
-            up_acc += __shfl_xor_sync(0xFFFFFFFF, up_acc, offset);
-        }
-
-        if (lane == 0) {
-            float gate = gate_acc, up = up_acc;
-            if (swiglu_limit > 0.0f) {
-                up = fminf(fmaxf(up, -swiglu_limit), swiglu_limit);
-                gate = fminf(gate, swiglu_limit);
+                // w3 (up)
+                int s3c = min(sc, scale3_cols - 1);
+                uint8_t p3 = w3_row[k >> 1];
+                uint8_t n3 = (k & 1) ? (p3 >> 4) : (p3 & 0x0F);
+                up_acc += xv * fp4_e2m1_to_float(n3) *
+                    scales3[s3_row * scale3_cols + s3c];
             }
-            float silu = gate / (1.0f + expf(-gate));
-            hidden[top_idx * inter_dim + inter_idx] =
-                __float2bfloat16(silu * up * route_val);
+
+            // Warp shuffle reduction
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                gate_acc += __shfl_xor_sync(0xFFFFFFFF, gate_acc, offset);
+                up_acc += __shfl_xor_sync(0xFFFFFFFF, up_acc, offset);
+            }
+
+            if (lane == 0) {
+                float gate = gate_acc, up = up_acc;
+                if (swiglu_limit > 0.0f) {
+                    up = fminf(fmaxf(up, -swiglu_limit), swiglu_limit);
+                    gate = fminf(gate, swiglu_limit);
+                }
+                float silu = gate / (1.0f + expf(-gate));
+                hidden[top_idx * inter_dim + inter_idx] =
+                    __float2bfloat16(silu * up * route_val);
+            }
         }
     }
 }
 
 
-__global__ void fp4_topk_w2_accum_f32_kernel(
+__global__ __launch_bounds__(256, 6) void fp4_topk_w2_accum_f32_kernel(
     const __nv_bfloat16* __restrict__ hidden,
     const int32_t* __restrict__ indices,
     const uintptr_t* __restrict__ packed_w2_ptrs,
@@ -593,7 +599,7 @@ __global__ __launch_bounds__(256, 2) void bf16_topk_gate_up_fused_kernel(
     int inter_dim,
     float swiglu_limit
 ) {
-    int inter_base = blockIdx.x * FP4_TOPK_GU_TILE;
+    int inter_base = blockIdx.x * BF16_TOPK_GU_TILE;
     int top_idx = blockIdx.y;
     int tid = threadIdx.x;
     int warp_id = tid / 32;
@@ -609,7 +615,7 @@ __global__ __launch_bounds__(256, 2) void bf16_topk_gate_up_fused_kernel(
         w3_addr = w3_ptrs[local_e];
     }
     if (local_e < 0 || local_e >= n_local || w1_addr == 0 || w3_addr == 0) {
-        for (int i = tid; i < FP4_TOPK_GU_TILE; i += blockDim.x) {
+        for (int i = tid; i < BF16_TOPK_GU_TILE; i += blockDim.x) {
             int idx = inter_base + i;
             if (idx < inter_dim) {
                 hidden[top_idx * inter_dim + idx] = __float2bfloat16(0.0f);
@@ -629,40 +635,44 @@ __global__ __launch_bounds__(256, 2) void bf16_topk_gate_up_fused_kernel(
     const __nv_bfloat16* w3_base = reinterpret_cast<const __nv_bfloat16*>(w3_addr);
     float route_val = routes ? routes[top_idx] : 1.0f;
 
-    int inter_idx = inter_base + warp_id;
-    if (inter_idx < inter_dim) {
-        const __nv_bfloat16* w1_row = w1_base + inter_idx * dim;
-        const __nv_bfloat16* w3_row = w3_base + inter_idx * dim;
+    // Each warp computes BF16_TOPK_GU_ELEMS_PER_WARP output elements sequentially
+    #pragma unroll
+    for (int w = 0; w < BF16_TOPK_GU_ELEMS_PER_WARP; ++w) {
+        int inter_idx = inter_base + warp_id + w * 8;
+        if (inter_idx < inter_dim) {
+            const __nv_bfloat16* w1_row = w1_base + inter_idx * dim;
+            const __nv_bfloat16* w3_row = w3_base + inter_idx * dim;
 
-        float gate_acc = 0.0f;
-        float up_acc = 0.0f;
-        for (int k = lane; k < dim; k += WARP_SIZE) {
-            float xv = x_s[k];
-            gate_acc += xv * __bfloat162float(w1_row[k]);
-            up_acc += xv * __bfloat162float(w3_row[k]);
-        }
-
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            gate_acc += __shfl_xor_sync(0xFFFFFFFF, gate_acc, offset);
-            up_acc += __shfl_xor_sync(0xFFFFFFFF, up_acc, offset);
-        }
-
-        if (lane == 0) {
-            float gate = gate_acc;
-            float up = up_acc;
-            if (swiglu_limit > 0.0f) {
-                up = fminf(fmaxf(up, -swiglu_limit), swiglu_limit);
-                gate = fminf(gate, swiglu_limit);
+            float gate_acc = 0.0f;
+            float up_acc = 0.0f;
+            for (int k = lane; k < dim; k += WARP_SIZE) {
+                float xv = x_s[k];
+                gate_acc += xv * __bfloat162float(w1_row[k]);
+                up_acc += xv * __bfloat162float(w3_row[k]);
             }
-            float silu = gate / (1.0f + expf(-gate));
-            hidden[top_idx * inter_dim + inter_idx] =
-                __float2bfloat16(silu * up * route_val);
+
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                gate_acc += __shfl_xor_sync(0xFFFFFFFF, gate_acc, offset);
+                up_acc += __shfl_xor_sync(0xFFFFFFFF, up_acc, offset);
+            }
+
+            if (lane == 0) {
+                float gate = gate_acc;
+                float up = up_acc;
+                if (swiglu_limit > 0.0f) {
+                    up = fminf(fmaxf(up, -swiglu_limit), swiglu_limit);
+                    gate = fminf(gate, swiglu_limit);
+                }
+                float silu = gate / (1.0f + expf(-gate));
+                hidden[top_idx * inter_dim + inter_idx] =
+                    __float2bfloat16(silu * up * route_val);
+            }
         }
     }
 }
 
-__global__ void bf16_topk_w2_accum_f32_kernel(
+__global__ __launch_bounds__(256, 4) void bf16_topk_w2_accum_f32_kernel(
     const __nv_bfloat16* __restrict__ hidden,
     const int32_t* __restrict__ indices,
     const uintptr_t* __restrict__ w2_ptrs,
@@ -1381,7 +1391,7 @@ extern "C" int ds_v4_bf16_topk_expert_ffn_accum_f32(
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     constexpr int threads = 256;
-    int gate_up_grid_x = (inter_dim + FP4_TOPK_GU_TILE - 1) / FP4_TOPK_GU_TILE;
+    int gate_up_grid_x = (inter_dim + BF16_TOPK_GU_TILE - 1) / BF16_TOPK_GU_TILE;
     size_t gate_up_smem = dim * sizeof(float);
 
     bf16_topk_gate_up_fused_kernel<<<dim3(gate_up_grid_x, topk), threads, gate_up_smem, stream>>>(

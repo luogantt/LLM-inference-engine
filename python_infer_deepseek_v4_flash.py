@@ -66,7 +66,7 @@ def configure_a800_compat(args: argparse.Namespace, torch, local_rank: int) -> L
         "A800_USE_CUDA_FP4_TOPK_FFN": "1",
         "A800_CACHE_FP4_BF16": "0",
         "A800_USE_CUDA_BF16_TOPK_FFN": "0",
-        "A800_BF16_TOPK_FREEZE_AFTER_WARMUP": "1",
+        "A800_BF16_TOPK_FREEZE_AFTER_WARMUP": "0",
         "A800_BF16_TOPK_CACHE_MB": "2048",
         "A800_BF16_TOPK_MAX_LOCAL_EXPERTS": "2",
         "A800_BF16_TOPK_MIN_FREE_MB": "4096",
@@ -91,6 +91,7 @@ def configure_a800_compat(args: argparse.Namespace, torch, local_rank: int) -> L
         "A800_USE_HC_SPLIT_KERNEL": "1",
         "A800_USE_HC_POST_KERNEL": "1",
         "A800_USE_SPARSE_ATTN_KERNEL": "1",
+        "A800_FUSE_ATTN_OUT": "1",
         "A800_CUDA_LIB": "./build/libdeepseek_v4_a800.so",
     }
 
@@ -244,6 +245,7 @@ def run_inference(args: argparse.Namespace) -> None:
     a800_hc_split_kernel = os.getenv("A800_USE_HC_SPLIT_KERNEL", "").strip().lower() in {"1", "true", "yes", "on"}
     a800_hc_post_kernel = os.getenv("A800_USE_HC_POST_KERNEL", "").strip().lower() in {"1", "true", "yes", "on"}
     a800_sparse_attn_kernel = os.getenv("A800_USE_SPARSE_ATTN_KERNEL", "").strip().lower() in {"1", "true", "yes", "on"}
+    a800_fuse_attn_out = os.getenv("A800_FUSE_ATTN_OUT", "").strip().lower() in {"1", "true", "yes", "on"}
 
     if model_args.scale_dtype == "fp32" or a800_force_dequant:
         import torch.nn as nn
@@ -401,6 +403,11 @@ def run_inference(args: argparse.Namespace) -> None:
         print(
             "[A800 compat] A800_USE_SPARSE_ATTN_KERNEL=1, "
             "try TileLang sparse attention kernel before torch fallback"
+        )
+    if a800_fuse_attn_out:
+        print(
+            "[A800 compat] A800_FUSE_ATTN_OUT=1, "
+            "fuse attention output projection into single F.linear for decode"
         )
 
     torch.set_default_device("cuda")

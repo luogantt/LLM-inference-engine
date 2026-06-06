@@ -292,6 +292,10 @@ def _a800_use_sparse_attn_kernel() -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _a800_fuse_attn_out_proj() -> bool:
+    return _env_flag("A800_FUSE_ATTN_OUT")
+
+
 def _a800_fp4_cache_limit_bytes() -> int:
     if not _a800_cache_fp4_weight():
         return 0
@@ -1003,11 +1007,17 @@ def _a800_cuda_o_proj_fused(
     lora_rank: int,
 ) -> Optional[torch.Tensor]:
     """Fused CUDA kernel for attention output projection.
-    Combines einsum + wo_b linear into one kernel launch."""
+    Combines einsum + wo_b linear into one kernel launch.
+    Dequantizes FP8 weights to BF16 on demand (cached)."""
     if not _a800_force_dequant_gemm():
         return None
     if o.dtype != torch.bfloat16 or not o.is_cuda:
         return None
+    # Dequantize weights if they are still in FP8
+    if wo_a_weight.dtype != torch.bfloat16:
+        wo_a_weight = _dequantize_fp8_weight(wo_a_weight)
+    if wo_b_weight.dtype != torch.bfloat16:
+        wo_b_weight = _dequantize_fp8_weight(wo_b_weight)
     if wo_a_weight.dtype != torch.bfloat16 or wo_b_weight.dtype != torch.bfloat16:
         return None
 
@@ -2209,20 +2219,53 @@ class Indexer(torch.nn.Module):
         if self.compressor.kv_cache is None:
             self.compressor.kv_cache = self.kv_cache
             self.compressor.freqs_cis = self.freqs_cis
-        q = self.wq_b(qr)
-        q = q.unflatten(-1, (self.n_local_heads, self.head_dim))
-        apply_rotary_emb(q[..., -rd:], freqs_cis)
-        q = rotate_activation(q)
-        if not (_a800_force_dequant_gemm() and not _a800_keep_act_quant()):
-            fp4_act_quant(q, fp4_block_size, True)
         self.compressor(x, start_pos)
         cache_len = end_pos // ratio
-        weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads ** -0.5)
-        index_score = _a800_cuda_indexer_score(
-            q.squeeze(0).squeeze(0), self.kv_cache[:bsz, :cache_len].squeeze(0),
-            weights.squeeze(0).squeeze(0), bsz, cache_len,
-        )
+        weight_scale = self.softmax_scale * self.n_heads ** -0.5
+
+        # Try fully fused Indexer kernel for single-token decode:
+        # fuses Q proj + weight proj + RoPE + index scoring into one kernel launch
+        index_score = None
+        if seqlen == 1 and bsz == 1:
+            wq_b_weight = self.wq_b.weight
+            if wq_b_weight.dtype != torch.bfloat16:
+                wq_b_weight = _dequantize_fp8_weight(wq_b_weight)
+            weights_w = self.weights_proj.weight
+            if weights_w.dtype != torch.bfloat16:
+                weights_w = _dequantize_fp8_weight(weights_w)
+            index_score = _a800_cuda_indexer_full(
+                x.view(-1), qr.view(-1),
+                wq_b_weight, weights_w,
+                freqs_cis, self.kv_cache[:bsz, :cache_len].squeeze(0),
+                self.dim, self.q_lora_rank, self.n_local_heads, self.head_dim,
+                rd, cache_len, weight_scale,
+            )
+
         if index_score is None:
+            # Fallback: separate Q proj + weight proj + index score kernel
+            q = self.wq_b(qr)
+            q = q.unflatten(-1, (self.n_local_heads, self.head_dim))
+            apply_rotary_emb(q[..., -rd:], freqs_cis)
+            q = rotate_activation(q)
+            if not (_a800_force_dequant_gemm() and not _a800_keep_act_quant()):
+                fp4_act_quant(q, fp4_block_size, True)
+            weights = self.weights_proj(x) * weight_scale
+            index_score = _a800_cuda_indexer_score(
+                q.squeeze(0).squeeze(0), self.kv_cache[:bsz, :cache_len].squeeze(0),
+                weights.squeeze(0).squeeze(0), bsz, cache_len,
+            )
+
+        if index_score is None:
+            # Final fallback: torch einsum
+            if 'q' not in locals():
+                q = self.wq_b(qr)
+                q = q.unflatten(-1, (self.n_local_heads, self.head_dim))
+                apply_rotary_emb(q[..., -rd:], freqs_cis)
+                q = rotate_activation(q)
+                if not (_a800_force_dequant_gemm() and not _a800_keep_act_quant()):
+                    fp4_act_quant(q, fp4_block_size, True)
+            if 'weights' not in locals():
+                weights = self.weights_proj(x) * weight_scale
             index_score = torch.einsum("bshd,btd->bsht", q, self.kv_cache[:bsz, :cache_len])
             index_score = (index_score.relu_() * weights.unsqueeze(-1)).sum(dim=2)
         if world_size > 1:
@@ -2268,6 +2311,7 @@ class Attention(nn.Module):
         self.wo_a = ColumnParallelLinear(self.n_heads * self.head_dim // self.n_groups, self.n_groups * args.o_lora_rank, dtype=torch.bfloat16)
         self.wo_b = RowParallelLinear(self.n_groups * args.o_lora_rank, self.dim)
         self.softmax_scale = self.head_dim ** -0.5
+        self._a800_fused_out_weight: Optional[torch.Tensor] = None
         for linear in (self.wq_a, self.wq_b, self.wkv, self.wo_b):
             linear.weight._a800_attn_fp8 = True
 
@@ -2289,6 +2333,38 @@ class Attention(nn.Module):
         freqs_cis = precompute_freqs_cis(self.rope_head_dim, args.max_seq_len, original_seq_len,
                                          rope_theta, args.rope_factor, args.beta_fast, args.beta_slow)
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
+
+    def _a800_out_proj(self, o: torch.Tensor) -> Optional[torch.Tensor]:
+        """Fused attention output projection: pre-computes wo_a·wo_b once, then uses a
+        single F.linear call per decode step instead of einsum + wo_b (2 kernel launches)."""
+        if not _a800_fuse_attn_out_proj() or not _a800_force_dequant_gemm():
+            return None
+        if o.dtype != torch.bfloat16 or not o.is_cuda or o.size(0) != 1 or o.size(1) != 1:
+            return None
+        # Only applies when weights are in FP8 (the default checkpoint format)
+        if self.wo_a.weight.dtype != torch.float8_e4m3fn or self.wo_b.weight.dtype != torch.float8_e4m3fn:
+            return None
+
+        local_in = self.n_local_heads * self.head_dim
+        fused = self._a800_fused_out_weight
+        if fused is None or fused.shape != (self.dim, local_in) or fused.device != o.device:
+            wo_a = _dequantize_fp8_weight(self.wo_a.weight).view(
+                self.n_local_groups, self.o_lora_rank, -1
+            ).float()
+            wo_b = _dequantize_fp8_weight(self.wo_b.weight).view(
+                self.dim, self.n_local_groups, self.o_lora_rank
+            ).float()
+            parts = [torch.matmul(wo_b[:, g, :], wo_a[g]) for g in range(self.n_local_groups)]
+            fused = torch.cat(parts, dim=1).to(o.dtype).contiguous()
+            self._a800_fused_out_weight = fused
+
+        x = F.linear(o.reshape(1, 1, local_in), fused)
+        if world_size > 1:
+            if not (_a800_bf16_row_reduce() and x.dtype == torch.bfloat16):
+                x = x.float()
+            dist.all_reduce(x)
+            x = x.to(o.dtype)
+        return x
 
     def _forward_no_profile(self, x: torch.Tensor, start_pos: int):
         bsz, seqlen, _ = x.size()
@@ -2346,6 +2422,10 @@ class Attention(nn.Module):
                 o = sparse_attn(q, self.kv_cache[:bsz], self.attn_sink, topk_idxs, self.softmax_scale)
         apply_rotary_emb(o[..., -rd:], freqs_cis, True)
 
+        # Try fused attention output projection (single F.linear vs einsum+wo_b)
+        out_x = self._a800_out_proj(o)
+        if out_x is not None:
+            return out_x
         o = o.view(bsz, seqlen, self.n_local_groups, -1)
         wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
         o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
@@ -2419,6 +2499,10 @@ class Attention(nn.Module):
 
         # o
         with _a800_profile_region("attn.o_proj"):
+            # Try Python-fused attention output projection first (single F.linear)
+            x = self._a800_out_proj(o)
+            if x is not None:
+                return x
             # Try fused CUDA kernel (einsum + wo_b in one launch, coalesced)
             x = _a800_cuda_o_proj_fused(
                 o, self.wo_a.weight, self.wo_b.weight,
