@@ -32,6 +32,8 @@ _A800_PROFILE_ENABLED = None
 _A800_PROFILE_EVENTS = []
 _A800_HC_SPLIT_KERNEL_FAILED = False
 _A800_HC_SPLIT_KERNEL_WARNED = False
+_A800_SPARSE_ATTN_KERNEL_FAILED = False
+_A800_SPARSE_ATTN_KERNEL_WARNED = False
 
 
 class _A800NoopProfileRegion:
@@ -229,6 +231,13 @@ def _a800_reuse_argmax_packs() -> bool:
 
 def _a800_use_hc_split_kernel() -> bool:
     value = os.getenv("A800_USE_HC_SPLIT_KERNEL")
+    if value is None or value.strip() == "":
+        return _a800_force_dequant_gemm()
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _a800_use_sparse_attn_kernel() -> bool:
+    value = os.getenv("A800_USE_SPARSE_ATTN_KERNEL")
     if value is None or value.strip() == "":
         return _a800_force_dequant_gemm()
     return value.strip().lower() in {"1", "true", "yes", "on"}
@@ -615,6 +624,25 @@ def _torch_sparse_attn(
             denom = score_exp.sum(dim=-1, keepdim=True) + sink_exp
             out[b_idx, s_idx] = torch.matmul(score_exp / denom, kv_sel).to(q.dtype)
     return out
+
+
+def _a800_sparse_attn(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    attn_sink: torch.Tensor,
+    topk_idxs: torch.Tensor,
+    softmax_scale: float,
+) -> torch.Tensor:
+    global _A800_SPARSE_ATTN_KERNEL_FAILED, _A800_SPARSE_ATTN_KERNEL_WARNED
+    if _a800_use_sparse_attn_kernel() and not _A800_SPARSE_ATTN_KERNEL_FAILED:
+        try:
+            return sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale)
+        except Exception as exc:
+            _A800_SPARSE_ATTN_KERNEL_FAILED = True
+            if not _A800_SPARSE_ATTN_KERNEL_WARNED and rank == 0:
+                print(f"[A800 compat] sparse attention TileLang kernel fallback to torch path: {exc}")
+                _A800_SPARSE_ATTN_KERNEL_WARNED = True
+    return _torch_sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale)
 
 
 def _dequantize_fp4_weight(weight: torch.Tensor) -> torch.Tensor:
@@ -1348,12 +1376,15 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
 def get_window_topk_idxs(window_size: int, bsz: int, seqlen: int, start_pos: int):
     if start_pos >= window_size - 1:
         start_pos %= window_size
-        matrix = torch.cat([torch.arange(start_pos + 1, window_size),  torch.arange(0, start_pos + 1)], dim=0)
+        matrix = torch.cat([
+            torch.arange(start_pos + 1, window_size, dtype=torch.int32),
+            torch.arange(0, start_pos + 1, dtype=torch.int32),
+        ], dim=0)
     elif start_pos > 0:
-        matrix = F.pad(torch.arange(start_pos + 1), (0, window_size - start_pos - 1), value=-1)
+        matrix = F.pad(torch.arange(start_pos + 1, dtype=torch.int32), (0, window_size - start_pos - 1), value=-1)
     else:
-        base = torch.arange(seqlen).unsqueeze(1)
-        matrix = (base - window_size + 1).clamp(0) + torch.arange(min(seqlen, window_size))
+        base = torch.arange(seqlen, dtype=torch.int32).unsqueeze(1)
+        matrix = (base - window_size + 1).clamp(0) + torch.arange(min(seqlen, window_size), dtype=torch.int32)
         matrix = torch.where(matrix > base, -1, matrix)
     return matrix.unsqueeze(0).expand(bsz, -1, -1)
 
@@ -1361,10 +1392,10 @@ def get_window_topk_idxs(window_size: int, bsz: int, seqlen: int, start_pos: int
 @lru_cache(2)
 def get_compress_topk_idxs(ratio: int, bsz: int, seqlen: int, start_pos: int, offset: int):
     if start_pos > 0:
-        matrix = torch.arange(0, (start_pos + 1) // ratio) + offset
+        matrix = torch.arange(0, (start_pos + 1) // ratio, dtype=torch.int32) + offset
     else:
-        matrix = torch.arange(seqlen // ratio).repeat(seqlen, 1)
-        mask = matrix >= torch.arange(1, seqlen + 1).unsqueeze(1) // ratio
+        matrix = torch.arange(seqlen // ratio, dtype=torch.int32).repeat(seqlen, 1)
+        mask = matrix >= torch.arange(1, seqlen + 1, dtype=torch.int32).unsqueeze(1) // ratio
         matrix = torch.where(mask, -1, matrix + offset)
     return matrix.unsqueeze(0).expand(bsz, -1, -1)
 
@@ -1520,9 +1551,9 @@ class Indexer(torch.nn.Module):
         if start_pos == 0:
             mask = torch.arange(seqlen // ratio).repeat(seqlen, 1) >= torch.arange(1, seqlen + 1).unsqueeze(1) // ratio
             index_score += torch.where(mask, float("-inf"), 0)
-        topk_idxs = index_score.topk(min(self.index_topk, end_pos // ratio), dim=-1)[1]
+        topk_idxs = index_score.topk(min(self.index_topk, end_pos // ratio), dim=-1)[1].to(torch.int32)
         if start_pos == 0:
-            mask = topk_idxs >= torch.arange(1, seqlen + 1).unsqueeze(1) // ratio
+            mask = topk_idxs >= torch.arange(1, seqlen + 1, dtype=torch.int32).unsqueeze(1) // ratio
             topk_idxs = torch.where(mask, -1, topk_idxs + offset)
         else:
             topk_idxs += offset
@@ -1610,7 +1641,8 @@ class Attention(nn.Module):
             else:
                 compress_topk_idxs = get_compress_topk_idxs(ratio, bsz, seqlen, start_pos, offset)
             topk_idxs = torch.cat([topk_idxs, compress_topk_idxs], dim=-1)
-        topk_idxs = topk_idxs.int()
+        if topk_idxs.dtype != torch.int32:
+            topk_idxs = topk_idxs.int()
 
         if start_pos == 0:
             if seqlen <= win:
@@ -1622,7 +1654,7 @@ class Attention(nn.Module):
                 if (kv_compress := self.compressor(x, start_pos)) is not None:
                     kv = torch.cat([kv, kv_compress], dim=1)
             if _a800_force_dequant_gemm():
-                o = _torch_sparse_attn(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
+                o = _a800_sparse_attn(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
             else:
                 o = sparse_attn(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
         else:
@@ -1630,7 +1662,7 @@ class Attention(nn.Module):
             if self.compress_ratio:
                 self.compressor(x, start_pos)
             if _a800_force_dequant_gemm():
-                o = _torch_sparse_attn(q, self.kv_cache[:bsz], self.attn_sink, topk_idxs, self.softmax_scale)
+                o = _a800_sparse_attn(q, self.kv_cache[:bsz], self.attn_sink, topk_idxs, self.softmax_scale)
             else:
                 o = sparse_attn(q, self.kv_cache[:bsz], self.attn_sink, topk_idxs, self.softmax_scale)
         apply_rotary_emb(o[..., -rd:], freqs_cis, True)
@@ -1677,7 +1709,8 @@ class Attention(nn.Module):
                 else:
                     compress_topk_idxs = get_compress_topk_idxs(ratio, bsz, seqlen, start_pos, offset)
                 topk_idxs = torch.cat([topk_idxs, compress_topk_idxs], dim=-1)
-            topk_idxs = topk_idxs.int()
+            if topk_idxs.dtype != torch.int32:
+                topk_idxs = topk_idxs.int()
 
         # compress kv & attn
         with _a800_profile_region("attn.sparse"):
@@ -1692,7 +1725,7 @@ class Attention(nn.Module):
                         kv = torch.cat([kv, kv_compress], dim=1)
                 # We performed QAT here, kv could also use fp8 format, though current implementation uses bf16
                 if _a800_force_dequant_gemm():
-                    o = _torch_sparse_attn(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
+                    o = _a800_sparse_attn(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
                 else:
                     o = sparse_attn(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
             else:
@@ -1700,7 +1733,7 @@ class Attention(nn.Module):
                 if self.compress_ratio:
                     self.compressor(x, start_pos)
                 if _a800_force_dequant_gemm():
-                    o = _torch_sparse_attn(q, self.kv_cache[:bsz], self.attn_sink, topk_idxs, self.softmax_scale)
+                    o = _a800_sparse_attn(q, self.kv_cache[:bsz], self.attn_sink, topk_idxs, self.softmax_scale)
                 else:
                     o = sparse_attn(q, self.kv_cache[:bsz], self.attn_sink, topk_idxs, self.softmax_scale)
             apply_rotary_emb(o[..., -rd:], freqs_cis, True)
