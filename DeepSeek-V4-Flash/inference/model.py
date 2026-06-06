@@ -439,6 +439,94 @@ def _a800_load_cuda_lib():
                 print("[A800 compat] CUDA FP8 shared expert FFN symbol available")
         except AttributeError:
             pass
+        try:
+            lib.ds_v4_sparse_attn_decode_bf16.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_float,
+                ctypes.c_void_p,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_void_p,
+            ]
+            lib.ds_v4_sparse_attn_decode_bf16.restype = ctypes.c_int
+        except AttributeError:
+            pass
+        try:
+            lib.ds_v4_hc_pre_fused_bf16.argtypes = [
+                ctypes.c_void_p,  # x_bf16
+                ctypes.c_void_p,  # hc_fn_fp32
+                ctypes.c_void_p,  # hc_scale_fp32
+                ctypes.c_void_p,  # hc_base_fp32
+                ctypes.c_float,   # eps
+                ctypes.c_int,     # N
+                ctypes.c_int,     # hc_mult
+                ctypes.c_int,     # dim
+                ctypes.c_int,     # sinkhorn_iters
+                ctypes.c_void_p,  # y_bf16
+                ctypes.c_void_p,  # pre_out_fp32
+                ctypes.c_void_p,  # post_out_fp32
+                ctypes.c_void_p,  # comb_out_fp32
+                ctypes.c_void_p,  # stream
+            ]
+            lib.ds_v4_hc_pre_fused_bf16.restype = ctypes.c_int
+        except AttributeError:
+            pass
+        try:
+            lib.ds_v4_attn_o_proj_fused_bf16.argtypes = [
+                ctypes.c_void_p,  # o_bf16
+                ctypes.c_void_p,  # wo_a_bf16
+                ctypes.c_void_p,  # wo_b_bf16
+                ctypes.c_int,     # N
+                ctypes.c_int,     # n_groups
+                ctypes.c_int,     # lora_rank
+                ctypes.c_int,     # group_dim
+                ctypes.c_int,     # dim
+                ctypes.c_void_p,  # y_bf16
+                ctypes.c_void_p,  # stream
+            ]
+            lib.ds_v4_attn_o_proj_fused_bf16.restype = ctypes.c_int
+        except AttributeError:
+            pass
+        try:
+            lib.ds_v4_indexer_score_fused_bf16.argtypes = [
+                ctypes.c_void_p,  # q_bf16
+                ctypes.c_void_p,  # kv_cache_bf16
+                ctypes.c_void_p,  # weights_bf16
+                ctypes.c_int,     # n_heads
+                ctypes.c_int,     # head_dim
+                ctypes.c_int,     # cache_len
+                ctypes.c_void_p,  # index_score_fp32
+                ctypes.c_void_p,  # stream
+            ]
+            lib.ds_v4_indexer_score_fused_bf16.restype = ctypes.c_int
+        except AttributeError:
+            pass
+        try:
+            lib.ds_v4_indexer_full_fused_bf16.argtypes = [
+                ctypes.c_void_p,  # x_bf16
+                ctypes.c_void_p,  # qr_bf16
+                ctypes.c_void_p,  # wq_b_w_bf16
+                ctypes.c_void_p,  # weights_w_bf16
+                ctypes.c_void_p,  # freqs_cis_fp32
+                ctypes.c_void_p,  # kv_cache_bf16
+                ctypes.c_int,     # dim
+                ctypes.c_int,     # q_lora_rank
+                ctypes.c_int,     # n_heads
+                ctypes.c_int,     # head_dim
+                ctypes.c_int,     # rd
+                ctypes.c_int,     # cache_len
+                ctypes.c_float,   # weight_scale
+                ctypes.c_void_p,  # index_score_fp32
+                ctypes.c_void_p,  # stream
+            ]
+            lib.ds_v4_indexer_full_fused_bf16.restype = ctypes.c_int
+        except AttributeError:
+            pass
         lib.ds_v4_a800_last_error.argtypes = []
         lib.ds_v4_a800_last_error.restype = ctypes.c_char_p
         _A800_CUDA_LIB = lib
@@ -633,6 +721,300 @@ def _torch_sparse_attn(
     return out
 
 
+def _a800_cuda_sparse_attn(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    attn_sink: torch.Tensor,
+    topk_idxs: torch.Tensor,
+    softmax_scale: float,
+) -> Optional[torch.Tensor]:
+    """CUDA sparse attention kernel for single-token decode (batch=1, seqlen=1)."""
+    if not _a800_force_dequant_gemm():
+        return None
+    if q.dtype != torch.bfloat16 or not q.is_cuda:
+        return None
+    if kv.dtype != torch.bfloat16 or not kv.is_cuda:
+        return None
+    if topk_idxs.dtype != torch.int32 or not topk_idxs.is_cuda:
+        return None
+    if attn_sink.dtype != torch.float32 or not attn_sink.is_cuda:
+        return None
+
+    bsz, seqlen, n_heads, head_dim = q.shape
+    if bsz != 1 or seqlen != 1:
+        return None  # Only optimize single-token decode
+
+    lib = _a800_load_cuda_lib()
+    if lib is None:
+        return None
+    try:
+        kernel_fn = lib.ds_v4_sparse_attn_decode_bf16
+    except AttributeError:
+        return None
+
+    cache_size = kv.size(1)
+    topk = topk_idxs.numel()
+
+    q_c = q.reshape(n_heads, head_dim)
+    if not q_c.is_contiguous():
+        q_c = q_c.contiguous()
+    kv_c = kv.reshape(bsz * cache_size, head_dim)
+    if not kv_c.is_contiguous():
+        kv_c = kv_c.contiguous()
+    idx_c = topk_idxs.reshape(-1)
+    if not idx_c.is_contiguous():
+        idx_c = topk_idxs.contiguous()
+    sink_c = attn_sink
+    if not sink_c.is_contiguous():
+        sink_c = sink_c.contiguous()
+    out = torch.empty((n_heads, head_dim), device=q.device, dtype=torch.bfloat16)
+    stream = torch.cuda.current_stream(q.device).cuda_stream
+
+    ret = kernel_fn(
+        ctypes.c_void_p(q_c.data_ptr()),
+        ctypes.c_void_p(kv_c.data_ptr()),
+        ctypes.c_void_p(idx_c.data_ptr()),
+        ctypes.c_void_p(sink_c.data_ptr()),
+        ctypes.c_float(softmax_scale),
+        ctypes.c_void_p(out.data_ptr()),
+        ctypes.c_int(n_heads),
+        ctypes.c_int(head_dim),
+        ctypes.c_int(topk),
+        ctypes.c_int(cache_size),
+        ctypes.c_void_p(stream),
+    )
+    if ret != 0:
+        return None
+    return out.view(bsz, seqlen, n_heads, head_dim)
+
+
+def _a800_cuda_hc_pre_fused(
+    x: torch.Tensor,        # [bsz, seqlen, hc_mult, dim] bf16
+    hc_fn: torch.Tensor,    # [mix_hc, hc_mult * dim] fp32
+    hc_scale: torch.Tensor, # [3] fp32
+    hc_base: torch.Tensor,  # [mix_hc] fp32
+    eps: float,
+    hc_mult: int,
+    dim: int,
+    sinkhorn_iters: int,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """Fused CUDA kernel for hc_pre: RMS norm + linear + Sinkhorn + weighted sum.
+    Returns (y, pre, post, comb) or None on failure."""
+    if not _a800_force_dequant_gemm():
+        return None
+    if x.dtype != torch.bfloat16 or not x.is_cuda:
+        return None
+
+    lib = _a800_load_cuda_lib()
+    if lib is None:
+        return None
+    try:
+        kernel_fn = lib.ds_v4_hc_pre_fused_bf16
+    except AttributeError:
+        return None
+
+    bsz, seqlen, hc, d = x.shape
+    if hc != hc_mult or d != dim:
+        return None
+    N = bsz * seqlen
+
+    x_flat = x.reshape(N, hc_mult * dim)
+    if not x_flat.is_contiguous():
+        x_flat = x_flat.contiguous()
+
+    y = torch.empty((N, dim), device=x.device, dtype=torch.bfloat16)
+    pre = torch.empty((N, hc_mult), device=x.device, dtype=torch.float32)
+    post = torch.empty((N, hc_mult), device=x.device, dtype=torch.float32)
+    comb = torch.empty((N, hc_mult, hc_mult), device=x.device, dtype=torch.float32)
+    stream = torch.cuda.current_stream(x.device).cuda_stream
+
+    ret = kernel_fn(
+        ctypes.c_void_p(x_flat.data_ptr()),
+        ctypes.c_void_p(hc_fn.data_ptr()),
+        ctypes.c_void_p(hc_scale.data_ptr()),
+        ctypes.c_void_p(hc_base.data_ptr()),
+        ctypes.c_float(eps),
+        ctypes.c_int(N),
+        ctypes.c_int(hc_mult),
+        ctypes.c_int(dim),
+        ctypes.c_int(sinkhorn_iters),
+        ctypes.c_void_p(y.data_ptr()),
+        ctypes.c_void_p(pre.data_ptr()),
+        ctypes.c_void_p(post.data_ptr()),
+        ctypes.c_void_p(comb.data_ptr()),
+        ctypes.c_void_p(stream),
+    )
+    if ret != 0:
+        return None
+    return y.view(bsz, seqlen, dim), pre.view(bsz, seqlen, hc_mult), post.view(bsz, seqlen, hc_mult), comb.view(bsz, seqlen, hc_mult, hc_mult)
+
+
+def _a800_cuda_o_proj_fused(
+    o: torch.Tensor,          # [bsz, seqlen, n_local_heads, head_dim]
+    wo_a_weight: torch.Tensor, # [n_groups_local * lora_rank, n_heads * head_dim // n_groups_local]
+    wo_b_weight: torch.Tensor, # [n_groups_local * lora_rank, dim_local]
+    N: int,
+    n_groups: int,
+    lora_rank: int,
+) -> Optional[torch.Tensor]:
+    """Fused CUDA kernel for attention output projection.
+    Combines einsum + wo_b linear into one kernel launch."""
+    if not _a800_force_dequant_gemm():
+        return None
+    if o.dtype != torch.bfloat16 or not o.is_cuda:
+        return None
+    if wo_a_weight.dtype != torch.bfloat16 or wo_b_weight.dtype != torch.bfloat16:
+        return None
+
+    lib = _a800_load_cuda_lib()
+    if lib is None:
+        return None
+    try:
+        kernel_fn = lib.ds_v4_attn_o_proj_fused_bf16
+    except AttributeError:
+        return None
+
+    bsz, seqlen, n_heads, head_dim = o.shape
+    group_dim = n_heads * head_dim // n_groups  # total elements per group
+    dim = wo_b_weight.size(1)  # output dimension
+
+    # Reshape o to [N, n_groups, group_dim]
+    o_reshaped = o.reshape(N, n_groups, group_dim)
+    if not o_reshaped.is_contiguous():
+        o_reshaped = o_reshaped.contiguous()
+
+    y = torch.empty((N, dim), device=o.device, dtype=torch.bfloat16)
+    stream = torch.cuda.current_stream(o.device).cuda_stream
+
+    ret = kernel_fn(
+        ctypes.c_void_p(o_reshaped.data_ptr()),
+        ctypes.c_void_p(wo_a_weight.data_ptr()),
+        ctypes.c_void_p(wo_b_weight.data_ptr()),
+        ctypes.c_int(N),
+        ctypes.c_int(n_groups),
+        ctypes.c_int(lora_rank),
+        ctypes.c_int(group_dim),
+        ctypes.c_int(dim),
+        ctypes.c_void_p(y.data_ptr()),
+        ctypes.c_void_p(stream),
+    )
+    if ret != 0:
+        return None
+    return y.view(bsz, seqlen, dim)
+
+
+def _a800_cuda_indexer_score(
+    q: torch.Tensor,           # [n_local_heads, head_dim] bf16
+    kv_cache: torch.Tensor,    # [cache_len, head_dim] bf16
+    weights: torch.Tensor,     # [n_local_heads] bf16
+    bsz: int,                  # batch size (1 for decode)
+    cache_len: int,            # number of KV cache positions to score
+) -> Optional[torch.Tensor]:   # [bsz, 1, cache_len] fp32
+    """Fused CUDA kernel for Indexer scoring: einsum + ReLU + weighted sum.
+    Returns None on failure to trigger PyTorch fallback."""
+    if not _a800_force_dequant_gemm():
+        return None
+    if q.dtype != torch.bfloat16 or not q.is_cuda:
+        return None
+    if kv_cache.dtype != torch.bfloat16 or weights.dtype != torch.bfloat16:
+        return None
+
+    lib = _a800_load_cuda_lib()
+    if lib is None:
+        return None
+    try:
+        kernel_fn = lib.ds_v4_indexer_score_fused_bf16
+    except AttributeError:
+        return None
+
+    n_heads = q.size(0)
+    head_dim = q.size(1)
+    if kv_cache.size(0) != cache_len or kv_cache.size(1) != head_dim:
+        return None
+    if weights.numel() != n_heads:
+        return None
+
+    q_c = q.contiguous() if not q.is_contiguous() else q
+    kv_c = kv_cache.contiguous() if not kv_cache.is_contiguous() else kv_cache
+    w_c = weights.contiguous() if not weights.is_contiguous() else weights
+    out = torch.empty(cache_len, device=q.device, dtype=torch.float32)
+    stream = torch.cuda.current_stream(q.device).cuda_stream
+
+    ret = kernel_fn(
+        ctypes.c_void_p(q_c.data_ptr()),
+        ctypes.c_void_p(kv_c.data_ptr()),
+        ctypes.c_void_p(w_c.data_ptr()),
+        ctypes.c_int(n_heads),
+        ctypes.c_int(head_dim),
+        ctypes.c_int(cache_len),
+        ctypes.c_void_p(out.data_ptr()),
+        ctypes.c_void_p(stream),
+    )
+    if ret != 0:
+        return None
+    return out.view(bsz, 1, cache_len)
+
+
+def _a800_cuda_indexer_full(
+    x: torch.Tensor,           # [dim] bf16
+    qr: torch.Tensor,          # [q_lora_rank] bf16
+    wq_b_w: torch.Tensor,      # [n_heads*head_dim, q_lora_rank] bf16
+    weights_w: torch.Tensor,   # [n_heads, dim] bf16
+    freqs_cis: torch.Tensor,   # [rd] fp32 (cos/sin interleaved)
+    kv_cache: torch.Tensor,    # [cache_len, head_dim] bf16
+    dim: int,
+    q_lora_rank: int,
+    n_heads: int,
+    head_dim: int,
+    rd: int,
+    cache_len: int,
+    weight_scale: float,
+) -> Optional[torch.Tensor]:   # [1, 1, cache_len] fp32
+    """Fully fused Indexer kernel for single-token decode."""
+    if not _a800_force_dequant_gemm():
+        return None
+    if x.dtype != torch.bfloat16 or not x.is_cuda:
+        return None
+
+    lib = _a800_load_cuda_lib()
+    if lib is None:
+        return None
+    try:
+        kernel_fn = lib.ds_v4_indexer_full_fused_bf16
+    except AttributeError:
+        return None
+
+    x_c = x.contiguous() if not x.is_contiguous() else x
+    qr_c = qr.contiguous() if not qr.is_contiguous() else qr
+    wq_b_c = wq_b_w.contiguous() if not wq_b_w.is_contiguous() else wq_b_w
+    weights_c = weights_w.contiguous() if not weights_w.is_contiguous() else weights_w
+    freqs_c = freqs_cis.contiguous() if not freqs_cis.is_contiguous() else freqs_cis
+    kv_c = kv_cache.contiguous() if not kv_cache.is_contiguous() else kv_cache
+    out = torch.empty(cache_len, device=x.device, dtype=torch.float32)
+    stream = torch.cuda.current_stream(x.device).cuda_stream
+
+    ret = kernel_fn(
+        ctypes.c_void_p(x_c.data_ptr()),
+        ctypes.c_void_p(qr_c.data_ptr()),
+        ctypes.c_void_p(wq_b_c.data_ptr()),
+        ctypes.c_void_p(weights_c.data_ptr()),
+        ctypes.c_void_p(freqs_c.data_ptr()),
+        ctypes.c_void_p(kv_c.data_ptr()),
+        ctypes.c_int(dim),
+        ctypes.c_int(q_lora_rank),
+        ctypes.c_int(n_heads),
+        ctypes.c_int(head_dim),
+        ctypes.c_int(rd),
+        ctypes.c_int(cache_len),
+        ctypes.c_float(weight_scale),
+        ctypes.c_void_p(out.data_ptr()),
+        ctypes.c_void_p(stream),
+    )
+    if ret != 0:
+        return None
+    return out.view(1, 1, cache_len)
+
+
 def _a800_sparse_attn(
     q: torch.Tensor,
     kv: torch.Tensor,
@@ -641,6 +1023,11 @@ def _a800_sparse_attn(
     softmax_scale: float,
 ) -> torch.Tensor:
     global _A800_SPARSE_ATTN_KERNEL_FAILED, _A800_SPARSE_ATTN_KERNEL_WARNED
+    # Try CUDA kernel first (fastest path for single-token decode)
+    cuda_out = _a800_cuda_sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale)
+    if cuda_out is not None:
+        return cuda_out
+    # Try TileLang kernel
     if _a800_use_sparse_attn_kernel() and not _A800_SPARSE_ATTN_KERNEL_FAILED:
         try:
             return sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale)
@@ -1371,6 +1758,46 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = F
     return y
 
 
+# torch.compile cached functions for q/kv projection chains.
+# We keep wq_a+q_norm eager (output qr is shared with Indexer) and compile only
+# the downstream chains which are pure PyTorch: F.linear → RMSNorm → RoPE.
+_COMPILED_Q_PROJ = None
+_COMPILED_KV_PROJ = None
+
+
+def _get_compiled_q_proj():
+    """Compiled: wq_b → unflatten → RMSNorm → RoPE. Takes qr from wq_a+q_norm."""
+    global _COMPILED_Q_PROJ
+    if _COMPILED_Q_PROJ is not None:
+        return _COMPILED_Q_PROJ
+
+    def _impl(qr, wq_b_w, wq_b_b, norm_eps, n_heads, head_dim, rd, freqs_cis):
+        q = F.linear(qr, wq_b_w, wq_b_b)
+        q = q.unflatten(-1, (n_heads, head_dim))
+        q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + norm_eps)
+        q_rope = apply_rotary_emb(q[..., -rd:], freqs_cis)
+        return torch.cat([q[..., :-rd], q_rope], dim=-1)
+
+    _COMPILED_Q_PROJ = torch.compile(_impl, mode="reduce-overhead")
+    return _COMPILED_Q_PROJ
+
+
+def _get_compiled_kv_proj():
+    """Compiled: wkv → RMSNorm → RoPE."""
+    global _COMPILED_KV_PROJ
+    if _COMPILED_KV_PROJ is not None:
+        return _COMPILED_KV_PROJ
+
+    def _impl(x, wkv_w, wkv_b, norm_eps, rd, freqs_cis):
+        kv = F.linear(x, wkv_w, wkv_b)
+        kv = kv * torch.rsqrt(kv.square().mean(-1, keepdim=True) + norm_eps)
+        kv_rope = apply_rotary_emb(kv[..., -rd:], freqs_cis)
+        return torch.cat([kv[..., :-rd], kv_rope], dim=-1)
+
+    _COMPILED_KV_PROJ = torch.compile(_impl, mode="reduce-overhead")
+    return _COMPILED_KV_PROJ
+
+
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     """Applies randomized Hadamard rotation to spread information across dims before FP8 quant."""
     assert x.dtype == torch.bfloat16
@@ -1546,14 +1973,18 @@ class Indexer(torch.nn.Module):
         q = q.unflatten(-1, (self.n_local_heads, self.head_dim))
         apply_rotary_emb(q[..., -rd:], freqs_cis)
         q = rotate_activation(q)
-        # use fp4 simulation for q and kv in indexer
         if not (_a800_force_dequant_gemm() and not _a800_keep_act_quant()):
             fp4_act_quant(q, fp4_block_size, True)
         self.compressor(x, start_pos)
+        cache_len = end_pos // ratio
         weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads ** -0.5)
-        # We performed QAT here, kv could also use fp8 format, though current implementation uses bf16
-        index_score = torch.einsum("bshd,btd->bsht", q, self.kv_cache[:bsz, :end_pos // ratio])
-        index_score = (index_score.relu_() * weights.unsqueeze(-1)).sum(dim=2)
+        index_score = _a800_cuda_indexer_score(
+            q.squeeze(0).squeeze(0), self.kv_cache[:bsz, :cache_len].squeeze(0),
+            weights.squeeze(0).squeeze(0), bsz, cache_len,
+        )
+        if index_score is None:
+            index_score = torch.einsum("bshd,btd->bsht", q, self.kv_cache[:bsz, :cache_len])
+            index_score = (index_score.relu_() * weights.unsqueeze(-1)).sum(dim=2)
         if world_size > 1:
             dist.all_reduce(index_score)
         if start_pos == 0:
@@ -1748,6 +2179,14 @@ class Attention(nn.Module):
 
         # o
         with _a800_profile_region("attn.o_proj"):
+            # Try fused CUDA kernel (einsum + wo_b in one launch, coalesced)
+            x = _a800_cuda_o_proj_fused(
+                o, self.wo_a.weight, self.wo_b.weight,
+                bsz * seqlen, self.n_local_groups, self.o_lora_rank,
+            )
+            if x is not None:
+                return x
+            # Fallback
             o = o.view(bsz, seqlen, self.n_local_groups, -1)
             wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
             # NOTE: wo_a is FP8 in checkpoint; could do FP8 einsum here for better perf,
@@ -2192,6 +2631,18 @@ class Block(nn.Module):
 
     def hc_pre(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor):
         # x: [b,s,hc,d], hc_fn: [mix_hc,hc*d], hc_scale: [3], hc_base: [mix_hc], y: [b,s,hc,d]
+        # Try fully-fused CUDA kernel first (single launch instead of ~10)
+        fused = _a800_cuda_hc_pre_fused(
+            x, hc_fn, hc_scale, hc_base,
+            self.norm_eps, self.hc_mult, x.size(-1), self.hc_sinkhorn_iters,
+        )
+        if fused is not None:
+            y, pre, post, comb = fused
+            if y.dtype != x.dtype:
+                y = y.to(x.dtype)
+            return y, post, comb
+
+        # Original path
         shape, dtype = x.size(), x.dtype
         x = x.flatten(2).float()
         rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)
