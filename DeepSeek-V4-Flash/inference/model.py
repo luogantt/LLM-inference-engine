@@ -180,6 +180,13 @@ def _a800_bf16_moe_reduce() -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _a800_bf16_row_reduce() -> bool:
+    value = os.getenv("A800_BF16_ROW_REDUCE")
+    if value is None or value.strip() == "":
+        return False
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _a800_reuse_decode_moe_y() -> bool:
     value = os.getenv("A800_REUSE_DECODE_MOE_Y")
     if value is None or value.strip() == "":
@@ -1292,7 +1299,8 @@ class RowParallelLinear(Linear):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = linear(x, self.weight, None)
         if world_size > 1:
-            y = y.float()
+            if not (_a800_bf16_row_reduce() and y.dtype == torch.bfloat16):
+                y = y.float()
             dist.all_reduce(y)
         if self.bias is not None:
             y += self.bias

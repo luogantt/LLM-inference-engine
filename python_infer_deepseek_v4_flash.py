@@ -68,6 +68,7 @@ def configure_a800_compat(args: argparse.Namespace, torch, local_rank: int) -> L
         "A800_USE_CUDA_FP4_ACCUM": "0",
         "A800_FAST_DECODE_MOE": "1",
         "A800_BF16_MOE_REDUCE": "0",
+        "A800_BF16_ROW_REDUCE": "0",
         "A800_REUSE_DECODE_MOE_Y": "1",
         "A800_REUSE_TOPK_INDEX_I32": "0",
         "A800_ASYNC_MOE_ALLREDUCE": "0",
@@ -180,6 +181,12 @@ def run_inference(args: argparse.Namespace) -> None:
         if a800_bf16_moe_reduce_value == ""
         else a800_bf16_moe_reduce_value in {"1", "true", "yes", "on"}
     )
+    a800_bf16_row_reduce_value = os.getenv("A800_BF16_ROW_REDUCE", "").strip().lower()
+    a800_bf16_row_reduce = (
+        False
+        if a800_bf16_row_reduce_value == ""
+        else a800_bf16_row_reduce_value in {"1", "true", "yes", "on"}
+    )
     a800_reuse_decode_moe_y_value = os.getenv("A800_REUSE_DECODE_MOE_Y", "").strip().lower()
     a800_reuse_decode_moe_y = (
         True
@@ -273,6 +280,11 @@ def run_inference(args: argparse.Namespace) -> None:
         print(
             "[A800 compat] A800_BF16_MOE_REDUCE=1, "
             "MoE routed output accumulates and all-reduces in BF16"
+        )
+    if a800_bf16_row_reduce:
+        print(
+            "[A800 compat] A800_BF16_ROW_REDUCE=1, "
+            "attention row-parallel output projection all-reduces in BF16"
         )
     if a800_fast_decode_moe and not a800_bf16_moe_reduce and a800_reuse_decode_moe_y:
         print(
