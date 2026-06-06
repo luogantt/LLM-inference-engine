@@ -1,7 +1,6 @@
 import torch
 import tilelang
 import tilelang.language as T
-from functools import lru_cache
 from typing import Tuple, Optional
 
 
@@ -362,16 +361,11 @@ def sparse_attn(
         q = torch.cat([q, q.new_zeros(b, s, 16 - h, d)], dim=2)
         attn_sink = torch.cat([attn_sink, attn_sink.new_zeros(16 - h)])
     o = torch.empty_like(q)
-    kernel = _cached_sparse_attn_kernel(q.size(2), d, float(softmax_scale))
+    kernel = sparse_attn_kernel(q.size(2), d, softmax_scale)
     kernel(q, kv, o, attn_sink, topk_idxs)
     if h < 16:
         o = o.narrow(2, 0, h).contiguous()
     return o
-
-
-@lru_cache(maxsize=8)
-def _cached_sparse_attn_kernel(h: int, d: int, softmax_scale: float):
-    return sparse_attn_kernel(h, d, softmax_scale)
 
 
 @tilelang.jit(pass_configs=pass_configs)
@@ -438,15 +432,10 @@ def hc_split_sinkhorn(mixes: torch.Tensor, hc_scale: torch.Tensor, hc_base: torc
     pre = mixes.new_empty(b, s, hc_mult)
     post = mixes.new_empty(b, s, hc_mult)
     comb = mixes.new_empty(b, s, hc_mult, hc_mult)
-    kernel = _cached_hc_split_sinkhorn_kernel(hc_mult, sinkhorn_iters, float(eps))
+    kernel = hc_split_sinkhorn_kernel(hc_mult, sinkhorn_iters, eps)
     kernel(mixes.view(-1, (2 + hc_mult) * hc_mult), hc_scale, hc_base,
            pre.view(-1, hc_mult), post.view(-1, hc_mult), comb.view(-1, hc_mult, hc_mult))
     return pre, post, comb
-
-
-@lru_cache(maxsize=4)
-def _cached_hc_split_sinkhorn_kernel(hc_mult: int, sinkhorn_iters: int, eps: float):
-    return hc_split_sinkhorn_kernel(hc_mult, sinkhorn_iters, eps)
 
 
 @tilelang.jit(pass_configs=pass_configs)
