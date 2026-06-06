@@ -3,9 +3,10 @@
 > **TL;DR**: 在 4 张 NVIDIA A800 80GB PCIe（无 NVLink）上推理 DeepSeek-V4-Flash (43层 MoE, 256专家, 4096维)，从初始的纯 PyTorch 反量化回退路径 **0.69 tok/s** 出发，通过 14 个自定义 CUDA kernel、MoE 分发优化、分布式通信优化等手段，最终达到 **5.87 tok/s**，**整体提升 8.5×**。
 
 - **GitHub**: [luogantt/LLM-inference-engine](https://github.com/luogantt/LLM-inference-engine)
+- **Branch**: [`cuda_A800_deepseekv4_deepapi`](https://github.com/luogantt/LLM-inference-engine/tree/cuda_A800_deepseekv4_deepapi)
 - **Tag**: [`v0.2.0-a800-opt`](https://github.com/luogantt/LLM-inference-engine/releases/tag/v0.2.0-a800-opt)
-- **Branch**: `cuda_A800_deepseekv4_deepapi`
-- **Final Commit**: `bab88c8`
+- **Final Commit**: [`bab88c8`](https://github.com/luogantt/LLM-inference-engine/commit/bab88c8)
+- **完整 diff**: [master...cuda_A800_deepseekv4_deepapi](https://github.com/luogantt/LLM-inference-engine/compare/cuda_A800_deepseekv4_deepapi)
 
 ---
 
@@ -40,9 +41,65 @@
 | PyTorch | 2.x |
 | Python | 3.13 |
 
-### 1.3 核心挑战
+### 1.3 A800 与 H/B 系列 GPU 架构差异
 
-A800 是 **SM80 (Ampere)** 架构，而 DeepSeek-V4-Flash 官方推理代码依赖 **TileLang JIT 编译** 生成 **SM89 (Ada/Hopper)** FP8 GEMM kernel。A800 无法执行这些 kernel，编译时报错：
+A800 是 NVIDIA 面向中国市场的 **Ampere 架构 (SM80)** 数据中心 GPU，与 H800/H100 (Hopper, SM90) 及 B200 (Blackwell, SM100) 存在显著的硬件代差。理解这些差异是理解本文优化策略的前提。
+
+#### 计算能力对比
+
+| 特性 | A800 (Ampere) | H800 (Hopper) | B200 (Blackwell) |
+|---|---|---|---|
+| **SM 架构** | SM80 | SM90 | SM100 |
+| **FP4 (E2M1) Tensor Core** | ❌ **不支持** | ❌ 不支持 | ✅ 原生支持 |
+| **FP8 (E4M3) Tensor Core** | ❌ **不支持** | ✅ 原生支持 | ✅ 原生支持 |
+| **FP16 Tensor Core** | ✅ 312 TFLOPS | ✅ 990 TFLOPS | ✅ 2.25 PFLOPS |
+| **BF16 Tensor Core** | ✅ 312 TFLOPS | ✅ 990 TFLOPS | ✅ 2.25 PFLOPS |
+| **INT8 Tensor Core** | ✅ 624 TOPS | ✅ 1980 TOPS | ✅ 4.5 POPS |
+| **共享内存 / SM** | 最大 164 KB | 最大 228 KB | 最大 256 KB |
+| **NVLink** | PCIe 版无 | NVLink 4.0 (900 GB/s) | NVLink 5.0 (1.8 TB/s) |
+| **CUDA 版本要求** | 11.0+ | 11.8+ | 12.8+ |
+| **FP8 支持方式** | 无硬件加速 | `cuda_fp8.h` 原生类型 | `cuda_fp8.h` 原生类型 |
+| **FP4 支持方式** | 无硬件加速 | 无硬件加速 | `cuda_fp4.h` 原生类型 |
+
+#### 关键差异详解
+
+**1. 无 FP8 Tensor Core — 这是最核心的硬件限制**
+
+DeepSeek-V4-Flash 的注意力层和共享专家层权重存储为 **FP8 (E4M3)** 格式。H800/H100 可以通过 `cuda_fp8.h` 的 `__nv_fp8_e4m3` 类型直接在 Tensor Core 上执行 FP8 GEMM，享受 2× BF16 的吞吐量。A800 没有 FP8 Tensor Core，任何 FP8 数据的运算必须**先反量化到 BF16/FP16**，再用 BF16 Tensor Core 或 CUDA Core 计算。
+
+这正是 TileLang JIT 编译失败的根本原因：TileLang 生成的 kernel 使用了 `fp8_e4m3` 等 SM89+ 原生类型，而 SM80 的 nvcc 编译器无法识别这些类型。
+
+**2. 无 FP4 Tensor Core — 需要手动实现 FP4→BF16 反量化**
+
+B200 可以原生执行 FP4 (E2M1) Tensor Core 矩阵乘法。但 A800 和 H800 都没有 FP4 硬件加速。对于 DeepSeek-V4-Flash 的路由专家层（权重为 FP4 格式），在 A800 上必须：
+
+- **方案 A**: 预先将 FP4 权重反量化为 BF16（每个专家 ~50MB），再用 BF16 Tensor Core 计算
+- **方案 B**: 在 kernel 中在线解包 FP4（查表 + scale 乘法），直接做 CUDA Core GEMV
+
+本文最终选择了**方案 B**——原因在第 8.1 节详述：单 token 解码是内存带宽瓶颈，FP4 紧凑格式（0.5 字节/元素）的带宽优势超过了在线解包的计算开销。
+
+**3. PCIe 互连 vs NVLink**
+
+A800 PCIe 版本没有 NVLink，GPU 间通信走 PCIe 4.0 x16（~32 GB/s 单向），而 H800 的 NVLink 4.0 提供 900 GB/s 双向带宽（~28× 差距）。这说明：
+
+- All-reduce 通信是显著瓶颈（BF16 行并行 reduce 可减少 50% 通信量）
+- 通信与计算难以重叠（async all-reduce 实测无收益，见第 9 节）
+
+#### 软件层面的连锁反应
+
+因为上述硬件限制，DeepSeek-V4-Flash 官方推理代码在 A800 上的运行路径与 H 系列完全不同：
+
+| 组件 | H800/H100 路径 | A800 路径（本文） |
+|---|---|---|
+| Attention FP8 权重 | TileLang FP8 GEMM kernel → Tensor Core | **反量化到 BF16** → `F.linear` 或自定义 CUDA kernel |
+| 共享专家 FP8 | TileLang FP8 GEMM → Tensor Core | **反量化到 BF16** → 融合 CUDA GEMV kernel |
+| 路由专家 FP4 | TileLang FP4 GEMM → (H800 也需反量化) | **在线解包 FP4** → 自定义 CUDA GEMV kernel |
+| Act Quant | FP8 量化 (硬件加速) | **跳过** (避免编译失败) |
+| Hadamard 旋转 | 保持 (配合 FP8 量化) | **跳过** (减少无意义计算) |
+
+### 1.4 核心挑战
+
+A800 是 **SM80 (Ampere)** 架构，而 DeepSeek-V4-Flash 官方推理代码依赖 **TileLang JIT 编译** 生成 **SM89 (Ada/Hopper)** FP8 GEMM kernel。由于 A800 没有 FP8/FP4 Tensor Core（见上节），A800 无法执行这些 kernel，编译时报错：
 
 ```
 error: no suitable constructor exists to convert from "float" to "fp8_e8_t"
