@@ -579,6 +579,141 @@ __global__ void fp4_topk_w2_accum_f32_kernel(
     }
 }
 
+__global__ __launch_bounds__(256, 2) void bf16_topk_gate_up_fused_kernel(
+    const __nv_bfloat16* __restrict__ x,
+    const float* __restrict__ routes,
+    const int32_t* __restrict__ indices,
+    const uintptr_t* __restrict__ w1_ptrs,
+    const uintptr_t* __restrict__ w3_ptrs,
+    __nv_bfloat16* __restrict__ hidden,
+    int topk,
+    int local_start,
+    int n_local,
+    int dim,
+    int inter_dim,
+    float swiglu_limit
+) {
+    int inter_base = blockIdx.x * FP4_TOPK_GU_TILE;
+    int top_idx = blockIdx.y;
+    int tid = threadIdx.x;
+    int warp_id = tid / 32;
+    int lane = tid % 32;
+    constexpr int WARP_SIZE = 32;
+
+    int expert_id = indices[top_idx];
+    int local_e = expert_id - local_start;
+    uintptr_t w1_addr = 0;
+    uintptr_t w3_addr = 0;
+    if (local_e >= 0 && local_e < n_local) {
+        w1_addr = w1_ptrs[local_e];
+        w3_addr = w3_ptrs[local_e];
+    }
+    if (local_e < 0 || local_e >= n_local || w1_addr == 0 || w3_addr == 0) {
+        for (int i = tid; i < FP4_TOPK_GU_TILE; i += blockDim.x) {
+            int idx = inter_base + i;
+            if (idx < inter_dim) {
+                hidden[top_idx * inter_dim + idx] = __float2bfloat16(0.0f);
+            }
+        }
+        return;
+    }
+
+    extern __shared__ float smem[];
+    float* x_s = smem;
+    for (int k = tid; k < dim; k += blockDim.x) {
+        x_s[k] = __bfloat162float(x[k]);
+    }
+    __syncthreads();
+
+    const __nv_bfloat16* w1_base = reinterpret_cast<const __nv_bfloat16*>(w1_addr);
+    const __nv_bfloat16* w3_base = reinterpret_cast<const __nv_bfloat16*>(w3_addr);
+    float route_val = routes ? routes[top_idx] : 1.0f;
+
+    int inter_idx = inter_base + warp_id;
+    if (inter_idx < inter_dim) {
+        const __nv_bfloat16* w1_row = w1_base + inter_idx * dim;
+        const __nv_bfloat16* w3_row = w3_base + inter_idx * dim;
+
+        float gate_acc = 0.0f;
+        float up_acc = 0.0f;
+        for (int k = lane; k < dim; k += WARP_SIZE) {
+            float xv = x_s[k];
+            gate_acc += xv * __bfloat162float(w1_row[k]);
+            up_acc += xv * __bfloat162float(w3_row[k]);
+        }
+
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            gate_acc += __shfl_xor_sync(0xFFFFFFFF, gate_acc, offset);
+            up_acc += __shfl_xor_sync(0xFFFFFFFF, up_acc, offset);
+        }
+
+        if (lane == 0) {
+            float gate = gate_acc;
+            float up = up_acc;
+            if (swiglu_limit > 0.0f) {
+                up = fminf(fmaxf(up, -swiglu_limit), swiglu_limit);
+                gate = fminf(gate, swiglu_limit);
+            }
+            float silu = gate / (1.0f + expf(-gate));
+            hidden[top_idx * inter_dim + inter_idx] =
+                __float2bfloat16(silu * up * route_val);
+        }
+    }
+}
+
+__global__ void bf16_topk_w2_accum_f32_kernel(
+    const __nv_bfloat16* __restrict__ hidden,
+    const int32_t* __restrict__ indices,
+    const uintptr_t* __restrict__ w2_ptrs,
+    float* __restrict__ y_accum,
+    int topk,
+    int local_start,
+    int n_local,
+    int dim,
+    int inter_dim
+) {
+    int out_idx = blockIdx.x;
+    int tid = threadIdx.x;
+
+    extern __shared__ float smem[];
+    float acc = 0.0f;
+
+    for (int top_idx = 0; top_idx < topk; ++top_idx) {
+        int expert_id = indices[top_idx];
+        int local_e = expert_id - local_start;
+        if (local_e < 0 || local_e >= n_local) {
+            continue;
+        }
+        uintptr_t w2_addr = w2_ptrs[local_e];
+        if (w2_addr == 0) {
+            continue;
+        }
+
+        const __nv_bfloat16* hidden_row = hidden + top_idx * inter_dim;
+        const __nv_bfloat16* w2_row =
+            reinterpret_cast<const __nv_bfloat16*>(w2_addr) + out_idx * inter_dim;
+
+        for (int k = tid; k < inter_dim; k += blockDim.x) {
+            acc += __bfloat162float(hidden_row[k]) * __bfloat162float(w2_row[k]);
+        }
+    }
+
+    smem[tid] = acc;
+    __syncthreads();
+
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            smem[tid] += smem[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        y_accum[out_idx] += __bfloat162float(__float2bfloat16(smem[0]));
+    }
+}
+
 // Sparse attention for single-token decode: computes attention over topk KV positions.
 // Uses online softmax within each head for numerical stability and minimal memory.
 // One CUDA block per head; processes topk positions in tiles to keep KV in shared memory.
@@ -1215,6 +1350,82 @@ extern "C" int ds_v4_fp4_topk_expert_ffn_accum_f32(
     return 0;
 }
 
+extern "C" int ds_v4_bf16_topk_expert_ffn_accum_f32(
+    const void* x_bf16,
+    const void* routes_fp32,
+    const void* indices_i32,
+    const void* w1_ptrs_i64,
+    const void* w2_ptrs_i64,
+    const void* w3_ptrs_i64,
+    void* hidden_bf16,
+    void* y_accum_f32,
+    int topk,
+    int local_start,
+    int n_local,
+    int dim,
+    int inter_dim,
+    float swiglu_limit,
+    void* stream_ptr
+) {
+    set_last_error("");
+
+    if (!x_bf16 || !routes_fp32 || !indices_i32 || !w1_ptrs_i64 ||
+        !w2_ptrs_i64 || !w3_ptrs_i64 || !hidden_bf16 || !y_accum_f32) {
+        set_last_error("null pointer");
+        return 1;
+    }
+    if (topk <= 0 || n_local <= 0 || dim <= 0 || inter_dim <= 0) {
+        set_last_error("invalid shape");
+        return 2;
+    }
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    constexpr int threads = 256;
+    int gate_up_grid_x = (inter_dim + FP4_TOPK_GU_TILE - 1) / FP4_TOPK_GU_TILE;
+    size_t gate_up_smem = dim * sizeof(float);
+
+    bf16_topk_gate_up_fused_kernel<<<dim3(gate_up_grid_x, topk), threads, gate_up_smem, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x_bf16),
+        reinterpret_cast<const float*>(routes_fp32),
+        reinterpret_cast<const int32_t*>(indices_i32),
+        reinterpret_cast<const uintptr_t*>(w1_ptrs_i64),
+        reinterpret_cast<const uintptr_t*>(w3_ptrs_i64),
+        reinterpret_cast<__nv_bfloat16*>(hidden_bf16),
+        topk,
+        local_start,
+        n_local,
+        dim,
+        inter_dim,
+        swiglu_limit
+    );
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        set_last_cuda_error(err);
+        return 3;
+    }
+
+    size_t shared_bytes = threads * sizeof(float);
+    bf16_topk_w2_accum_f32_kernel<<<dim3(dim), threads, shared_bytes, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(hidden_bf16),
+        reinterpret_cast<const int32_t*>(indices_i32),
+        reinterpret_cast<const uintptr_t*>(w2_ptrs_i64),
+        reinterpret_cast<float*>(y_accum_f32),
+        topk,
+        local_start,
+        n_local,
+        dim,
+        inter_dim
+    );
+
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        set_last_cuda_error(err);
+        return 4;
+    }
+    return 0;
+}
+
 // Fused HC pre-processing: RMS norm + linear projection + Sinkhorn + weighted sum.
 // Replaces ~10 PyTorch/TileLang kernel launches with a single kernel.
 // One block per batch*seq element; N = bsz * seqlen (typically 1 for decode).
@@ -1441,6 +1652,82 @@ extern "C" int ds_v4_hc_pre_fused_bf16(
         reinterpret_cast<float*>(pre_out_fp32),
         reinterpret_cast<float*>(post_out_fp32),
         reinterpret_cast<float*>(comb_out_fp32)
+    );
+
+    cudaError_t launch_err = cudaGetLastError();
+    if (launch_err != cudaSuccess) {
+        set_last_cuda_error(launch_err);
+        return 3;
+    }
+    return 0;
+}
+
+__global__ __launch_bounds__(256, 2) void hc_post_fused_kernel(
+    const __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ residual,
+    const float* __restrict__ post,
+    const float* __restrict__ comb,
+    __nv_bfloat16* __restrict__ y,
+    int total,
+    int hc_mult,
+    int dim
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+
+    int d = idx % dim;
+    int h = (idx / dim) % hc_mult;
+    int n = idx / (dim * hc_mult);
+
+    const __nv_bfloat16* residual_n = residual + n * hc_mult * dim;
+    const float* post_n = post + n * hc_mult;
+    const float* comb_n = comb + n * hc_mult * hc_mult;
+    const __nv_bfloat16* x_n = x + n * dim;
+
+    float acc = post_n[h] * __bfloat162float(x_n[d]);
+    for (int in_h = 0; in_h < hc_mult; ++in_h) {
+        acc += comb_n[in_h * hc_mult + h] *
+            __bfloat162float(residual_n[in_h * dim + d]);
+    }
+    y[idx] = __float2bfloat16(acc);
+}
+
+extern "C" int ds_v4_hc_post_fused_bf16(
+    const void* x_bf16,
+    const void* residual_bf16,
+    const void* post_fp32,
+    const void* comb_fp32,
+    void* y_bf16,
+    int N,
+    int hc_mult,
+    int dim,
+    void* stream_ptr
+) {
+    set_last_error("");
+
+    if (!x_bf16 || !residual_bf16 || !post_fp32 || !comb_fp32 || !y_bf16) {
+        set_last_error("null pointer");
+        return 1;
+    }
+    if (N <= 0 || hc_mult <= 0 || hc_mult > 8 || dim <= 0) {
+        set_last_error("invalid shape");
+        return 2;
+    }
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    constexpr int threads = 256;
+    int total = N * hc_mult * dim;
+    int blocks = (total + threads - 1) / threads;
+
+    hc_post_fused_kernel<<<blocks, threads, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x_bf16),
+        reinterpret_cast<const __nv_bfloat16*>(residual_bf16),
+        reinterpret_cast<const float*>(post_fp32),
+        reinterpret_cast<const float*>(comb_fp32),
+        reinterpret_cast<__nv_bfloat16*>(y_bf16),
+        total,
+        hc_mult,
+        dim
     );
 
     cudaError_t launch_err = cudaGetLastError();

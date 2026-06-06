@@ -64,6 +64,9 @@ def configure_a800_compat(args: argparse.Namespace, torch, local_rank: int) -> L
         "A800_USE_CUDA_FP4_GEMM": "1",
         "A800_USE_CUDA_FP4_FFN": "1",
         "A800_USE_CUDA_FP4_TOPK_FFN": "1",
+        "A800_CACHE_FP4_BF16": "0",
+        "A800_USE_CUDA_BF16_TOPK_FFN": "0",
+        "A800_BF16_TOPK_FREEZE_AFTER_WARMUP": "1",
         "A800_USE_CUDA_SHARED_FFN": "0",
         "A800_USE_CUDA_FP4_ACCUM": "0",
         "A800_FAST_DECODE_MOE": "1",
@@ -83,6 +86,7 @@ def configure_a800_compat(args: argparse.Namespace, torch, local_rank: int) -> L
         "A800_ARGMAX_GATHER_INTO_TENSOR": "0",
         "A800_REUSE_ARGMAX_PACKS": "0",
         "A800_USE_HC_SPLIT_KERNEL": "1",
+        "A800_USE_HC_POST_KERNEL": "1",
         "A800_USE_SPARSE_ATTN_KERNEL": "1",
         "A800_CUDA_LIB": "./build/libdeepseek_v4_a800.so",
     }
@@ -162,6 +166,12 @@ def run_inference(args: argparse.Namespace) -> None:
     a800_cuda_fp4 = os.getenv("A800_USE_CUDA_FP4_GEMM", "").strip().lower() in {"1", "true", "yes", "on"}
     a800_cuda_fp4_ffn = os.getenv("A800_USE_CUDA_FP4_FFN", "").strip().lower() in {"1", "true", "yes", "on"}
     a800_cuda_fp4_topk_ffn = os.getenv("A800_USE_CUDA_FP4_TOPK_FFN", "").strip().lower() in {"1", "true", "yes", "on"}
+    a800_cache_fp4_bf16 = os.getenv("A800_CACHE_FP4_BF16", "").strip().lower() in {"1", "true", "yes", "on"}
+    a800_cuda_bf16_topk_ffn = os.getenv("A800_USE_CUDA_BF16_TOPK_FFN", "").strip().lower() in {"1", "true", "yes", "on"}
+    a800_bf16_topk_freeze_after_warmup = (
+        os.getenv("A800_BF16_TOPK_FREEZE_AFTER_WARMUP", "1").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
     a800_cuda_shared_ffn = os.getenv("A800_USE_CUDA_SHARED_FFN", "").strip().lower() in {"1", "true", "yes", "on"}
     a800_cuda_fp4_accum_value = os.getenv("A800_USE_CUDA_FP4_ACCUM", "").strip().lower()
     a800_cuda_fp4_accum = (
@@ -226,6 +236,7 @@ def run_inference(args: argparse.Namespace) -> None:
     a800_argmax_gather_tensor = os.getenv("A800_ARGMAX_GATHER_INTO_TENSOR", "").strip().lower() in {"1", "true", "yes", "on"}
     a800_reuse_argmax_packs = os.getenv("A800_REUSE_ARGMAX_PACKS", "").strip().lower() in {"1", "true", "yes", "on"}
     a800_hc_split_kernel = os.getenv("A800_USE_HC_SPLIT_KERNEL", "").strip().lower() in {"1", "true", "yes", "on"}
+    a800_hc_post_kernel = os.getenv("A800_USE_HC_POST_KERNEL", "").strip().lower() in {"1", "true", "yes", "on"}
     a800_sparse_attn_kernel = os.getenv("A800_USE_SPARSE_ATTN_KERNEL", "").strip().lower() in {"1", "true", "yes", "on"}
 
     if model_args.scale_dtype == "fp32" or a800_force_dequant:
@@ -266,6 +277,21 @@ def run_inference(args: argparse.Namespace) -> None:
             "[A800 compat] A800_USE_CUDA_FP4_TOPK_FFN=1, "
             "group selected top-k FP4 experts through one CUDA .so call per MoE layer"
         )
+    if a800_cache_fp4_bf16:
+        print(
+            "[A800 compat] A800_CACHE_FP4_BF16=1, "
+            f"cache selected FP4 expert weights as BF16 (limit={os.getenv('A800_DEQUANT_CACHE_FP4_MB', '4096')} MB)"
+        )
+    if a800_cache_fp4_bf16 and a800_cuda_bf16_topk_ffn:
+        print(
+            "[A800 compat] A800_USE_CUDA_BF16_TOPK_FFN=1, "
+            "try cached BF16 top-k expert FFN before packed FP4 top-k path"
+        )
+        if a800_bf16_topk_freeze_after_warmup:
+            print(
+                "[A800 compat] A800_BF16_TOPK_FREEZE_AFTER_WARMUP=1, "
+                "freeze cached BF16 expert pointer tables after warmup for timed runs"
+            )
     if a800_cuda_shared_ffn:
         print(
             "[A800 compat] A800_USE_CUDA_SHARED_FFN=1, "
@@ -356,6 +382,11 @@ def run_inference(args: argparse.Namespace) -> None:
             "[A800 compat] A800_USE_HC_SPLIT_KERNEL=1, "
             "try TileLang fused HC split/sinkhorn kernel before torch fallback"
         )
+    if a800_hc_post_kernel:
+        print(
+            "[A800 compat] A800_USE_HC_POST_KERNEL=1, "
+            "try CUDA fused HC post kernel before torch broadcast fallback"
+        )
     if a800_sparse_attn_kernel:
         print(
             "[A800 compat] A800_USE_SPARSE_ATTN_KERNEL=1, "
@@ -387,6 +418,9 @@ def run_inference(args: argparse.Namespace) -> None:
         )
         if torch.cuda.is_available():
             torch.cuda.synchronize()
+        if a800_cache_fp4_bf16 and a800_cuda_bf16_topk_ffn and a800_bf16_topk_freeze_after_warmup:
+            os.environ["A800_BF16_TOPK_FREEZE_CACHE"] = "1"
+            print("[A800 compat] A800_BF16_TOPK_FREEZE_CACHE=1 after warmup")
         if a800_profile_enabled:
             a800_profile_reset()
 

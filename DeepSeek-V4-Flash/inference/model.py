@@ -140,7 +140,7 @@ def _a800_cache_attn_fp8_weight() -> bool:
 
 
 def _a800_cache_fp4_weight() -> bool:
-    return _env_flag("A800_DEQUANT_CACHE_FP4")
+    return _env_flag("A800_DEQUANT_CACHE_FP4") or _env_flag("A800_CACHE_FP4_BF16")
 
 
 def _a800_use_cuda_fp4_gemm() -> bool:
@@ -153,6 +153,14 @@ def _a800_use_cuda_fp4_ffn() -> bool:
 
 def _a800_use_cuda_fp4_topk_ffn() -> bool:
     return _env_flag("A800_USE_CUDA_FP4_TOPK_FFN")
+
+
+def _a800_use_cuda_bf16_topk_ffn() -> bool:
+    return _env_flag("A800_USE_CUDA_BF16_TOPK_FFN")
+
+
+def _a800_bf16_topk_freeze_cache() -> bool:
+    return _env_flag("A800_BF16_TOPK_FREEZE_CACHE")
 
 
 def _a800_use_cuda_shared_ffn() -> bool:
@@ -238,6 +246,13 @@ def _a800_reuse_argmax_packs() -> bool:
 
 def _a800_use_hc_split_kernel() -> bool:
     value = os.getenv("A800_USE_HC_SPLIT_KERNEL")
+    if value is None or value.strip() == "":
+        return _a800_force_dequant_gemm()
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _a800_use_hc_post_kernel() -> bool:
+    value = os.getenv("A800_USE_HC_POST_KERNEL")
     if value is None or value.strip() == "":
         return _a800_force_dequant_gemm()
     return value.strip().lower() in {"1", "true", "yes", "on"}
@@ -411,6 +426,29 @@ def _a800_load_cuda_lib():
         except AttributeError:
             pass
         try:
+            lib.ds_v4_bf16_topk_expert_ffn_accum_f32.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_float,
+                ctypes.c_void_p,
+            ]
+            lib.ds_v4_bf16_topk_expert_ffn_accum_f32.restype = ctypes.c_int
+            if rank == 0:
+                print("[A800 compat] CUDA BF16 cached top-k expert FFN symbol available")
+        except AttributeError:
+            pass
+        try:
             lib.ds_v4_fp8_shared_expert_ffn_bf16.argtypes = [
                 ctypes.c_void_p,
                 ctypes.c_void_p,
@@ -474,6 +512,21 @@ def _a800_load_cuda_lib():
                 ctypes.c_void_p,  # stream
             ]
             lib.ds_v4_hc_pre_fused_bf16.restype = ctypes.c_int
+        except AttributeError:
+            pass
+        try:
+            lib.ds_v4_hc_post_fused_bf16.argtypes = [
+                ctypes.c_void_p,  # x_bf16
+                ctypes.c_void_p,  # residual_bf16
+                ctypes.c_void_p,  # post_fp32
+                ctypes.c_void_p,  # comb_fp32
+                ctypes.c_void_p,  # y_bf16
+                ctypes.c_int,     # N
+                ctypes.c_int,     # hc_mult
+                ctypes.c_int,     # dim
+                ctypes.c_void_p,  # stream
+            ]
+            lib.ds_v4_hc_post_fused_bf16.restype = ctypes.c_int
         except AttributeError:
             pass
         try:
@@ -847,6 +900,64 @@ def _a800_cuda_hc_pre_fused(
     if ret != 0:
         return None
     return y.view(bsz, seqlen, dim), pre.view(bsz, seqlen, hc_mult), post.view(bsz, seqlen, hc_mult), comb.view(bsz, seqlen, hc_mult, hc_mult)
+
+
+def _a800_cuda_hc_post_fused(
+    x: torch.Tensor,        # [bsz, seqlen, dim] bf16
+    residual: torch.Tensor, # [bsz, seqlen, hc_mult, dim] bf16
+    post: torch.Tensor,     # [bsz, seqlen, hc_mult] fp32
+    comb: torch.Tensor,     # [bsz, seqlen, hc_mult, hc_mult] fp32
+    hc_mult: int,
+) -> Optional[torch.Tensor]:
+    if not _a800_use_hc_post_kernel():
+        return None
+    if not _a800_force_dequant_gemm():
+        return None
+    if x.dtype != torch.bfloat16 or residual.dtype != torch.bfloat16:
+        return None
+    if post.dtype != torch.float32 or comb.dtype != torch.float32:
+        return None
+    if not (x.is_cuda and residual.is_cuda and post.is_cuda and comb.is_cuda):
+        return None
+
+    bsz, seqlen, dim = x.shape
+    if residual.shape != (bsz, seqlen, hc_mult, dim):
+        return None
+    if post.shape != (bsz, seqlen, hc_mult):
+        return None
+    if comb.shape != (bsz, seqlen, hc_mult, hc_mult):
+        return None
+
+    lib = _a800_load_cuda_lib()
+    if lib is None:
+        return None
+    try:
+        kernel_fn = lib.ds_v4_hc_post_fused_bf16
+    except AttributeError:
+        return None
+
+    x_c = x.contiguous()
+    residual_c = residual.contiguous()
+    post_c = post.contiguous()
+    comb_c = comb.contiguous()
+    y = torch.empty_like(residual_c)
+    N = bsz * seqlen
+    stream = torch.cuda.current_stream(x.device).cuda_stream
+
+    ret = kernel_fn(
+        ctypes.c_void_p(x_c.data_ptr()),
+        ctypes.c_void_p(residual_c.data_ptr()),
+        ctypes.c_void_p(post_c.data_ptr()),
+        ctypes.c_void_p(comb_c.data_ptr()),
+        ctypes.c_void_p(y.data_ptr()),
+        ctypes.c_int(N),
+        ctypes.c_int(hc_mult),
+        ctypes.c_int(dim),
+        ctypes.c_void_p(stream),
+    )
+    if ret != 0:
+        return None
+    return y.view(bsz, seqlen, hc_mult, dim)
 
 
 def _a800_cuda_o_proj_fused(
@@ -1446,6 +1557,101 @@ def _a800_cuda_fp4_topk_expert_ffn_accum(
         err = lib.ds_v4_a800_last_error()
         err_text = err.decode("utf-8", errors="replace") if err else f"ret={ret}"
         _a800_warn_cuda_fp4_fallback(f"top-k fused FFN accum {err_text}")
+        return False
+    return True
+
+
+def _a800_cuda_bf16_topk_expert_ffn_accum(
+    x: torch.Tensor,
+    route_weights: torch.Tensor,
+    indices: torch.Tensor,
+    ptrs: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]],
+    local_start: int,
+    n_local: int,
+    swiglu_limit: float,
+    hidden: Optional[torch.Tensor],
+    accum: torch.Tensor,
+) -> bool:
+    if not _a800_use_cuda_bf16_topk_ffn():
+        return False
+    if not _a800_force_dequant_gemm():
+        return False
+    if ptrs is None:
+        return False
+    if accum.dtype != torch.float32 or not accum.is_cuda or not accum.is_contiguous():
+        return False
+    if hidden is None or hidden.dtype != x.dtype or not hidden.is_cuda or not hidden.is_contiguous():
+        return False
+    if x.dtype != torch.bfloat16 or not x.is_cuda:
+        return False
+
+    w1_ptrs, w2_ptrs, w3_ptrs, inter_dim = ptrs
+    ptr_tensors = (w1_ptrs, w2_ptrs, w3_ptrs)
+    if any(t.dtype != torch.int64 or not t.is_cuda or not t.is_contiguous() or t.numel() != n_local for t in ptr_tensors):
+        return False
+
+    dim = x.size(-1)
+    if x.reshape(-1, dim).size(0) != 1:
+        return False
+    if accum.size(-1) != dim:
+        return False
+    if inter_dim <= 0 or dim <= 0:
+        return False
+    if hidden.shape != (route_weights.numel(), inter_dim):
+        return False
+
+    route = route_weights.reshape(-1)
+    if route.numel() <= 0:
+        return False
+    if route.dtype != torch.float32:
+        route = route.float()
+    if not route.is_contiguous():
+        route = route.contiguous()
+
+    idx = indices.reshape(-1)
+    if idx.numel() != route.numel():
+        return False
+    if idx.dtype != torch.int32:
+        idx = idx.to(torch.int32)
+    if not idx.is_contiguous():
+        idx = idx.contiguous()
+
+    lib = _a800_load_cuda_lib()
+    if lib is None:
+        return False
+    try:
+        ffn = lib.ds_v4_bf16_topk_expert_ffn_accum_f32
+    except AttributeError:
+        return False
+
+    x_2d = x.reshape(-1, dim).contiguous()
+    y_2d = accum.reshape(-1, dim)
+    if y_2d.size(0) != 1:
+        return False
+
+    stream = torch.cuda.current_stream(x.device).cuda_stream
+
+    ret = ffn(
+        ctypes.c_void_p(x_2d.data_ptr()),
+        ctypes.c_void_p(route.data_ptr()),
+        ctypes.c_void_p(idx.data_ptr()),
+        ctypes.c_void_p(w1_ptrs.data_ptr()),
+        ctypes.c_void_p(w2_ptrs.data_ptr()),
+        ctypes.c_void_p(w3_ptrs.data_ptr()),
+        ctypes.c_void_p(hidden.data_ptr()),
+        ctypes.c_void_p(y_2d.data_ptr()),
+        ctypes.c_int(route.numel()),
+        ctypes.c_int(local_start),
+        ctypes.c_int(n_local),
+        ctypes.c_int(dim),
+        ctypes.c_int(inter_dim),
+        ctypes.c_float(float(swiglu_limit)),
+        ctypes.c_void_p(stream),
+    )
+    if ret != 0:
+        err = lib.ds_v4_a800_last_error()
+        err_text = err.decode("utf-8", errors="replace") if err else f"ret={ret}"
+        _a800_warn_cuda_fp4_fallback(f"BF16 cached top-k FFN accum {err_text}")
         return False
     return True
 
@@ -2352,6 +2558,11 @@ class MoE(nn.Module):
         self._a800_topk_indices_i32: Optional[torch.Tensor] = None
         self._a800_fp4_topk_ptrs = None
         self._a800_fp4_topk_ptrs_failed = False
+        self._a800_bf16_topk_ptrs = None
+        self._a800_bf16_topk_refs = None
+        self._a800_bf16_topk_ref_by_local = {}
+        self._a800_bf16_topk_ptr_lists = None
+        self._a800_bf16_topk_ptrs_failed = False
         self.swiglu_limit = args.swiglu_limit
 
     def _a800_decode_accum_buffer(self, x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
@@ -2468,6 +2679,95 @@ class MoE(nn.Module):
             _a800_warn_cuda_fp4_fallback(f"top-k pointer table build failed: {exc}")
             return None
 
+    def _a800_selected_bf16_topk_ptrs(self, indices: torch.Tensor):
+        if not _a800_use_cuda_bf16_topk_ffn() or self._a800_bf16_topk_ptrs_failed:
+            return None
+        if not _env_flag("A800_CACHE_FP4_BF16") or _a800_dequant_dtype() != torch.bfloat16:
+            return None
+        if _a800_bf16_topk_freeze_cache() and self._a800_bf16_topk_ptrs is not None:
+            return self._a800_bf16_topk_ptrs
+        if not indices.is_cuda:
+            return None
+
+        try:
+            selected_ids = indices.reshape(-1).detach().cpu().tolist()
+            if not selected_ids:
+                return None
+
+            template = self.experts[self.experts_start_idx]
+            if template is None:
+                self._a800_bf16_topk_ptrs_failed = True
+                return None
+            inter_dim = template.w1.weight.size(0)
+            dim = self.dim
+            device = template.w1.weight.device
+
+            if self._a800_bf16_topk_ptr_lists is None:
+                self._a800_bf16_topk_ptr_lists = (
+                    [0] * self.n_local_experts,
+                    [0] * self.n_local_experts,
+                    [0] * self.n_local_experts,
+                )
+            w1_ptrs, w2_ptrs, w3_ptrs = self._a800_bf16_topk_ptr_lists
+            ref_by_local = self._a800_bf16_topk_ref_by_local
+            have_local = False
+            updated = self._a800_bf16_topk_ptrs is None
+
+            for expert_id in selected_ids:
+                if expert_id < self.experts_start_idx or expert_id >= self.experts_end_idx:
+                    continue
+                local_e = expert_id - self.experts_start_idx
+                if local_e in ref_by_local:
+                    have_local = True
+                    continue
+
+                expert = self.experts[expert_id]
+                if expert is None:
+                    self._a800_bf16_topk_ptrs_failed = True
+                    return None
+
+                weights = (expert.w1.weight, expert.w2.weight, expert.w3.weight)
+                if any(weight.dtype != torch.float4_e2m1fn_x2 or not weight.is_cuda for weight in weights):
+                    self._a800_bf16_topk_ptrs_failed = True
+                    return None
+
+                w1_bf16, w2_bf16, w3_bf16 = (_dequantize_fp4_weight(weight).contiguous() for weight in weights)
+                if w1_bf16.dtype != torch.bfloat16 or w2_bf16.dtype != torch.bfloat16 or w3_bf16.dtype != torch.bfloat16:
+                    self._a800_bf16_topk_ptrs_failed = True
+                    return None
+                if w1_bf16.shape != (inter_dim, dim) or w3_bf16.shape != (inter_dim, dim) or w2_bf16.shape != (dim, inter_dim):
+                    self._a800_bf16_topk_ptrs_failed = True
+                    return None
+
+                w1_ptrs[local_e] = w1_bf16.data_ptr()
+                w2_ptrs[local_e] = w2_bf16.data_ptr()
+                w3_ptrs[local_e] = w3_bf16.data_ptr()
+                ref_by_local[local_e] = (w1_bf16, w2_bf16, w3_bf16)
+                have_local = True
+                updated = True
+
+            if not have_local:
+                return None
+
+            def ptr_tensor(values):
+                return torch.tensor(values, dtype=torch.int64, device=device)
+
+            if updated:
+                self._a800_bf16_topk_ptrs = (
+                    ptr_tensor(w1_ptrs),
+                    ptr_tensor(w2_ptrs),
+                    ptr_tensor(w3_ptrs),
+                    inter_dim,
+                )
+                self._a800_bf16_topk_refs = tuple(
+                    tensor for refs in ref_by_local.values() for tensor in refs
+                )
+            return self._a800_bf16_topk_ptrs
+        except (RuntimeError, TypeError, ValueError) as exc:
+            self._a800_bf16_topk_ptrs_failed = True
+            _a800_warn_cuda_fp4_fallback(f"BF16 top-k pointer table build failed: {exc}")
+            return None
+
     def _add_shared_expert_after_reduce(self, y: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         if not _a800_profile_stages():
             return self._add_shared_expert_after_reduce_no_profile(y, x)
@@ -2512,6 +2812,24 @@ class MoE(nn.Module):
 
         if _a800_fast_decode_moe() and x.size(0) == 1:
             y = self._a800_decode_accum_buffer(x, moe_accum_dtype)
+            bf16_ptrs = self._a800_selected_bf16_topk_ptrs(indices)
+            bf16_hidden = self._a800_topk_hidden_buffer(x, weights.numel(), bf16_ptrs[-1]) if bf16_ptrs is not None else None
+            bf16_indices = self._a800_topk_indices_i32_buffer(indices) if bf16_ptrs is not None else indices
+            if _a800_cuda_bf16_topk_expert_ffn_accum(
+                x,
+                weights,
+                bf16_indices,
+                bf16_ptrs,
+                self.experts_start_idx,
+                self.n_local_experts,
+                self.swiglu_limit,
+                bf16_hidden,
+                y,
+            ):
+                y = self._add_shared_expert_after_reduce_no_profile(y, x)
+                return y.type_as(x).view(shape)
+            if bf16_ptrs is not None:
+                y.zero_()
             topk_ptrs = self._a800_local_fp4_topk_ptrs()
             topk_hidden = self._a800_topk_hidden_buffer(x, weights.numel(), topk_ptrs[-1]) if topk_ptrs is not None else None
             topk_indices = self._a800_topk_indices_i32_buffer(indices) if topk_ptrs is not None else indices
@@ -2560,6 +2878,26 @@ class MoE(nn.Module):
 
         if _a800_fast_decode_moe() and x.size(0) == 1:
             y = self._a800_decode_accum_buffer(x, moe_accum_dtype)
+            bf16_ptrs = self._a800_selected_bf16_topk_ptrs(indices)
+            bf16_hidden = self._a800_topk_hidden_buffer(x, weights.numel(), bf16_ptrs[-1]) if bf16_ptrs is not None else None
+            bf16_indices = self._a800_topk_indices_i32_buffer(indices) if bf16_ptrs is not None else indices
+            with _a800_profile_region("moe.routed_topk_bf16_cuda"):
+                bf16_topk_ok = _a800_cuda_bf16_topk_expert_ffn_accum(
+                    x,
+                    weights,
+                    bf16_indices,
+                    bf16_ptrs,
+                    self.experts_start_idx,
+                    self.n_local_experts,
+                    self.swiglu_limit,
+                    bf16_hidden,
+                    y,
+                )
+            if bf16_topk_ok:
+                y = self._add_shared_expert_after_reduce(y, x)
+                return y.type_as(x).view(shape)
+            if bf16_ptrs is not None:
+                y.zero_()
             topk_ptrs = self._a800_local_fp4_topk_ptrs()
             topk_hidden = self._a800_topk_hidden_buffer(x, weights.numel(), topk_ptrs[-1]) if topk_ptrs is not None else None
             topk_indices = self._a800_topk_indices_i32_buffer(indices) if topk_ptrs is not None else indices
@@ -2656,6 +2994,9 @@ class Block(nn.Module):
 
     def hc_post(self, x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor):
         # x: [b,s,d], residual: [b,s,hc,d], post: [b,s,hc], comb: [b,s,hc,hc], y: [b,s,hc,d]
+        fused = _a800_cuda_hc_post_fused(x, residual, post, comb, self.hc_mult)
+        if fused is not None:
+            return fused.type_as(x)
         y = post.unsqueeze(-1) * x.unsqueeze(-2) + torch.sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)
         return y.type_as(x)
 
