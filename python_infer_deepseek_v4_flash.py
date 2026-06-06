@@ -437,7 +437,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ckpt-path", default="./DeepSeek-V4-Flash-converted", help="converted checkpoint directory")
     p.add_argument("--save-path", default="./DeepSeek-V4-Flash-converted", help="output dir for --convert")
     p.add_argument("--config", default="./DeepSeek-V4-Flash/inference/config.json")
-    p.add_argument("--prompt", default="黑格尔的哲学思想可以概括为")
+    p.add_argument("--prompt", default="\u9ed1\u683c\u5c14\u7684\u54f2\u5b66\u601d\u60f3\u53ef\u4ee5\u6982\u62ec\u4e3a")
     p.add_argument("--input-file", default="")
     p.add_argument("--max-new-tokens", type=int, default=128)
     p.add_argument("--max-seq-len", type=int, default=4096)
