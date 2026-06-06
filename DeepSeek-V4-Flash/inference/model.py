@@ -25,6 +25,7 @@ scale_dtype = torch.float32
 _FP4_TABLE = None
 _A800_FP4_DEQUANT_CACHE = OrderedDict()
 _A800_FP4_DEQUANT_CACHE_BYTES = 0
+_A800_BF16_TOPK_CACHE_BYTES = 0
 _A800_CUDA_LIB = None
 _A800_CUDA_LIB_FAILED = False
 _A800_CUDA_FP4_WARNED = False
@@ -161,6 +162,32 @@ def _a800_use_cuda_bf16_topk_ffn() -> bool:
 
 def _a800_bf16_topk_freeze_cache() -> bool:
     return _env_flag("A800_BF16_TOPK_FREEZE_CACHE")
+
+
+def _a800_bf16_topk_max_local_experts() -> int:
+    value = os.getenv("A800_BF16_TOPK_MAX_LOCAL_EXPERTS", "2").strip()
+    try:
+        return max(0, int(value))
+    except ValueError:
+        return 2
+
+
+def _a800_bf16_topk_cache_limit_bytes() -> int:
+    value = os.getenv("A800_BF16_TOPK_CACHE_MB", "2048").strip()
+    try:
+        mb = int(value)
+    except ValueError:
+        mb = 2048
+    return max(0, mb) * 1024 * 1024
+
+
+def _a800_bf16_topk_min_free_bytes() -> int:
+    value = os.getenv("A800_BF16_TOPK_MIN_FREE_MB", "4096").strip()
+    try:
+        mb = int(value)
+    except ValueError:
+        mb = 4096
+    return max(0, mb) * 1024 * 1024
 
 
 def _a800_use_cuda_shared_ffn() -> bool:
@@ -649,6 +676,13 @@ def _a800_fp4_cache_put(weight: torch.Tensor, dequant: torch.Tensor) -> None:
     while _A800_FP4_DEQUANT_CACHE_BYTES > limit and _A800_FP4_DEQUANT_CACHE:
         _, (_, evicted_bytes) = _A800_FP4_DEQUANT_CACHE.popitem(last=False)
         _A800_FP4_DEQUANT_CACHE_BYTES -= evicted_bytes
+
+
+def _a800_fp4_cache_clear() -> None:
+    global _A800_FP4_DEQUANT_CACHE_BYTES
+
+    _A800_FP4_DEQUANT_CACHE.clear()
+    _A800_FP4_DEQUANT_CACHE_BYTES = 0
 
 
 def _apply_k_block_scales(
@@ -2679,7 +2713,23 @@ class MoE(nn.Module):
             _a800_warn_cuda_fp4_fallback(f"top-k pointer table build failed: {exc}")
             return None
 
+    def _a800_clear_bf16_topk_cache(self) -> None:
+        global _A800_BF16_TOPK_CACHE_BYTES
+
+        freed = 0
+        for refs in self._a800_bf16_topk_ref_by_local.values():
+            if len(refs) >= 4:
+                freed += int(refs[3])
+        if freed:
+            _A800_BF16_TOPK_CACHE_BYTES = max(0, _A800_BF16_TOPK_CACHE_BYTES - freed)
+        self._a800_bf16_topk_ref_by_local.clear()
+        self._a800_bf16_topk_refs = None
+        self._a800_bf16_topk_ptrs = None
+        self._a800_bf16_topk_ptr_lists = None
+
     def _a800_selected_bf16_topk_ptrs(self, indices: torch.Tensor):
+        global _A800_BF16_TOPK_CACHE_BYTES
+
         if not _a800_use_cuda_bf16_topk_ffn() or self._a800_bf16_topk_ptrs_failed:
             return None
         if not _env_flag("A800_CACHE_FP4_BF16") or _a800_dequant_dtype() != torch.bfloat16:
@@ -2712,6 +2762,9 @@ class MoE(nn.Module):
             ref_by_local = self._a800_bf16_topk_ref_by_local
             have_local = False
             updated = self._a800_bf16_topk_ptrs is None
+            max_cached_local = _a800_bf16_topk_max_local_experts()
+            if max_cached_local <= 0:
+                return None
 
             for expert_id in selected_ids:
                 if expert_id < self.experts_start_idx or expert_id >= self.experts_end_idx:
@@ -2725,11 +2778,30 @@ class MoE(nn.Module):
                 if expert is None:
                     self._a800_bf16_topk_ptrs_failed = True
                     return None
-
+                if len(ref_by_local) >= max_cached_local:
+                    continue
                 weights = (expert.w1.weight, expert.w2.weight, expert.w3.weight)
                 if any(weight.dtype != torch.float4_e2m1fn_x2 or not weight.is_cuda for weight in weights):
                     self._a800_bf16_topk_ptrs_failed = True
                     return None
+                expert_bytes = sum(weight.size(0) * weight.size(1) * 4 for weight in weights)
+                cache_limit = _a800_bf16_topk_cache_limit_bytes()
+                if cache_limit <= 0 or _A800_BF16_TOPK_CACHE_BYTES + expert_bytes > cache_limit:
+                    continue
+                if torch.cuda.is_available():
+                    free_bytes, _ = torch.cuda.mem_get_info(device)
+                    if free_bytes < _a800_bf16_topk_min_free_bytes() + expert_bytes:
+                        self._a800_bf16_topk_ptrs_failed = True
+                        self._a800_clear_bf16_topk_cache()
+                        _a800_fp4_cache_clear()
+                        if rank == 0:
+                            free_mb = free_bytes / (1024 * 1024)
+                            need_mb = (_a800_bf16_topk_min_free_bytes() + expert_bytes) / (1024 * 1024)
+                            print(
+                                "[A800 compat] disable BF16 top-k expert cache: "
+                                f"free memory {free_mb:.1f} MB below guarded need {need_mb:.1f} MB"
+                            )
+                        return None
 
                 w1_bf16, w2_bf16, w3_bf16 = (_dequantize_fp4_weight(weight).contiguous() for weight in weights)
                 if w1_bf16.dtype != torch.bfloat16 or w2_bf16.dtype != torch.bfloat16 or w3_bf16.dtype != torch.bfloat16:
@@ -2742,7 +2814,8 @@ class MoE(nn.Module):
                 w1_ptrs[local_e] = w1_bf16.data_ptr()
                 w2_ptrs[local_e] = w2_bf16.data_ptr()
                 w3_ptrs[local_e] = w3_bf16.data_ptr()
-                ref_by_local[local_e] = (w1_bf16, w2_bf16, w3_bf16)
+                ref_by_local[local_e] = (w1_bf16, w2_bf16, w3_bf16, expert_bytes)
+                _A800_BF16_TOPK_CACHE_BYTES += expert_bytes
                 have_local = True
                 updated = True
 
@@ -2760,9 +2833,18 @@ class MoE(nn.Module):
                     inter_dim,
                 )
                 self._a800_bf16_topk_refs = tuple(
-                    tensor for refs in ref_by_local.values() for tensor in refs
+                    tensor for refs in ref_by_local.values() for tensor in refs[:3]
                 )
             return self._a800_bf16_topk_ptrs
+        except torch.cuda.OutOfMemoryError as exc:
+            self._a800_bf16_topk_ptrs_failed = True
+            self._a800_clear_bf16_topk_cache()
+            _a800_fp4_cache_clear()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            if rank == 0:
+                print(f"[A800 compat] disable BF16 top-k expert cache after OOM: {exc}")
+            return None
         except (RuntimeError, TypeError, ValueError) as exc:
             self._a800_bf16_topk_ptrs_failed = True
             _a800_warn_cuda_fp4_fallback(f"BF16 top-k pointer table build failed: {exc}")

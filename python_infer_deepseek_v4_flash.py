@@ -67,6 +67,9 @@ def configure_a800_compat(args: argparse.Namespace, torch, local_rank: int) -> L
         "A800_CACHE_FP4_BF16": "0",
         "A800_USE_CUDA_BF16_TOPK_FFN": "0",
         "A800_BF16_TOPK_FREEZE_AFTER_WARMUP": "1",
+        "A800_BF16_TOPK_CACHE_MB": "2048",
+        "A800_BF16_TOPK_MAX_LOCAL_EXPERTS": "2",
+        "A800_BF16_TOPK_MIN_FREE_MB": "4096",
         "A800_USE_CUDA_SHARED_FFN": "0",
         "A800_USE_CUDA_FP4_ACCUM": "0",
         "A800_FAST_DECODE_MOE": "1",
@@ -172,6 +175,9 @@ def run_inference(args: argparse.Namespace) -> None:
         os.getenv("A800_BF16_TOPK_FREEZE_AFTER_WARMUP", "1").strip().lower()
         in {"1", "true", "yes", "on"}
     )
+    a800_bf16_topk_cache_mb = os.getenv("A800_BF16_TOPK_CACHE_MB", "2048").strip()
+    a800_bf16_topk_max_local = os.getenv("A800_BF16_TOPK_MAX_LOCAL_EXPERTS", "2").strip()
+    a800_bf16_topk_min_free = os.getenv("A800_BF16_TOPK_MIN_FREE_MB", "4096").strip()
     a800_cuda_shared_ffn = os.getenv("A800_USE_CUDA_SHARED_FFN", "").strip().lower() in {"1", "true", "yes", "on"}
     a800_cuda_fp4_accum_value = os.getenv("A800_USE_CUDA_FP4_ACCUM", "").strip().lower()
     a800_cuda_fp4_accum = (
@@ -280,7 +286,11 @@ def run_inference(args: argparse.Namespace) -> None:
     if a800_cache_fp4_bf16:
         print(
             "[A800 compat] A800_CACHE_FP4_BF16=1, "
-            f"cache selected FP4 expert weights as BF16 (limit={os.getenv('A800_DEQUANT_CACHE_FP4_MB', '4096')} MB)"
+            "cache selected FP4 expert weights as BF16 "
+            f"(persistent_budget={a800_bf16_topk_cache_mb} MB, "
+            f"global_lru={os.getenv('A800_DEQUANT_CACHE_FP4_MB', '4096')} MB, "
+            f"max_local_experts={a800_bf16_topk_max_local}, "
+            f"min_free={a800_bf16_topk_min_free} MB)"
         )
     if a800_cache_fp4_bf16 and a800_cuda_bf16_topk_ffn:
         print(
