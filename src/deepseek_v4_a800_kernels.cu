@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cmath>
+#include <cstdlib>
 
 static thread_local char g_last_error[256] = {0};
 
@@ -575,6 +576,109 @@ __global__ void fp4_topk_w2_accum_f32_kernel(
     }
 }
 
+// Decode-specialized FP4 layout: one warp
+// computes four output rows, with an independent 8-lane reduction per row.
+// This avoids one 256-thread block and two shared-memory reductions per row.
+__device__ __forceinline__ float qwarp8_sum(float value) {
+    const unsigned subgroup = threadIdx.x >> 3;
+    const unsigned mask = 0xffu << (subgroup * 8);
+#pragma unroll
+    for (int offset = 4; offset > 0; offset >>= 1) {
+        value += __shfl_down_sync(mask, value, offset, 8);
+    }
+    return value;
+}
+
+__global__ void fp4_topk_gate_up_qwarp_kernel(
+    const __nv_bfloat16* __restrict__ x,
+    const float* __restrict__ routes,
+    const int32_t* __restrict__ indices,
+    const uintptr_t* __restrict__ packed_w1_ptrs,
+    const uintptr_t* __restrict__ scales1_ptrs,
+    const uintptr_t* __restrict__ packed_w3_ptrs,
+    const uintptr_t* __restrict__ scales3_ptrs,
+    __nv_bfloat16* __restrict__ hidden,
+    int topk, int local_start, int n_local, int dim, int inter_dim,
+    int scale1_rows, int scale1_cols, int scale3_rows, int scale3_cols,
+    int group_size, float swiglu_limit
+) {
+    const int lane = threadIdx.x & 7;
+    const int inter_idx = blockIdx.x * 4 + (threadIdx.x >> 3);
+    const int top_idx = blockIdx.y;
+    if (inter_idx >= inter_dim) return;
+
+    const int local_e = indices[top_idx] - local_start;
+    if (local_e < 0 || local_e >= n_local) {
+        if (lane == 0) hidden[top_idx * inter_dim + inter_idx] = __float2bfloat16(0.0f);
+        return;
+    }
+
+    const int packed_dim = dim / 2;
+    const uint8_t* w1_row = reinterpret_cast<const uint8_t*>(packed_w1_ptrs[local_e]) + inter_idx * packed_dim;
+    const uint8_t* w3_row = reinterpret_cast<const uint8_t*>(packed_w3_ptrs[local_e]) + inter_idx * packed_dim;
+    const float* scales1 = reinterpret_cast<const float*>(scales1_ptrs[local_e]);
+    const float* scales3 = reinterpret_cast<const float*>(scales3_ptrs[local_e]);
+    int s1r = scale1_rows == inter_dim ? inter_idx : min(inter_idx / group_size, scale1_rows - 1);
+    int s3r = scale3_rows == inter_dim ? inter_idx : min(inter_idx / group_size, scale3_rows - 1);
+    float gate = 0.0f, up = 0.0f;
+    for (int k = lane; k < dim; k += 8) {
+        const float xv = __bfloat162float(x[k]);
+        const int scol = k / group_size;
+        const uint8_t p1 = w1_row[k >> 1];
+        const uint8_t p3 = w3_row[k >> 1];
+        const uint8_t n1 = (k & 1) ? ((p1 >> 4) & 15) : (p1 & 15);
+        const uint8_t n3 = (k & 1) ? ((p3 >> 4) & 15) : (p3 & 15);
+        gate += xv * fp4_e2m1_to_float(n1) * scales1[s1r * scale1_cols + min(scol, scale1_cols - 1)];
+        up += xv * fp4_e2m1_to_float(n3) * scales3[s3r * scale3_cols + min(scol, scale3_cols - 1)];
+    }
+    gate = qwarp8_sum(gate);
+    up = qwarp8_sum(up);
+    if (lane == 0) {
+        gate = __bfloat162float(__float2bfloat16(gate));
+        up = __bfloat162float(__float2bfloat16(up));
+        if (swiglu_limit > 0.0f) {
+            up = fminf(fmaxf(up, -swiglu_limit), swiglu_limit);
+            gate = fminf(gate, swiglu_limit);
+        }
+        hidden[top_idx * inter_dim + inter_idx] =
+            __float2bfloat16((gate / (1.0f + expf(-gate))) * up * routes[top_idx]);
+    }
+}
+
+__global__ void fp4_topk_w2_qwarp_kernel(
+    const __nv_bfloat16* __restrict__ hidden,
+    const int32_t* __restrict__ indices,
+    const uintptr_t* __restrict__ packed_w2_ptrs,
+    const uintptr_t* __restrict__ scales2_ptrs,
+    float* __restrict__ y_accum,
+    int topk, int local_start, int n_local, int dim, int inter_dim,
+    int scale2_rows, int scale2_cols, int group_size
+) {
+    const int lane = threadIdx.x & 7;
+    const int out_idx = blockIdx.x * 4 + (threadIdx.x >> 3);
+    if (out_idx >= dim) return;
+    const int packed_inter = inter_dim / 2;
+    const int s2r = scale2_rows == dim ? out_idx : min(out_idx / group_size, scale2_rows - 1);
+    float total = 0.0f;
+#pragma unroll
+    for (int top_idx = 0; top_idx < topk; ++top_idx) {
+        const int local_e = indices[top_idx] - local_start;
+        if (local_e < 0 || local_e >= n_local) continue;
+        const __nv_bfloat16* h = hidden + top_idx * inter_dim;
+        const uint8_t* w = reinterpret_cast<const uint8_t*>(packed_w2_ptrs[local_e]) + out_idx * packed_inter;
+        const float* s = reinterpret_cast<const float*>(scales2_ptrs[local_e]);
+        float acc = 0.0f;
+        for (int k = lane; k < inter_dim; k += 8) {
+            const uint8_t p = w[k >> 1];
+            const uint8_t nibble = (k & 1) ? ((p >> 4) & 15) : (p & 15);
+            acc += __bfloat162float(h[k]) * fp4_e2m1_to_float(nibble) *
+                   s[s2r * scale2_cols + min(k / group_size, scale2_cols - 1)];
+        }
+        total += qwarp8_sum(acc);
+    }
+    if (lane == 0) y_accum[out_idx] += __bfloat162float(__float2bfloat16(total));
+}
+
 extern "C" int ds_v4_fp4_dequant_gemm_bf16(
     const void* x_bf16,
     const void* packed_w_fp4,
@@ -951,11 +1055,21 @@ extern "C" int ds_v4_fp4_topk_expert_ffn_accum_f32(
     }
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    const char* qwarp_env = std::getenv("A800_USE_QWARP_TOPK");
+    const bool use_qwarp = qwarp_env && qwarp_env[0] != '\0' && qwarp_env[0] != '0';
     constexpr int threads = 256;
     size_t shared_bytes = threads * sizeof(float);
     size_t shared_pair_bytes = threads * 2 * sizeof(float);
 
-    fp4_topk_gate_up_fused_kernel<<<dim3(inter_dim, topk), threads, shared_pair_bytes, stream>>>(
+    if (use_qwarp) {
+        fp4_topk_gate_up_qwarp_kernel<<<dim3((inter_dim + 3) / 4, topk), 32, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(x_bf16), reinterpret_cast<const float*>(routes_fp32),
+            reinterpret_cast<const int32_t*>(indices_i32), reinterpret_cast<const uintptr_t*>(w1_ptrs_i64),
+            reinterpret_cast<const uintptr_t*>(s1_ptrs_i64), reinterpret_cast<const uintptr_t*>(w3_ptrs_i64),
+            reinterpret_cast<const uintptr_t*>(s3_ptrs_i64), reinterpret_cast<__nv_bfloat16*>(hidden_bf16),
+            topk, local_start, n_local, dim, inter_dim, s1_rows, s1_cols, s3_rows, s3_cols,
+            group_size, swiglu_limit);
+    } else fp4_topk_gate_up_fused_kernel<<<dim3(inter_dim, topk), threads, shared_pair_bytes, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(x_bf16),
         reinterpret_cast<const float*>(routes_fp32),
         reinterpret_cast<const int32_t*>(indices_i32),
@@ -983,7 +1097,13 @@ extern "C" int ds_v4_fp4_topk_expert_ffn_accum_f32(
         return 5;
     }
 
-    fp4_topk_w2_accum_f32_kernel<<<dim3(dim), threads, shared_bytes, stream>>>(
+    if (use_qwarp) {
+        fp4_topk_w2_qwarp_kernel<<<dim3((dim + 3) / 4), 32, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(hidden_bf16), reinterpret_cast<const int32_t*>(indices_i32),
+            reinterpret_cast<const uintptr_t*>(w2_ptrs_i64), reinterpret_cast<const uintptr_t*>(s2_ptrs_i64),
+            reinterpret_cast<float*>(y_accum_f32), topk, local_start, n_local, dim, inter_dim,
+            s2_rows, s2_cols, group_size);
+    } else fp4_topk_w2_accum_f32_kernel<<<dim3(dim), threads, shared_bytes, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(hidden_bf16),
         reinterpret_cast<const int32_t*>(indices_i32),
         reinterpret_cast<const uintptr_t*>(w2_ptrs_i64),
